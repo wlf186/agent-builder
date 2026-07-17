@@ -4,12 +4,12 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - test3 智能体已配置 CoinGecko、cold-jokes、Calculator MCP 工具
 - 使用 headed 模式运行（非无头浏览器）
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 滚动到页面顶部触发浏览器重绘（修复 X11 远程投屏渲染问题）
 4. 等待 0.1 秒

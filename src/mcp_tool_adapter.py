@@ -7,6 +7,8 @@ import asyncio
 from typing import Dict, Any, List, Optional, TYPE_CHECKING
 from langchain_core.tools import StructuredTool
 
+from .log_safety import content_length, summarize_arguments
+
 # 使用标准 pydantic 导入（兼容 pydantic v2）
 try:
     from pydantic import BaseModel, Field, create_model
@@ -17,6 +19,16 @@ except ImportError:
 
 if TYPE_CHECKING:
     from .mcp_manager import MCPManager, MCPTool
+
+
+def summarize_tool_arguments(arguments: Any) -> Dict[str, Any]:
+    """Backward-compatible alias for the shared value-free summary."""
+    return summarize_arguments(arguments)
+
+
+def tool_result_length(result: Any) -> int:
+    """Backward-compatible alias for value-free content measurement."""
+    return content_length(result)
 
 
 class MCPToolAdapter:
@@ -95,7 +107,10 @@ class MCPToolAdapter:
                     kwargs_value = kwargs['kwargs']
                     if isinstance(kwargs_value, dict):
                         actual_args = kwargs_value
-                        print(f"[DEBUG] 展开动态 schema 参数: {kwargs} -> {actual_args}")
+                        print(
+                            "[DEBUG] 展开动态 schema 参数: "
+                            f"{summarize_tool_arguments(actual_args)}"
+                        )
 
                 # 获取当前事件循环，如果没有则创建
                 try:
@@ -115,7 +130,7 @@ class MCPToolAdapter:
                         self.mcp_manager.call_tool(mcp_tool.name, actual_args)
                     )
             except Exception as e:
-                return f"工具调用错误: {str(e)}"
+                return f"工具调用错误 ({type(e).__name__})"
 
         # 创建 StructuredTool
         langchain_tool = StructuredTool(
@@ -146,7 +161,10 @@ class MCPToolAdapter:
                 lc_tool = self.convert_tool(mcp_tool)
                 tools.append(lc_tool)
             except Exception as e:
-                print(f"警告: 转换工具 {mcp_tool.name} 失败: {e}")
+                print(
+                    f"警告: 转换工具 {mcp_tool.name} 失败: "
+                    f"error_type={type(e).__name__}"
+                )
 
         return tools
 
@@ -389,7 +407,10 @@ class MCPToolAdapter:
                 kwargs_value = kwargs['kwargs']
                 if isinstance(kwargs_value, dict):
                     actual_args = kwargs_value
-                    print(f"[DEBUG] [async] 展开动态 schema 参数: {kwargs} -> {actual_args}")
+                    print(
+                        "[DEBUG] [async] 展开动态 schema 参数: "
+                        f"{summarize_tool_arguments(actual_args)}"
+                    )
 
             return await self.mcp_manager.call_tool(mcp_tool.name, actual_args)
 
@@ -408,7 +429,11 @@ class MCPToolAdapter:
         """
         # 这种情况表示在异步上下文中尝试同步调用
         # 返回特殊标记，让调用方知道需要在异步上下文中处理
-        return f"[ASYNC_PENDING] Tool call to {tool_name} with args {kwargs} needs async execution"
+        summary = summarize_tool_arguments(kwargs)
+        return (
+            f"[ASYNC_PENDING] Tool call to {tool_name} ({summary}) "
+            "needs async execution"
+        )
 
     def clear_cache(self):
         """清除转换缓存"""

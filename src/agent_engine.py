@@ -3,10 +3,26 @@ Agent核心引擎 - 基于LangGraph，支持多种规划模式
 """
 import os
 import asyncio
+import hashlib
+import inspect
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar, Token
+from functools import partial
 from pathlib import Path
-from typing import TypedDict, Annotated, Sequence, Optional, Dict, Any, List, TYPE_CHECKING
+from typing import (
+    TypedDict,
+    Annotated,
+    Sequence,
+    Optional,
+    Dict,
+    Any,
+    List,
+    Mapping,
+    Tuple,
+    TYPE_CHECKING,
+)
 from operator import add
 
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage
@@ -15,13 +31,18 @@ from langgraph.graph import StateGraph, END
 
 from .models import AgentConfig, LLMProvider, PlanningMode, ModelProvider
 from .mcp_manager import MCPManager
-from .mcp_tool_adapter import MCPToolAdapter
+from .mcp_tool_adapter import (
+    MCPToolAdapter,
+    summarize_tool_arguments,
+    tool_result_length,
+)
 from .skill_registry import SkillRegistry
 from .skill_loader import SkillLoader
 from .skill_tool import SkillTool
 from .model_service_registry import ModelServiceRegistry
 from .cycle_detector import CycleDetector
-from .langfuse_tracer import get_langfuse_tracer, is_langfuse_enabled
+from .observability import get_tracer, is_observability_enabled
+from .security import validate_outbound_url
 
 if TYPE_CHECKING:
     from .execution_engine import ExecutionEngine
@@ -56,6 +77,12 @@ class AgentState(TypedDict):
 class AgentEngine:
     """Agent引擎 - 支持多种规划模式"""
 
+    RAG_MAX_WORKERS = 2
+    MAX_LLM_RESPONSE_CHARS = 2 * 1024 * 1024
+    MAX_LLM_TOOL_ARGUMENT_BYTES = 1024 * 1024
+    MAX_LLM_TOOL_CALLS = 64
+    _OPAQUE_TRACE_ID = re.compile(r"^trace-[0-9a-f]{32}$")
+
     def __init__(
         self,
         config: AgentConfig,
@@ -77,13 +104,18 @@ class AgentEngine:
         self.agent_manager = agent_manager  # 用于子Agent调用
         self.llm = None
         self.llm_with_tools = None  # 绑定工具后的 LLM
+        self._http_client = None
+        self._http_async_client = None
+        self._client_close_tasks: set[asyncio.Task] = set()
+        self._close_task: Optional[asyncio.Task] = None
+        self._llm_fingerprint: Optional[Tuple[Any, ...]] = None
         self.graph = None
         self._tool_adapter: Optional[MCPToolAdapter] = None
         self._tool_call_strategy = ToolCallStrategy.AUTO  # 默认策略
         # 初始化 SkillTool 用于按需加载技能
         self.skill_tool: Optional[SkillTool] = None
         if skill_registry and config.skills:
-            print(f"[DEBUG] AgentEngine.__init__: config.skills = {config.skills}, agent_name = {config.name}")
+            print(f"[DEBUG] AgentEngine.__init__: skill_count={len(config.skills)}")
             self.skill_tool = SkillTool(
                 skill_registry=skill_registry,
                 skills_dir=self.skills_dir,
@@ -91,7 +123,7 @@ class AgentEngine:
                 execution_engine=execution_engine,
                 agent_name=config.name
             )
-            print(f"[DEBUG] SkillTool.enabled_skills = {self.skill_tool.enabled_skills}")
+            print(f"[DEBUG] SkillTool.enabled_skill_count={len(self.skill_tool.enabled_skills)}")
 
         # 保存config引用，用于动态刷新skill_tool的enabled_skills
         self._config_ref = config
@@ -101,6 +133,9 @@ class AgentEngine:
         # ====================================================================
         # 运行时调用栈追踪（用于循环检测）
         self._call_stack: List[str] = []
+        self._call_stack_context: ContextVar[Tuple[str, ...]] = ContextVar(
+            f"agent_call_stack_{id(self)}", default=()
+        )
         # 子Agent并发控制（信号量）
         self._sub_agent_semaphore: Optional[asyncio.Semaphore] = None
         # 循环检测器（延迟初始化）
@@ -112,11 +147,16 @@ class AgentEngine:
         self.kb_manager = kb_manager
         self.embedder = embedder
         self._retrievers: Dict[str, Any] = {}  # kb_id -> Retriever
+        self._retrievers_initialized = not bool(kb_manager and config.knowledge_bases)
+        self._retriever_init_task: Optional[asyncio.Task] = None
+        self._rag_executor: Optional[ThreadPoolExecutor] = None
+        self._rag_worker_semaphore: Optional[asyncio.Semaphore] = None
+        self._rag_futures: set[asyncio.Future] = set()
+        self._rag_closed = False
         self._last_retrieval_sources: List[Dict[str, Any]] = []  # Track sources for citations
-
-        # 预加载知识库检索器
-        if kb_manager and config.knowledge_bases:
-            self._init_retrievers()
+        self._retrieval_sources_context: ContextVar[Tuple[Dict[str, Any], ...]] = ContextVar(
+            f"agent_retrieval_sources_{id(self)}", default=()
+        )
 
         # ====================================================================
         # 【上下文窗口状态栏】Token 追踪
@@ -126,9 +166,26 @@ class AgentEngine:
         # 后备估算：当 API 不返回 usage_metadata 时，基于内容字符数估算
         self._last_input_chars: int = 0
         self._last_output_chars: int = 0
+        self._request_token_usage: ContextVar[Tuple[int, int]] = ContextVar(
+            f"agent_token_usage_{id(self)}", default=(0, 0)
+        )
+
+    def _normalize_trace_id(self, trace_id: Optional[str]) -> str:
+        """Turn caller-controlled correlation text into an opaque identifier."""
+        if isinstance(trace_id, str) and self._OPAQUE_TRACE_ID.fullmatch(trace_id):
+            return trace_id
+        if trace_id is None:
+            seed = (
+                f"{self.config.name}:{__import__('time').time_ns()}:"
+                f"{id(asyncio.current_task())}"
+            )
+        else:
+            seed = str(trace_id)
+        digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:32]
+        return f"trace-{digest}"
 
     def _refresh_skill_tool_if_needed(self):
-        """检查并刷新skill_tool的enabled_skills（用于配置热更新）"""
+        """检查并刷新工具配置，仅在指纹变化时重建 LLM。"""
         if self.skill_tool and hasattr(self._config_ref, 'skills'):
             current_skills = set(self._config_ref.skills or [])
             cached_skills = set(self.skill_tool.enabled_skills or [])
@@ -137,11 +194,88 @@ class AgentEngine:
                 self.skill_tool.enabled_skills = list(current_skills)
                 # 同时清除缓存，避免使用旧的skill内容
                 self.skill_tool._loaded_skills.clear()
-        self._setup_llm()
+
+        fingerprint = self._current_llm_fingerprint()
+        if self.llm is None or fingerprint != self._llm_fingerprint:
+            self._setup_llm()
+            self._llm_fingerprint = fingerprint
+
+    @staticmethod
+    def _fingerprint_secret(value: Optional[str]) -> str:
+        """Track credential rotation without retaining plaintext in the fingerprint."""
+        if not value:
+            return ""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _stable_fingerprint_value(value: Any) -> str:
+        try:
+            return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return repr(value)
+
+    def _current_llm_fingerprint(self) -> Tuple[Any, ...]:
+        """Return the model and tool configuration that affects the bound client."""
+        service_fingerprint: Tuple[Any, ...] = ()
+        if self.config.model_service and self.model_service_registry:
+            service = self.model_service_registry.get_service(self.config.model_service)
+            if service:
+                service_fingerprint = (
+                    service.name,
+                    getattr(service.provider, "value", service.provider),
+                    service.base_url,
+                    service.selected_model,
+                    self._fingerprint_secret(service.api_key),
+                )
+
+        mcp_tools: List[Tuple[str, str, str]] = []
+        if self.mcp_manager:
+            for tool in self.mcp_manager.all_tools or []:
+                mcp_tools.append(
+                    (
+                        str(getattr(tool, "name", "")),
+                        str(getattr(tool, "description", "")),
+                        self._stable_fingerprint_value(
+                            getattr(tool, "input_schema", getattr(tool, "args_schema", None))
+                        ),
+                    )
+                )
+
+        return (
+            service_fingerprint,
+            getattr(self.config.llm_provider, "value", self.config.llm_provider),
+            self.config.llm_model,
+            self.config.llm_base_url,
+            self.config.temperature,
+            tuple(sorted(self.skill_tool.enabled_skills or [])) if self.skill_tool else (),
+            tuple(sorted(mcp_tools)),
+            tuple(self.get_sub_agent_names()),
+            tuple(self.config.knowledge_bases or []),
+            self._tool_call_strategy,
+        )
 
     def _setup_llm(self):
         """设置LLM - 从模型服务注册表获取配置"""
+        import httpx
         from langchain_openai import ChatOpenAI
+
+        self._retire_llm_clients()
+
+        if self._http_client is None:
+            timeout = httpx.Timeout(60.0, connect=10.0)
+            limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            self._http_client = httpx.Client(
+                trust_env=False,
+                follow_redirects=False,
+                timeout=timeout,
+                limits=limits,
+            )
+            self._http_async_client = httpx.AsyncClient(
+                trust_env=False,
+                follow_redirects=False,
+                timeout=timeout,
+                limits=limits,
+            )
 
         # 新版：从模型服务注册表获取配置
         if self.config.model_service and self.model_service_registry:
@@ -154,6 +288,9 @@ class AgentEngine:
                     api_key=service.api_key or "not-needed",  # Ollama不需要API key
                     temperature=self.config.temperature,
                     stream_usage=True,  # 启用流式响应中的 token 使用统计
+                    max_retries=2,
+                    http_client=self._http_client,
+                    http_async_client=self._http_async_client,
                 )
                 # 绑定工具到 LLM
                 self._bind_tools_to_llm()
@@ -168,6 +305,9 @@ class AgentEngine:
                 model=self.config.llm_model or "qwen2.5:7b",
                 base_url=self.config.llm_base_url or "http://localhost:11434",
                 temperature=self.config.temperature,
+                client_kwargs={"trust_env": False, "follow_redirects": False},
+                async_client_kwargs={"trust_env": False, "follow_redirects": False},
+                sync_client_kwargs={"trust_env": False, "follow_redirects": False},
             )
         elif self.config.llm_provider == LLMProvider.ZHIPU:
             api_key = os.environ.get("ZHIPU_API_KEY")
@@ -179,6 +319,9 @@ class AgentEngine:
                 api_key=api_key,
                 temperature=self.config.temperature,
                 stream_usage=True,  # 启用流式响应中的 token 使用统计
+                max_retries=2,
+                http_client=self._http_client,
+                http_async_client=self._http_async_client,
             )
         else:
             # 默认使用Ollama
@@ -186,6 +329,133 @@ class AgentEngine:
 
         # 绑定工具到 LLM（兼容旧配置路径）
         self._bind_tools_to_llm()
+
+    def _retire_llm_clients(self) -> None:
+        """Close transport pools owned by a replaced legacy model client."""
+        llm = self.llm
+        self.llm = None
+        self.llm_with_tools = None
+        if llm is None:
+            return
+        for attribute in ("_client", "_async_client"):
+            client = getattr(llm, attribute, None)
+            close = getattr(client, "close", None)
+            if close is None:
+                continue
+            result = close()
+            if not inspect.isawaitable(result):
+                continue
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                asyncio.run(result)
+                continue
+            task = loop.create_task(result)
+            self._client_close_tasks.add(task)
+
+    async def aclose(self) -> None:
+        """Drain background work and close all pools owned by this engine."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_resources())
+        try:
+            await asyncio.shield(self._close_task)
+        except asyncio.CancelledError:
+            # A cancelled shutdown caller must not orphan embedding/vector-store
+            # work or leave its executor threads alive.
+            await asyncio.shield(self._close_task)
+            raise
+
+    async def _close_resources(self) -> None:
+        self._rag_closed = True
+
+        init_task = self._retriever_init_task
+        if init_task is not None and init_task is not asyncio.current_task():
+            await asyncio.gather(init_task, return_exceptions=True)
+
+        # A request cancellation does not stop a running Python thread. Futures
+        # therefore remain tracked until the underlying call actually exits.
+        while self._rag_futures:
+            await asyncio.gather(
+                *tuple(self._rag_futures),
+                return_exceptions=True,
+            )
+
+        rag_executor, self._rag_executor = self._rag_executor, None
+        if rag_executor is not None:
+            await asyncio.to_thread(
+                rag_executor.shutdown,
+                wait=True,
+                cancel_futures=True,
+            )
+        self._retrievers.clear()
+
+        self._retire_llm_clients()
+        if self._client_close_tasks:
+            await asyncio.gather(*tuple(self._client_close_tasks), return_exceptions=True)
+            self._client_close_tasks.clear()
+        async_client, sync_client = self._http_async_client, self._http_client
+        self._http_async_client = None
+        self._http_client = None
+        if async_client is not None:
+            await async_client.aclose()
+        if sync_client is not None:
+            await asyncio.to_thread(sync_client.close)
+
+    def _model_base_url(self) -> str:
+        """Return the configured endpoint for just-in-time SSRF validation."""
+        if self.config.model_service and self.model_service_registry:
+            service = self.model_service_registry.get_service(self.config.model_service)
+            if service:
+                return service.base_url
+        if self.config.llm_provider == LLMProvider.OLLAMA:
+            return self.config.llm_base_url or "http://localhost:11434"
+        if self.config.llm_provider == LLMProvider.ZHIPU:
+            return "https://open.bigmodel.cn/api/coding/paas/v4"
+        raise ValueError("模型服务端点不可用")
+
+    async def _invoke_llm(self, llm: Any, messages: Any) -> Any:
+        """Re-resolve and validate the model endpoint immediately before I/O."""
+        await validate_outbound_url(self._model_base_url())
+        response = await llm.ainvoke(messages)
+        self._validate_llm_response(response)
+        return response
+
+    async def _stream_llm(self, llm: Any, messages: Any):
+        """Validate the destination at call time, then proxy model chunks."""
+        await validate_outbound_url(self._model_base_url())
+        async for chunk in llm.astream(messages):
+            yield chunk
+
+    def _validate_llm_response(self, response: Any) -> None:
+        """Reject oversized provider responses before they enter prompts/state."""
+        content = getattr(response, "content", "")
+        if content is not None and len(str(content)) > self.MAX_LLM_RESPONSE_CHARS:
+            raise ValueError("模型响应超过 2MB 字符上限")
+        tool_calls = getattr(response, "tool_calls", None) or []
+        self._validate_complete_tool_calls(tool_calls)
+
+    def _validate_complete_tool_calls(self, tool_calls: Sequence[Any]) -> None:
+        if len(tool_calls) > self.MAX_LLM_TOOL_CALLS:
+            raise ValueError("模型返回的工具调用数量过多")
+        total = 0
+        for tool_call in tool_calls:
+            if isinstance(tool_call, Mapping):
+                arguments = tool_call.get("args", {})
+            else:
+                arguments = getattr(tool_call, "args", {})
+            try:
+                total += len(
+                    json.dumps(
+                        arguments,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        default=lambda item: f"<{type(item).__name__}>",
+                    ).encode("utf-8")
+                )
+            except (TypeError, ValueError, RecursionError) as exc:
+                raise ValueError("模型返回了无法序列化的工具参数") from exc
+            if total > self.MAX_LLM_TOOL_ARGUMENT_BYTES:
+                raise ValueError("模型返回的工具参数超过 1MB 上限")
 
     def _bind_tools_to_llm(self):
         """
@@ -255,7 +525,10 @@ class AgentEngine:
                 self.llm_with_tools = self.llm.bind_tools(tools_to_bind)
                 print(f"[DEBUG] LLM 已绑定 {len(tools_to_bind)} 个工具，tool_choice=auto")
         except Exception as e:
-            print(f"[WARNING] bind_tools 失败: {e}，使用传统文本模式")
+            print(
+                "[WARNING] bind_tools 失败，使用传统文本模式: "
+                f"error_type={type(e).__name__}"
+            )
             self.llm_with_tools = None
 
     def _get_tool_choice_param(self) -> Optional[str]:
@@ -293,6 +566,7 @@ class AgentEngine:
             self._tool_call_strategy = strategy
             # 重新绑定工具
             self._bind_tools_to_llm()
+            self._llm_fingerprint = self._current_llm_fingerprint()
         else:
             raise ValueError(f"无效的工具调用策略: {strategy}")
 
@@ -521,7 +795,7 @@ Returns:
 
         # 初始化调用栈
         if call_stack is None:
-            call_stack = []
+            call_stack = list(self._call_stack_context.get())
         current_stack = call_stack.copy()
 
         # 运行时循环检测
@@ -547,7 +821,10 @@ Returns:
             except Exception as e:
                 return {
                     "success": False,
-                    "error": f"子Agent '{sub_agent_name}' 初始化失败: {str(e)}"
+                    "error": (
+                        f"子Agent '{sub_agent_name}' 初始化失败 "
+                        f"({type(e).__name__})"
+                    )
                 }
 
         # 初始化并发控制信号量
@@ -589,7 +866,10 @@ Returns:
                     continue
                 return {
                     "success": False,
-                    "error": f"子Agent '{sub_agent_name}' 调用失败: {str(e)}"
+                    "error": (
+                        f"子Agent '{sub_agent_name}' 调用失败 "
+                        f"({type(e).__name__})"
+                    )
                 }
 
         return {
@@ -614,21 +894,21 @@ Returns:
         Returns:
             子Agent的响应结果
         """
-        # 设置子Agent的调用栈
-        if hasattr(sub_agent_instance.engine, '_call_stack'):
-            sub_agent_instance.engine._call_stack = call_stack
-
-        # 调用子Agent的run方法
-        result = await sub_agent_instance.engine.run(
-            message,
-            history=[]  # 子Agent调用不传递历史
-        )
-
-        return result
+        # AgentInstance serializes access to its engine and installs the stack
+        # in a request-local ContextVar, so concurrent parent requests cannot
+        # overwrite one another's cycle-detection state.
+        return await sub_agent_instance.run_with_call_stack(message, call_stack)
 
     def get_sub_agent_names(self) -> List[str]:
         """获取当前Agent配置的所有子Agent名称"""
         return getattr(self.config, 'sub_agents', []) or []
+
+    def set_request_call_stack(self, call_stack: Sequence[str]) -> Token:
+        """Install a cycle-detection stack for the current async request."""
+        return self._call_stack_context.set(tuple(str(item) for item in call_stack))
+
+    def reset_request_call_stack(self, token: Token) -> None:
+        self._call_stack_context.reset(token)
 
     def _get_cycle_detector(self, all_agent_names: List[str]) -> CycleDetector:
         """获取或创建循环检测器"""
@@ -640,38 +920,146 @@ Returns:
     # 【AC130-202603161542】RAG 知识库检索方法
     # ========================================================================
 
-    def _init_retrievers(self):
-        """初始化知识库检索器"""
-        if not self.kb_manager or not self.config.knowledge_bases:
-            return
+    async def _run_rag_blocking(self, function, *args, **kwargs):
+        """Run one embedding/vector-store operation in the bounded RAG pool."""
+        if self._rag_closed:
+            raise RuntimeError("AgentEngine 已关闭")
 
+        semaphore = self._rag_worker_semaphore
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self.RAG_MAX_WORKERS)
+            self._rag_worker_semaphore = semaphore
+
+        await semaphore.acquire()
+        if self._rag_closed:
+            semaphore.release()
+            raise RuntimeError("AgentEngine 已关闭")
+
+        executor = self._rag_executor
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=self.RAG_MAX_WORKERS,
+                thread_name_prefix="agent-rag",
+            )
+            self._rag_executor = executor
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(executor, partial(function, *args, **kwargs))
+        self._rag_futures.add(future)
+
+        def release_worker(completed: asyncio.Future) -> None:
+            self._rag_futures.discard(completed)
+            semaphore.release()
+
+        future.add_done_callback(release_worker)
+        # Shielding is important: cancelling the request cannot cancel a Python
+        # thread, so the future must stay alive and retain its semaphore slot.
+        return await asyncio.shield(future)
+
+    def _build_retrievers(self) -> Dict[str, Any]:
+        """Open configured Chroma collections outside the event-loop thread."""
+        from src.retriever import Retriever
+
+        retrievers: Dict[str, Any] = {}
+        configured = getattr(self.kb_manager, "_configs", {})
+        for kb_id in dict.fromkeys(self.config.knowledge_bases or []):
+            if kb_id in configured:
+                collection = self.kb_manager._get_collection(kb_id)
+                retrievers[kb_id] = Retriever(collection, self.embedder)
+        return retrievers
+
+    async def _initialize_retrievers(self) -> None:
         try:
-            from src.retriever import Retriever
+            retrievers = await self._run_rag_blocking(self._build_retrievers)
+            if not self._rag_closed:
+                self._retrievers = retrievers
+        except Exception as exc:
+            print(
+                "[ERROR] 初始化检索器失败: "
+                f"error_type={type(exc).__name__}"
+            )
+        finally:
+            self._retrievers_initialized = True
 
-            for kb_id in self.config.knowledge_bases:
-                if kb_id in self.kb_manager._configs:
-                    collection = self.kb_manager._get_collection(kb_id)
-                    self._retrievers[kb_id] = Retriever(collection, self.embedder)
+    async def _ensure_retrievers_initialized(self) -> None:
+        """Initialize retrievers once without tying the work to one request."""
+        if self._retrievers_initialized or self._rag_closed:
+            return
+        if self._retriever_init_task is None:
+            self._retriever_init_task = asyncio.create_task(
+                self._initialize_retrievers()
+            )
+        await asyncio.shield(self._retriever_init_task)
 
-        except Exception as e:
-            print(f"[ERROR] 初始化检索器失败: {e}")
-            import traceback
-            traceback.print_exc()
+    async def _search_retrievers(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        score_threshold: Optional[float] = None,
+    ) -> List[Any]:
+        """Search configured knowledge bases concurrently within the worker cap."""
+        await self._ensure_retrievers_initialized()
+        searches: List[Tuple[str, asyncio.Task]] = []
+        for kb_id in dict.fromkeys(self.config.knowledge_bases or []):
+            retriever = self._retrievers.get(kb_id)
+            if retriever is None:
+                continue
+            search_kwargs: Dict[str, Any] = {"top_k": top_k}
+            if score_threshold is not None:
+                search_kwargs["score_threshold"] = score_threshold
+            searches.append(
+                (
+                    kb_id,
+                    asyncio.create_task(
+                        self._run_rag_blocking(
+                            retriever.search,
+                            query,
+                            **search_kwargs,
+                        )
+                    ),
+                )
+            )
+
+        if not searches:
+            return []
+
+        outcomes = await asyncio.gather(
+            *(task for _, task in searches),
+            return_exceptions=True,
+        )
+        all_results: List[Any] = []
+        for (kb_id, _), outcome in zip(searches, outcomes):
+            if isinstance(outcome, BaseException):
+                print(
+                    f"[ERROR] 检索失败 (kb_id={kb_id}): "
+                    f"error_type={type(outcome).__name__}"
+                )
+                continue
+            all_results.extend(outcome)
+        return all_results
 
     async def _retrieve_for_query(self, query: str, trace_id: str = None) -> str:
         """为查询检索知识库内容
 
         Args:
             query: 用户查询
-            trace_id: Langfuse 追踪 ID（可选）
+            trace_id: 可观测性追踪 ID（可选）
 
         Returns:
             str: 格式化的检索结果，如果无结果返回空字符串
         """
-        langfuse_tracer = get_langfuse_tracer()
+        observability_tracer = get_tracer()
 
-        if not self.config.knowledge_bases or not self._retrievers:
+        if not self.config.knowledge_bases:
             self._last_retrieval_sources = []
+            self._retrieval_sources_context.set(())
+            return ""
+
+        await self._ensure_retrievers_initialized()
+        if not self._retrievers:
+            self._last_retrieval_sources = []
+            self._retrieval_sources_context.set(())
             return ""
 
         # 使用配置或默认值
@@ -685,65 +1073,49 @@ Returns:
         rag_retrieve_span_id = None
 
         # ====================================================================
-        # 【Langfuse 追踪】RAG 检索阶段 (Embedding + Vector Search)
+        # 【可观测性追踪】RAG 检索阶段 (Embedding + Vector Search)
         # ====================================================================
-        if is_langfuse_enabled() and trace_id:
-            rag_retrieve_result = langfuse_tracer.create_span(
+        if is_observability_enabled() and trace_id:
+            rag_retrieve_result = observability_tracer.create_span(
                 trace_id=trace_id,
                 span_name="rag.retrieve",
-                span_type="EMBEDDING",
-                input={
-                    "query": query[:500] if query else "",
+                span_type="RETRIEVER",
+                input=summarize_tool_arguments({
+                    "query": query,
                     "knowledge_bases": self.config.knowledge_bases,
                     "top_k": config.top_k,
-                    "score_threshold": config.score_threshold
-                }
+                    "score_threshold": config.score_threshold,
+                })
             )
             rag_retrieve_span_id = rag_retrieve_result[0] if isinstance(rag_retrieve_result, tuple) else None
 
-        # 从所有挂载的知识库中检索
-        for kb_id in self.config.knowledge_bases:
-            retriever = self._retrievers.get(kb_id)
-            if retriever:
-                try:
-                    results = retriever.search(
-                        query,
-                        top_k=config.top_k,
-                        score_threshold=config.score_threshold
-                    )
-                    all_results.extend(results)
-                except Exception as e:
-                    print(f"[ERROR] 检索失败 (kb_id={kb_id}): {e}")
+        all_results = await self._search_retrievers(
+            query,
+            top_k=config.top_k,
+            score_threshold=config.score_threshold,
+        )
 
         # 结束 RAG 检索阶段
-        if rag_retrieve_span_id and is_langfuse_enabled():
-            langfuse_tracer.end_span(
+        if rag_retrieve_span_id and is_observability_enabled():
+            observability_tracer.end_span(
                 trace_id=trace_id,
                 span_id=rag_retrieve_span_id,
                 output={
                     "raw_results_count": len(all_results),
-                    "results": [
-                        {
-                            "filename": r.filename,
-                            "chunk_index": r.chunk_index,
-                            "score": round(r.score, 4),
-                            "content_preview": r.content[:200] if r.content else ""
-                        }
-                        for r in all_results[:10]  # 最多显示前 10 个
-                    ]
                 }
             )
 
         if not all_results:
             self._last_retrieval_sources = []
+            self._retrieval_sources_context.set(())
             return ""
 
         # ====================================================================
-        # 【Langfuse 追踪】RAG 重排阶段 (Sorting + Filtering)
+        # 【可观测性追踪】RAG 重排阶段 (Sorting + Filtering)
         # ====================================================================
         rag_rerank_span_id = None
-        if is_langfuse_enabled() and trace_id:
-            rag_rerank_result = langfuse_tracer.create_span(
+        if is_observability_enabled() and trace_id:
+            rag_rerank_result = observability_tracer.create_span(
                 trace_id=trace_id,
                 span_name="rag.rerank",
                 span_type="DEFAULT",
@@ -758,20 +1130,12 @@ Returns:
         top_results = all_results[:config.top_k]
 
         # 结束 RAG 重排阶段
-        if rag_rerank_span_id and is_langfuse_enabled():
-            langfuse_tracer.end_span(
+        if rag_rerank_span_id and is_observability_enabled():
+            observability_tracer.end_span(
                 trace_id=trace_id,
                 span_id=rag_rerank_span_id,
                 output={
                     "top_results_count": len(top_results),
-                    "results": [
-                        {
-                            "filename": r.filename,
-                            "chunk_index": r.chunk_index,
-                            "score": round(r.score, 4)
-                        }
-                        for r in top_results
-                    ]
                 }
             )
 
@@ -784,13 +1148,16 @@ Returns:
             }
             for r in top_results
         ]
+        self._retrieval_sources_context.set(
+            tuple(dict(source) for source in self._last_retrieval_sources)
+        )
 
         # ====================================================================
-        # 【Langfuse 追踪】RAG 格式化阶段 (Context Generation)
+        # 【可观测性追踪】RAG 格式化阶段 (Context Generation)
         # ====================================================================
         rag_format_span_id = None
-        if is_langfuse_enabled() and trace_id:
-            rag_format_result = langfuse_tracer.create_span(
+        if is_observability_enabled() and trace_id:
+            rag_format_result = observability_tracer.create_span(
                 trace_id=trace_id,
                 span_name="rag.format",
                 span_type="DEFAULT",
@@ -804,13 +1171,12 @@ Returns:
         context = self._format_retrieved_context(top_results)
 
         # 结束 RAG 格式化阶段
-        if rag_format_span_id and is_langfuse_enabled():
-            langfuse_tracer.end_span(
+        if rag_format_span_id and is_observability_enabled():
+            observability_tracer.end_span(
                 trace_id=trace_id,
                 span_id=rag_format_span_id,
                 output={
                     "context_length": len(context),
-                    "context_preview": context[:500] if context else ""
                 }
             )
 
@@ -839,7 +1205,7 @@ Returns:
 
     def get_last_retrieval_sources(self) -> List[Dict[str, Any]]:
         """Get sources from last retrieval for citation display"""
-        return self._last_retrieval_sources
+        return [dict(source) for source in self._retrieval_sources_context.get()]
 
     def _get_system_prompt(self) -> str:
         """获取系统提示词"""
@@ -929,7 +1295,10 @@ Returns:
             kwargs_value = tool_args['kwargs']
             if isinstance(kwargs_value, dict):
                 actual_args = kwargs_value
-                print(f"[DEBUG] [agent_engine] 展开动态 schema 参数: {tool_args} -> {actual_args}")
+                print(
+                    "[DEBUG] [agent_engine] 展开动态 schema 参数: "
+                    f"{summarize_tool_arguments(actual_args)}"
+                )
 
         # 优先处理 skill 工具（按需加载）
         if tool_name == SkillTool.TOOL_NAME and self.skill_tool:
@@ -965,34 +1334,45 @@ Returns:
             if not query:
                 return "错误: 检索查询不能为空"
 
+            await self._ensure_retrievers_initialized()
             if not self._retrievers:
                 return "错误: 知识库检索器未初始化"
 
-            # 【Langfuse 追踪】创建 RAG 工具调用 Span
-            # 【BUG FIX 2026-03-21】必须先获取 langfuse_tracer 实例
+            # 【可观测性追踪】创建 RAG 工具调用 Span
             rag_tool_span_id = None
-            if is_langfuse_enabled() and trace_id:
-                langfuse_tracer = get_langfuse_tracer()
-                rag_tool_result = langfuse_tracer.create_span(
+            if is_observability_enabled() and trace_id:
+                observability_tracer = get_tracer()
+                rag_tool_result = observability_tracer.create_span(
                     trace_id=trace_id,
                     span_name="tool.rag_retrieve",
                     span_type="TOOL",
-                    input={"query": query[:500], "top_k": top_k}
+                    input=summarize_tool_arguments({"query": query, "top_k": top_k})
                 )
                 rag_tool_span_id = rag_tool_result[0] if isinstance(rag_tool_result, tuple) else None
 
             try:
-                all_results = []
-                for kb_id, retriever in self._retrievers.items():
-                    results = retriever.search(query, top_k=top_k)
-                    all_results.extend(results)
+                all_results = await self._search_retrievers(query, top_k=top_k)
 
                 if not all_results:
+                    self._last_retrieval_sources = []
+                    self._retrieval_sources_context.set(())
                     result = f"未找到与 '{query}' 相关的文档内容。请尝试其他关键词或告知用户该问题不在知识库范围内。"
                 else:
                     # 按相似度排序，取 Top-K
                     all_results.sort(key=lambda x: x.score, reverse=True)
                     top_results = all_results[:top_k]
+                    sources = [
+                        {
+                            "filename": result_item.filename,
+                            "chunk_index": result_item.chunk_index,
+                            "score": round(result_item.score, 2),
+                        }
+                        for result_item in top_results
+                    ]
+                    self._last_retrieval_sources = sources
+                    self._retrieval_sources_context.set(
+                        tuple(dict(source) for source in sources)
+                    )
 
                     # 格式化结果
                     formatted_parts = []
@@ -1004,37 +1384,29 @@ Returns:
 
                     result = "检索到以下相关内容：\n\n" + "\n".join(formatted_parts)
 
-                # 【Langfuse 追踪】结束 Span
-                if rag_tool_span_id and is_langfuse_enabled():
-                    langfuse_tracer.end_span(
+                # 【可观测性追踪】结束 Span
+                if rag_tool_span_id and is_observability_enabled():
+                    observability_tracer.end_span(
                         trace_id=trace_id,
                         span_id=rag_tool_span_id,
                         output={
                             "result_length": len(result),
                             "results_count": len(all_results),
-                            "results": [
-                                {
-                                    "filename": r.filename,
-                                    "chunk_index": r.chunk_index,
-                                    "score": round(r.score, 4)
-                                }
-                                for r in (top_results if all_results else [])
-                            ]
                         }
                     )
 
                 return result
 
             except Exception as e:
-                # 【Langfuse 追踪】错误处理
-                if rag_tool_span_id and is_langfuse_enabled():
-                    langfuse_tracer.end_span(
+                # 【可观测性追踪】错误处理
+                if rag_tool_span_id and is_observability_enabled():
+                    observability_tracer.end_span(
                         trace_id=trace_id,
                         span_id=rag_tool_span_id,
-                        output={"error": str(e)},
+                        output={"error_type": type(e).__name__},
                         status="error"
                     )
-                return f"检索失败: {str(e)}"
+                return f"检索失败 ({type(e).__name__})"
 
         # ====================================================================
         # 【AC130-202603142210】处理子Agent调用
@@ -1051,7 +1423,11 @@ Returns:
 
             if sub_agent_name:
                 message = tool_args.get("message", "")
-                result = await self._execute_sub_agent(sub_agent_name, message, self._call_stack)
+                result = await self._execute_sub_agent(
+                    sub_agent_name,
+                    message,
+                    list(self._call_stack_context.get()),
+                )
                 if result["success"]:
                     return result["result"]
                 else:
@@ -1072,15 +1448,19 @@ Returns:
         try:
             import time
             timestamp = time.strftime("%H:%M:%S", time.localtime())
-            print(f"[TOOL] {timestamp} 调用工具: {tool_name}, args: {actual_args}")
+            print(
+                f"[TOOL] {timestamp} 调用工具: {tool_name}, "
+                f"{summarize_tool_arguments(actual_args)}"
+            )
             result = await self.mcp_manager.call_tool(tool_name, actual_args)
-            print(f"[TOOL] {timestamp} 工具返回: {result[:100]}...")
+            print(
+                f"[TOOL] {timestamp} 工具返回: "
+                f"result_length={tool_result_length(result)}"
+            )
             return result
         except Exception as e:
-            import traceback
-            error_msg = f"工具调用异常: {str(e)}"
-            print(f"[TOOL] {error_msg}\n{traceback.format_exc()}")
-            return error_msg
+            print(f"[TOOL] 工具调用异常: error_type={type(e).__name__}")
+            return f"工具调用异常 ({type(e).__name__})"
 
     def _parse_tool_calls(self, response) -> List[Dict]:
         """解析工具调用"""
@@ -1115,7 +1495,7 @@ Returns:
                 system_prompt += f"\n\n你可以使用以下工具:\n{tools_desc}"
             messages = [SystemMessage(content=system_prompt)] + messages
 
-        response = await self.llm.ainvoke(messages)
+        response = await self._invoke_llm(self.llm, messages)
         return {"messages": [response], "iterations": iterations + 1}
 
     async def _react_tool_node(self, state: AgentState) -> Dict[str, Any]:
@@ -1181,7 +1561,7 @@ Returns:
         if reflection and not state.get("is_satisfactory", True):
             messages.append(SystemMessage(content=f"之前的回答需要改进。反思: {reflection}\n请根据反思改进你的回答。"))
 
-        response = await self.llm.ainvoke(messages)
+        response = await self._invoke_llm(self.llm, messages)
         return {"messages": [response], "iterations": iterations + 1}
 
     async def _reflexion_reflect_node(self, state: AgentState) -> Dict[str, Any]:
@@ -1210,7 +1590,7 @@ Returns:
 SATISFACTORY: 是/否
 REFLECTION: 改进建议（如果需要）"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=reflect_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=reflect_prompt)])
         reflection_text = response.content
 
         is_satisfactory = "SATISFACTORY: 是" in reflection_text or "SATISFACTORY:是" in reflection_text
@@ -1290,7 +1670,7 @@ REFLECTION: 改进建议（如果需要）"""
 
 只输出计划步骤，不要其他内容。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=planner_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=planner_prompt)])
         plan_text = response.content
 
         # 解析计划
@@ -1333,7 +1713,7 @@ REFLECTION: 改进建议（如果需要）"""
 
 请执行这个步骤。如果需要使用工具，请调用工具。完成后给出这个步骤的执行结果。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=executor_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=executor_prompt)])
 
         # 执行可能的工具调用
         tool_calls = self._parse_tool_calls(response)
@@ -1344,7 +1724,7 @@ REFLECTION: 改进建议（如果需要）"""
 
         if tool_results:
             # 将工具结果反馈给 LLM
-            follow_up = await self.llm.ainvoke([
+            follow_up = await self._invoke_llm(self.llm, [
                 SystemMessage(content=executor_prompt),
                 response,
                 SystemMessage(content=f"工具执行结果:\n{chr(10).join(tool_results)}\n\n请总结这个步骤的执行结果。")
@@ -1413,7 +1793,7 @@ ARGS: {{"参数名": "参数值"}}
 
 如果没有工具可用或不需要工具，直接回答问题。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=planner_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=planner_prompt)])
         plan_text = response.content
 
         # 解析工具调用计划
@@ -1463,7 +1843,7 @@ ARGS: {{"参数名": "参数值"}}
 
 如果没有工具可用或不需要工具，直接回答问题。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=planner_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=planner_prompt)])
         plan_text = response.content
 
         # 解析并执行工具调用
@@ -1507,7 +1887,7 @@ ARGS: {{"参数名": "参数值"}}
 
 请根据以上工具执行结果，给用户一个完整的回答。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=synthesizer_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=synthesizer_prompt)])
         return {"messages": [response]}
 
     def _build_rewOO_graph(self) -> StateGraph:
@@ -1556,7 +1936,7 @@ THOUGHT: [思考内容]
 THOUGHT: [思考内容]
 """
 
-        response = await self.llm.ainvoke([SystemMessage(content=prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=prompt)])
 
         # 解析思考
         thoughts = []
@@ -1595,7 +1975,7 @@ THOUGHT: [思考内容]
 SCORES: [分数1, 分数2, ...]
 BEST: 编号"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=eval_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=eval_prompt)])
 
         # 解析评估结果
         best_idx = 0
@@ -1645,7 +2025,7 @@ BEST: 编号"""
 
 请基于以上思考路径，给出最终答案。如果需要使用工具，请调用工具。"""
 
-        response = await self.llm.ainvoke([SystemMessage(content=answer_prompt)])
+        response = await self._invoke_llm(self.llm, [SystemMessage(content=answer_prompt)])
 
         # 执行可能的工具调用
         tool_calls = self._parse_tool_calls(response)
@@ -1655,7 +2035,7 @@ BEST: 编号"""
             tool_results.append(f"工具 {tool_call['name']} 结果: {result}")
 
         if tool_results:
-            follow_up = await self.llm.ainvoke([
+            follow_up = await self._invoke_llm(self.llm, [
                 SystemMessage(content=answer_prompt),
                 response,
                 SystemMessage(content=f"工具执行结果:\n{chr(10).join(tool_results)}\n\n请给出最终答案。")
@@ -1770,7 +2150,44 @@ BEST: 编号"""
     # - frontend/src/components/AgentChat.tsx - 前端渲染
     # - frontend/src/app/stream/agents/[name]/chat/route.ts - 流式代理
     # ============================================================================
-    async def stream(self, user_input: str, history: List[Dict] = None, file_context: str = "", trace_id: str = None, conversation_id: str = None):
+    async def stream(
+        self,
+        user_input: str,
+        history: List[Dict] = None,
+        file_context: str = "",
+        trace_id: str = None,
+        conversation_id: str = None,
+    ):
+        """Stream events and guarantee that interrupted traces are closed."""
+
+        active_trace_id = self._normalize_trace_id(trace_id)
+        completed = False
+        failure: Optional[BaseException] = None
+        try:
+            async for event in self._stream_events(
+                user_input=user_input,
+                history=history,
+                file_context=file_context,
+                trace_id=active_trace_id,
+                conversation_id=conversation_id,
+            ):
+                yield event
+            completed = True
+        except BaseException as exc:
+            failure = exc
+            raise
+        finally:
+            if not completed and is_observability_enabled():
+                error = {
+                    "type": type(failure).__name__ if failure else "StreamClosed",
+                }
+                get_tracer().end_trace(
+                    trace_id=active_trace_id,
+                    status="error",
+                    error=error,
+                )
+
+    async def _stream_events(self, user_input: str, history: List[Dict] = None, file_context: str = "", trace_id: str = None, conversation_id: str = None):
         """流式运行Agent - 支持返回 thinking、多轮工具调用和最终回答
 
         【流式输出核心方法 - 谨慎修改】
@@ -1790,24 +2207,29 @@ BEST: 编号"""
             history: 对话历史
             file_context: 文件上下文信息（包含用户上传文件的元数据）
             trace_id: 可追溯ID，用于关联日志和调试
-            conversation_id: 会话ID，用于Langfuse追踪
+            conversation_id: 会话ID，用于可观测性追踪
         """
+        # Request-scoped state must start empty even when the AgentEngine itself
+        # is cached across conversations.
+        self._request_token_usage.set((0, 0))
+        self._retrieval_sources_context.set(())
+
         # 刷新skill_tool的enabled_skills（用于配置热更新）
         self._refresh_skill_tool_if_needed()
 
         # ====================================================================
-        # 【Langfuse 追踪】创建 Trace
+        # 【可观测性追踪】创建 Trace
         # ====================================================================
-        langfuse_tracer = get_langfuse_tracer()
-        langfuse_trace_id = trace_id or f"trace-{self.config.name}-{int(__import__('time').time()*1000)}"
+        observability_tracer = get_tracer()
+        active_trace_id = self._normalize_trace_id(trace_id)
         root_obs_id = None
-        if is_langfuse_enabled():
-            trace_info = langfuse_tracer.create_trace(
-                trace_id=langfuse_trace_id,
+        if is_observability_enabled():
+            trace_info = observability_tracer.create_trace(
+                trace_id=active_trace_id,
                 name=f"agent:{self.config.name}",
                 user_id=self.config.name,
                 session_id=conversation_id,
-                input={"query": user_input},
+                input={"query_length": len(user_input)},
                 metadata={"agent": self.config.name}
             )
             root_obs_id = trace_info.get('observation_id') if trace_info else None
@@ -1881,12 +2303,17 @@ BEST: 编号"""
         full_response = ""
         all_tool_calls_info = []
         iteration = 0
-        max_iterations = 10  # 防止无限循环
+        max_iterations = max(1, min(self.config.max_iterations, 50))
+        total_input_tokens = 0
+        total_output_tokens = 0
+        total_input_chars = 0
+        total_output_chars = 0
 
         # 【AC130-202603190000】发送 RAG 检索来源元数据
         # 前端可用于显示来源引用
-        if self._last_retrieval_sources:
-            yield {"type": "rag_sources", "sources": self._last_retrieval_sources}
+        retrieval_sources = self.get_last_retrieval_sources()
+        if retrieval_sources:
+            yield {"type": "rag_sources", "sources": retrieval_sources}
 
         # 1. 输出思考过程的开始
         yield {"type": "thinking", "content": "正在分析您的问题..."}
@@ -1916,12 +2343,17 @@ BEST: 编号"""
             # - 工具调用检测准确性（阈值太小可能截断工具 JSON）
             # ============================================================
             response_content = ""
+            response_parts: List[str] = []
             might_be_tool_call = False
             content_started = False
-            buffer_content = ""  # 缓冲区：暂存待确认的内容
+            buffer_content = ""  # 流结束后由 buffer_parts 合并
+            buffer_parts: List[str] = []
+            buffer_length = 0
             buffering = False    # 是否处于缓冲模式
             BUFFER_THRESHOLD = 50  # 【关键参数】缓冲阈值，平衡检测与响应性
             started_streaming = False  # 是否已开始流式输出
+            native_tool_call_chunks: Dict[Tuple[str, Any], Dict[str, Any]] = {}
+            streamed_native_tool_calls: List[Dict[str, Any]] = []
 
             # 更新 thinking 为等待状态
             if iteration == 1:
@@ -1933,26 +2365,28 @@ BEST: 编号"""
             llm_to_use = self.llm_with_tools if self.llm_with_tools else self.llm
 
             # ====================================================================
-            # 【Langfuse 追踪】创建 LLM Span
+            # 【可观测性追踪】创建 LLM Span
             # ====================================================================
             llm_span_id = None
             llm_obs_id = None
-            if is_langfuse_enabled():
+            if is_observability_enabled():
                 # 获取模型服务名称（新版 model_service 优先，兼容旧版 llm_provider）
                 model_service_name = self.config.model_service or (
                     self.config.llm_provider.value if self.config.llm_provider else 'unknown'
                 )
-                # 准备输入内容（截断前1000字符）
-                input_preview = str(messages)[:1000] if messages else ""
-                llm_result = langfuse_tracer.create_span(
-                    trace_id=langfuse_trace_id,
+                llm_result = observability_tracer.create_span(
+                    trace_id=active_trace_id,
                     span_name=f"llm.{model_service_name}",
                     span_type="LLM",
                     parent_observation_id=root_obs_id,
                     input={
+                        "model": model_service_name,
                         "messages_count": len(messages),
                         "iteration": iteration,
-                        "messages_preview": input_preview
+                        "messages_length": sum(
+                            len(str(getattr(message, "content", "")))
+                            for message in messages
+                        ),
                     }
                 )
                 llm_span_id = llm_result[0] if isinstance(llm_result, tuple) else None
@@ -1969,63 +2403,91 @@ BEST: 编号"""
             )
             iteration_output_chars = 0
             try:
-                async for chunk in llm_to_use.astream(messages):
+                async for chunk in self._stream_llm(llm_to_use, messages):
                     # 【AC130-202603222100】检测原生 tool_calls（bind_tools 模式）
                     # 当使用 bind_tools 时，工具调用信息在 chunk.tool_calls 中，而非 content
-                    if hasattr(chunk, 'tool_call_chunks') and chunk.tool_call_chunks:
+                    chunk_tool_call_chunks = getattr(chunk, 'tool_call_chunks', None) or []
+                    if chunk_tool_call_chunks:
+                        self._merge_native_tool_call_chunks(
+                            native_tool_call_chunks,
+                            chunk_tool_call_chunks,
+                        )
                         might_be_tool_call = True
                         if not content_started:
                             content_started = True
                             buffering = True
                             yield {"type": "thinking", "content": "✓ 分析用户请求\n✓ 检测到原生工具调用..."}
 
+                    complete_tool_calls = getattr(chunk, 'tool_calls', None) or []
+                    if complete_tool_calls:
+                        self._validate_complete_tool_calls(complete_tool_calls)
+                        streamed_native_tool_calls = self._convert_native_tool_calls(
+                            complete_tool_calls
+                        )
+
                     if chunk.content:
-                        response_content += chunk.content
+                        chunk_text = str(chunk.content)
+                        if (
+                            iteration_output_chars + len(chunk_text)
+                            > self.MAX_LLM_RESPONSE_CHARS
+                        ):
+                            raise ValueError("模型响应超过 2MB 字符上限")
+                        response_parts.append(chunk_text)
 
                         # 检查是否可能是工具调用
                         if not content_started:
                             content_started = True
-                            stripped = response_content.strip()
+                            buffering = True
+                            # The first chunk is part of the response regardless
+                            # of whether it resembles a textual tool-call JSON.
+                            buffer_parts.append(chunk_text)
+                            buffer_length += len(chunk_text)
+                            stripped = chunk_text.strip()
                             if stripped.startswith('{') or stripped.startswith('```json'):
                                 might_be_tool_call = True
-                                buffering = True
                                 yield {"type": "thinking", "content": "✓ 分析用户请求\n✓ 检测到工具调用..."}
-                            else:
-                                # 不以 { 开头，先缓冲一小段来确认
-                                buffering = True
-                                buffer_content += chunk.content
                         elif buffering and not started_streaming:
                             # 还在缓冲模式，累积内容
-                            buffer_content += chunk.content
+                            buffer_parts.append(chunk_text)
+                            buffer_length += len(chunk_text)
 
                             # 检查缓冲内容是否包含工具调用 JSON
-                            if '"tool"' in buffer_content and '{' in buffer_content:
+                            detection_buffer = "".join(buffer_parts) if not might_be_tool_call else ""
+                            if '"tool"' in detection_buffer and '{' in detection_buffer:
                                 might_be_tool_call = True
 
                             # 【流式输出核心】如果缓冲区超过阈值且没有检测到工具调用，开始流式输出
-                            if len(buffer_content) > BUFFER_THRESHOLD and not might_be_tool_call:
+                            if buffer_length > BUFFER_THRESHOLD and not might_be_tool_call:
                                 started_streaming = True
-                                # 【关键】逐字符输出缓冲内容，实现打字机效果
-                                # 前端 AgentChat.tsx 使用 flushSync 确保每次 yield 都能立即渲染
-                                for char in buffer_content:
-                                    yield {"type": "content", "content": char}
-                                buffer_content = ""
+                                # Emit one bounded initial chunk. Subsequent model chunks
+                                # remain incremental, without generating one event per char.
+                                yield {"type": "content", "content": detection_buffer}
+                                buffer_parts.clear()
+                                buffer_length = 0
                         elif started_streaming:
                             # 【流式输出核心】已经开始流式输出，直接输出新内容
                             # 这里的 chunk.content 是 LLM 返回的增量内容，直接透传给前端
-                            yield {"type": "content", "content": chunk.content}
+                            yield {"type": "content", "content": chunk_text}
                         elif buffering and might_be_tool_call:
                             # 检测到工具调用，继续缓冲
-                            buffer_content += chunk.content
+                            buffer_parts.append(chunk_text)
+                            buffer_length += len(chunk_text)
 
                     # 【上下文窗口状态栏】提取 token 使用信息
                     # 许多 LLM API 在最后一个 chunk 中返回 usage_metadata（content 通常为空）
-                    if hasattr(chunk, 'usage_metadata') and chunk.usage_metadata:
+                    usage_metadata = getattr(chunk, 'usage_metadata', None)
+                    if usage_metadata:
                         try:
-                            iteration_input_tokens = getattr(chunk.usage_metadata, 'input_tokens', 0) or 0
-                            iteration_output_tokens = getattr(chunk.usage_metadata, 'output_tokens', 0) or 0
-                            self._last_input_tokens = iteration_input_tokens
-                            self._last_output_tokens = iteration_output_tokens
+                            reported_input = self._usage_metadata_value(
+                                usage_metadata, "input_tokens"
+                            )
+                            reported_output = self._usage_metadata_value(
+                                usage_metadata, "output_tokens"
+                            )
+                            if reported_input:
+                                iteration_input_tokens = reported_input
+                            if reported_output:
+                                iteration_output_tokens = reported_output
                         except Exception:
                             pass
 
@@ -2034,27 +2496,62 @@ BEST: 编号"""
                     if chunk_content:
                         iteration_output_chars += len(chunk_content)
 
-                # 流式结束后：如果 API 未返回 usage_metadata，使用字符数估算
-                if self._last_input_tokens == 0 and iteration_input_chars > 0:
-                    self._last_input_tokens = self._estimate_tokens_from_chars(iteration_input_chars)
-                    self._last_output_tokens = self._estimate_tokens_from_chars(iteration_output_chars)
-                    self._last_input_chars = iteration_input_chars
-                    self._last_output_chars = iteration_output_chars
+                response_content = "".join(response_parts)
+                buffer_content = "".join(buffer_parts)
+
+                # 流式结束后：仅对本轮 API 未返回的字段做估算。
+                if iteration_input_tokens == 0 and iteration_input_chars > 0:
+                    iteration_input_tokens = self._estimate_tokens_from_chars(
+                        iteration_input_chars
+                    )
+                if iteration_output_tokens == 0 and iteration_output_chars > 0:
+                    iteration_output_tokens = self._estimate_tokens_from_chars(
+                        iteration_output_chars
+                    )
+
+                total_input_tokens += iteration_input_tokens
+                total_output_tokens += iteration_output_tokens
+                total_input_chars += iteration_input_chars
+                total_output_chars += iteration_output_chars
+                self._publish_token_usage(
+                    total_input_tokens,
+                    total_output_tokens,
+                    total_input_chars,
+                    total_output_chars,
+                )
 
             # ============================================================================
             # 【AC130-202603150000】LLM 流式输出异常捕获
             # ============================================================================
             except Exception as e:
+                # Publish any usage observed before the stream failed without
+                # carrying data over from a previous request.
+                self._publish_token_usage(
+                    total_input_tokens + iteration_input_tokens,
+                    total_output_tokens + iteration_output_tokens,
+                    total_input_chars + iteration_input_chars,
+                    total_output_chars + iteration_output_chars,
+                )
                 # LLM 调用失败，发送错误事件到前端
-                error_msg = f"LLM 调用失败: {str(e)}"
-                print(f"[ERROR] LLM stream error: {error_msg}")
-                # 【Langfuse 追踪】结束 LLM Span (错误)
-                if llm_span_id and is_langfuse_enabled():
-                    langfuse_tracer.end_span(
-                        trace_id=langfuse_trace_id,
+                error_msg = "LLM 调用失败"
+                print(
+                    "[ERROR] LLM stream error: "
+                    f"error_type={type(e).__name__}"
+                )
+                # 【可观测性追踪】结束 LLM Span (错误)
+                if llm_span_id and is_observability_enabled():
+                    observability_tracer.end_span(
+                        trace_id=active_trace_id,
                         span_id=llm_span_id,
-                        output={"error": error_msg},
-                        status="error"
+                        output={"error_type": type(e).__name__},
+                        status="error",
+                        error={"type": type(e).__name__},
+                    )
+                if is_observability_enabled():
+                    observability_tracer.end_trace(
+                        trace_id=active_trace_id,
+                        status="error",
+                        error={"type": type(e).__name__},
                     )
                 yield {
                     "type": "error",
@@ -2071,22 +2568,19 @@ BEST: 编号"""
                     might_be_tool_call = True
 
             # 3. 检查是否有工具调用（支持原生 tool_calls 和文本解析）
-            tool_calls = []
+            tool_calls = self._native_tool_calls_from_chunks(native_tool_call_chunks)
 
-            # 优先检查原生 tool_calls（使用 bind_tools 时）
-            # 【性能优化】只在可能存在工具调用时才调用 ainvoke，避免不必要的 LLM 重新调用
-            # 根因：ainvoke 会阻塞约 4 秒，导致用户在看到最终回复后感知到明显卡顿
-            if self.llm_with_tools and might_be_tool_call:
-                # 需要重新调用 LLM 一次来获取完整的 tool_calls
-                # 因为流式响应中 tool_calls 可能不完整
-                try:
-                    full_response = await llm_to_use.ainvoke(messages)
-                    if hasattr(full_response, 'tool_calls') and full_response.tool_calls:
-                        # 原生工具调用，转换为统一格式
-                        tool_calls = self._convert_native_tool_calls(full_response.tool_calls)
-                        print(f"[DEBUG] 检测到原生 tool_calls: {[tc['name'] for tc in tool_calls]}")
-                except Exception as e:
-                    print(f"[WARNING] 获取原生 tool_calls 失败: {e}")
+            # Some providers populate complete ``tool_calls`` on a streamed
+            # chunk in addition to deltas. Prefer the merged deltas, and use the
+            # complete streamed value only as a fallback. Never issue a second
+            # model request to reconstruct an answer that has already streamed.
+            if not tool_calls and streamed_native_tool_calls:
+                tool_calls = streamed_native_tool_calls
+            if tool_calls:
+                print(
+                    f"[DEBUG] 检测到原生 tool_calls: "
+                    f"{[tc['name'] for tc in tool_calls]}"
+                )
 
             # 如果没有原生 tool_calls，尝试文本解析（兼容模式）
             if not tool_calls:
@@ -2100,11 +2594,12 @@ BEST: 编号"""
                 mock_response = MockResponse(response_content)
                 tool_calls = self._parse_tool_calls_enhanced(mock_response)
 
-            # 【Langfuse 追踪】结束 LLM Span (成功) — 在 tool_calls 解析后，包含工具调用信息
-            if llm_span_id and is_langfuse_enabled():
+            self._validate_complete_tool_calls(tool_calls)
+
+            # 【可观测性追踪】结束 LLM Span (成功) — 在 tool_calls 解析后，包含工具调用信息
+            if llm_span_id and is_observability_enabled():
                 llm_output = {
                     "response_length": len(response_content),
-                    "response_preview": response_content[:1000] if response_content else ""
                 }
                 if tool_calls:
                     llm_output["tool_calls"] = [
@@ -2118,8 +2613,8 @@ BEST: 编号"""
                         "output": iteration_output_tokens,
                         "total": iteration_input_tokens + iteration_output_tokens,
                     }
-                langfuse_tracer.end_span(
-                    trace_id=langfuse_trace_id,
+                observability_tracer.end_span(
+                    trace_id=active_trace_id,
                     span_id=llm_span_id,
                     output=llm_output,
                     usage=usage_data,
@@ -2139,31 +2634,29 @@ BEST: 编号"""
                 for tool_call in tool_calls:
                     tool_name = tool_call["name"]
                     tool_args = tool_call.get("args", {})
+                    service_name = ""
+                    is_skill_tool = (
+                        tool_name == SkillTool.TOOL_NAME
+                        or tool_name == SkillTool.EXECUTE_TOOL_NAME
+                    )
+                    is_rag_tool = tool_name == "rag_retrieve"
+                    is_sub_agent_tool = tool_name.startswith("call_agent_")
+                    sub_agent_name = None
+                    call_id = "unknown"
+                    tool_span_id = None
 
                     # ============================================================================
                     # 【AC130-202603150000】工具执行异常处理
                     # ============================================================================
                     try:
                         # 获取工具的服务名
-                        service_name = ""
                         if self.mcp_manager:
                             tool = self.mcp_manager.get_tool(tool_name)
                             if tool:
                                 service_name = tool.server_name
 
                         # 检查是否是 skill 工具
-                        is_skill_tool = tool_name == SkillTool.TOOL_NAME or tool_name == SkillTool.EXECUTE_TOOL_NAME
-
-                        # ====================================================================
-                        # 【AC130-202603161918】检测是否是 RAG 知识库检索工具
-                        # ====================================================================
-                        is_rag_tool = tool_name == "rag_retrieve"
-
-                        # ====================================================================
-                        # 【AC130-202603142210】检测是否是子Agent工具
-                        # ====================================================================
-                        is_sub_agent_tool = tool_name.startswith("call_agent_")
-                        sub_agent_name = None
+                        # 检测并解析子 Agent 工具
                         if is_sub_agent_tool:
                             # 从工具名中提取子Agent名称
                             for candidate in self.get_sub_agent_names():
@@ -2239,27 +2732,43 @@ BEST: 编号"""
                                 "call_id": call_id
                             }
 
-                        # 【Langfuse 追踪】创建工具 Span
-                        tool_span_id = None
-                        if is_langfuse_enabled():
-                            tool_result = langfuse_tracer.create_span(
-                                trace_id=langfuse_trace_id,
-                                span_name=f"tool.{tool_name}",
-                                span_type="TOOL",
+                        # 【可观测性追踪】创建工具或子 Agent Span
+                        if is_observability_enabled():
+                            span_name = f"tool.{tool_name}"
+                            if is_sub_agent_tool:
+                                span_name = f"agent.{sub_agent_name or tool_name}"
+                            elif is_rag_tool:
+                                span_name = "rag.retrieve"
+                            tool_result = observability_tracer.create_span(
+                                trace_id=active_trace_id,
+                                span_name=span_name,
+                                span_type=(
+                                    "AGENT" if is_sub_agent_tool
+                                    else "RETRIEVER" if is_rag_tool
+                                    else "TOOL"
+                                ),
                                 parent_observation_id=llm_obs_id,
-                                input={"tool": tool_name, "args": tool_args}
+                                input={
+                                    "tool": tool_name,
+                                    **summarize_tool_arguments(tool_args),
+                                }
                             )
                             tool_span_id = tool_result[0] if isinstance(tool_result, tuple) else None
 
                         # 执行工具
-                        result = await self._execute_tool(tool_name, tool_args, trace_id=langfuse_trace_id)
+                        result = await self._execute_tool(tool_name, tool_args, trace_id=active_trace_id)
 
-                        # 【Langfuse 追踪】结束工具 Span
-                        if tool_span_id and is_langfuse_enabled():
-                            langfuse_tracer.end_span(
-                                trace_id=langfuse_trace_id,
+                        # 【可观测性追踪】结束工具 Span
+                        if tool_span_id and is_observability_enabled():
+                            result_is_error = result.startswith(
+                                ("Error:", "错误:", "检索失败:", "子Agent调用失败:")
+                            )
+                            observability_tracer.end_span(
+                                trace_id=active_trace_id,
                                 span_id=tool_span_id,
-                                output={"result": result[:500] if result else None}
+                                output={"result_length": tool_result_length(result)},
+                                status="error" if result_is_error else "success",
+                                error={"type": "tool_error"} if result_is_error else None,
                             )
 
                         # 如果是 skill 工具，发送 skill_loaded 事件
@@ -2325,6 +2834,16 @@ BEST: 编号"""
                             "result": result
                         }
 
+                        # Retrieval sources belong to this request and become
+                        # available only after the RAG tool has completed.
+                        # Emit even an empty list so the client can clear any
+                        # citations left on screen from an earlier request.
+                        if is_rag_tool:
+                            yield {
+                                "type": "rag_sources",
+                                "sources": self.get_last_retrieval_sources(),
+                            }
+
                         tool_calls_info.append({
                             "name": tool_name,
                             "call_id": call_id,
@@ -2336,9 +2855,21 @@ BEST: 编号"""
                     # 【AC130-202603150000】工具执行异常捕获
                     # ============================================================================
                     except Exception as e:
-                        # 工具执行失败，发送错误事件
-                        error_msg = f"工具执行失败 ({tool_name}): {str(e)}"
-                        print(f"[ERROR] Tool execution error: {error_msg}")
+                        # 工具执行失败，只向浏览器暴露异常类型。
+                        public_error = f"错误: 工具执行失败 ({type(e).__name__})"
+                        print(
+                            "[ERROR] Tool execution error: "
+                            f"tool={tool_name}, error_type={type(e).__name__}"
+                        )
+
+                        if tool_span_id and is_observability_enabled():
+                            observability_tracer.end_span(
+                                trace_id=active_trace_id,
+                                span_id=tool_span_id,
+                                output={"result_length": 0},
+                                status="error",
+                                error={"type": type(e).__name__},
+                            )
 
                         # 发送工具结果（错误信息）
                         # 确定服务名称：优先使用 service_name，skill 工具回退到 "skill-system"，子 Agent 工具使用 agent: 前缀
@@ -2353,7 +2884,7 @@ BEST: 编号"""
                             "name": tool_name,
                             "call_id": call_id,
                             "service": service_display,
-                            "result": f"错误: {str(e)}",
+                            "result": public_error,
                             "error": True
                         }
 
@@ -2361,7 +2892,7 @@ BEST: 编号"""
                             "name": tool_name,
                             "call_id": call_id,
                             "args": tool_args,
-                            "result": f"错误: {str(e)}"
+                            "result": public_error
                         })
 
                 all_tool_calls_info.extend(tool_calls_info)
@@ -2394,20 +2925,17 @@ BEST: 编号"""
                 elif buffering and buffer_content:
                     # 还在缓冲模式（内容较短，未触发阈值），现在输出缓冲的内容
                     yield {"type": "thinking", "content": "✓ 分析用户请求\n✓ 无需调用工具，直接回答"}
-                    for char in buffer_content:
-                        full_response += char
-                        yield {"type": "content", "content": char}
+                    full_response = buffer_content
+                    yield {"type": "content", "content": buffer_content}
                 elif might_be_tool_call and response_content:
                     # 检测到可能的工具调用但解析失败，输出原始内容
                     yield {"type": "thinking", "content": "✓ 分析用户请求\n✓ 生成回答"}
-                    for char in response_content:
-                        full_response += char
-                        yield {"type": "content", "content": char}
+                    full_response = response_content
+                    yield {"type": "content", "content": response_content}
                 elif response_content and not full_response:
                     # 其他情况，确保输出响应内容
-                    for char in response_content:
-                        full_response += char
-                        yield {"type": "content", "content": char}
+                    full_response = response_content
+                    yield {"type": "content", "content": response_content}
 
                 # 退出循环
                 break
@@ -2430,24 +2958,166 @@ BEST: 编号"""
 
             if summary_parts:
                 summary_content = "\n\n".join(summary_parts)
-                for char in summary_content:
-                    full_response += char
-                    yield {"type": "content", "content": char}
+                full_response = summary_content
+                for offset in range(0, len(summary_content), 64):
+                    yield {"type": "content", "content": summary_content[offset:offset + 64]}
             else:
                 # 如果没有工具调用结果，输出默认消息
                 default_msg = "工具调用已完成，但未能生成最终回答。请尝试重新提问。"
-                for char in default_msg:
-                    full_response += char
-                    yield {"type": "content", "content": char}
+                full_response = default_msg
+                yield {"type": "content", "content": default_msg}
 
         # ====================================================================
-        # 【Langfuse 追踪】结束 Trace
+        # 【可观测性追踪】结束 Trace
         # ====================================================================
-        if is_langfuse_enabled():
-            langfuse_tracer.end_trace(
-                trace_id=langfuse_trace_id,
-                output={"response": full_response, "tool_calls": all_tool_calls_info}
+        if is_observability_enabled():
+            observability_tracer.end_trace(
+                trace_id=active_trace_id,
+                output={
+                    "response_length": len(full_response),
+                    "tool_call_count": len(all_tool_calls_info),
+                }
             )
+
+    @staticmethod
+    def _tool_call_chunk_mapping(chunk: Any) -> Dict[str, Any]:
+        if isinstance(chunk, Mapping):
+            return dict(chunk)
+        if hasattr(chunk, "model_dump"):
+            dumped = chunk.model_dump()
+            return dict(dumped) if isinstance(dumped, Mapping) else {}
+        return {
+            key: getattr(chunk, key, None)
+            for key in ("index", "id", "name", "args")
+        }
+
+    @staticmethod
+    def _merge_string_fragment(current: str, fragment: Any) -> str:
+        if fragment is None:
+            return current
+        text = str(fragment)
+        if not text:
+            return current
+        if not current or text.startswith(current):
+            return text
+        if text == current:
+            return current
+        return current + text
+
+    def _merge_native_tool_call_chunks(
+        self,
+        accumulated: Dict[Tuple[str, Any], Dict[str, Any]],
+        chunks: Sequence[Any],
+    ) -> None:
+        """Merge provider tool-call deltas by index without another LLM call."""
+        for position, raw_chunk in enumerate(chunks):
+            chunk = self._tool_call_chunk_mapping(raw_chunk)
+            index = chunk.get("index")
+            chunk_id = chunk.get("id")
+            if index is not None:
+                key: Tuple[str, Any] = ("index", index)
+            else:
+                # Provider IDs can themselves arrive as deltas (for example,
+                # ``call_`` followed by ``123``), so they are not safe keys.
+                # In the no-index fallback, list position is the only stable
+                # identity shared by successive streamed chunks.
+                key = ("position", position)
+
+            state = accumulated.setdefault(
+                key,
+                {
+                    "index": index,
+                    "id": "",
+                    "name": "",
+                    "args_text": "",
+                    "args_mapping": {},
+                    "has_mapping_args": False,
+                    "argument_bytes": 0,
+                },
+            )
+            state["id"] = self._merge_string_fragment(state["id"], chunk_id)
+            state["name"] = self._merge_string_fragment(
+                state["name"], chunk.get("name")
+            )
+            if len(state["id"]) > 256 or len(state["name"]) > 128:
+                raise ValueError("模型返回了过长的工具标识")
+            args_fragment = chunk.get("args")
+            if isinstance(args_fragment, Mapping):
+                state["args_mapping"].update(dict(args_fragment))
+                state["has_mapping_args"] = True
+                encoded_fragment = json.dumps(
+                    args_fragment,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=lambda item: f"<{type(item).__name__}>",
+                ).encode("utf-8")
+                state["argument_bytes"] += len(encoded_fragment)
+            elif args_fragment is not None:
+                fragment_text = str(args_fragment)
+                state["args_text"] += fragment_text
+                state["argument_bytes"] += len(fragment_text.encode("utf-8"))
+
+            if len(accumulated) > self.MAX_LLM_TOOL_CALLS:
+                raise ValueError("模型返回的工具调用数量过多")
+            if sum(
+                int(item.get("argument_bytes", 0))
+                for item in accumulated.values()
+            ) > self.MAX_LLM_TOOL_ARGUMENT_BYTES:
+                raise ValueError("模型返回的工具参数超过 1MB 上限")
+
+    def _native_tool_calls_from_chunks(
+        self,
+        accumulated: Mapping[Tuple[str, Any], Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        tool_calls: List[Dict[str, Any]] = []
+        for state in accumulated.values():
+            name = str(state.get("name") or "")
+            if not name:
+                continue
+            if state.get("has_mapping_args"):
+                args: Any = dict(state.get("args_mapping") or {})
+            else:
+                args_text = str(state.get("args_text") or "").strip()
+                if not args_text:
+                    args = {}
+                else:
+                    try:
+                        args = json.loads(args_text)
+                    except json.JSONDecodeError:
+                        # A malformed provider delta is not safe to execute with
+                        # guessed arguments; textual parsing remains available.
+                        continue
+            if not isinstance(args, Mapping):
+                continue
+            call_id = str(state.get("id") or f"call_{name}")
+            tool_calls.append({"name": name, "args": dict(args), "id": call_id})
+        return tool_calls
+
+    @staticmethod
+    def _usage_metadata_value(metadata: Any, field: str) -> int:
+        value = metadata.get(field, 0) if isinstance(metadata, Mapping) else getattr(
+            metadata, field, 0
+        )
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _publish_token_usage(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        input_chars: int,
+        output_chars: int,
+    ) -> None:
+        usage = (max(0, int(input_tokens)), max(0, int(output_tokens)))
+        self._request_token_usage.set(usage)
+        # Keep the legacy fields for diagnostic compatibility. Request-facing
+        # reads use the ContextVar below and therefore cannot observe another
+        # task's values.
+        self._last_input_tokens, self._last_output_tokens = usage
+        self._last_input_chars = max(0, int(input_chars))
+        self._last_output_chars = max(0, int(output_chars))
 
     def _convert_native_tool_calls(self, native_tool_calls) -> List[Dict]:
         """
@@ -2502,7 +3172,10 @@ BEST: 编号"""
                         "id": f"call_{tool_name}"
                     })
             except Exception as e:
-                print(f"[WARNING] 转换 tool_call 失败: {e}")
+                print(
+                    "[WARNING] 转换 tool_call 失败: "
+                    f"error_type={type(e).__name__}"
+                )
 
         return converted
 
@@ -2637,9 +3310,10 @@ BEST: 编号"""
         Returns:
             dict: 包含 input_tokens 和 output_tokens 的字典
         """
+        input_tokens, output_tokens = self._request_token_usage.get()
         return {
-            "input_tokens": self._last_input_tokens,
-            "output_tokens": self._last_output_tokens
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         }
 
     @staticmethod

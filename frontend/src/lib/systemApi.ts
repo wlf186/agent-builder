@@ -5,12 +5,12 @@
 const API_BASE = "/api";
 
 /**
- * Conda 检测结果
+ * 项目本地 uv 运行时检测结果
  */
-export interface CondaCheckResult {
-  available: boolean;       // conda 是否可用
-  path: string | null;      // conda 可执行文件路径
-  version: string | null;   // conda 版本
+export interface RuntimeCheckResult {
+  available: boolean;       // 项目本地 uv 是否可用
+  path: string | null;      // uv 可执行文件路径
+  version: string | null;   // uv 版本
   error: string | null;     // 错误代码
   message: string;          // 用户友好的消息
 }
@@ -39,10 +39,10 @@ export interface EnvironmentError {
  */
 export class SystemApi {
   /**
-   * 检测 Conda 是否可用
+   * 检测项目本地 uv 运行时是否可用
    */
-  static async checkConda(): Promise<CondaCheckResult> {
-    const response = await fetch(`${API_BASE}/system/check-conda`, {
+  static async checkRuntime(): Promise<RuntimeCheckResult> {
+    const response = await fetch(`${API_BASE}/system/check-runtime`, {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
@@ -50,7 +50,7 @@ export class SystemApi {
     });
 
     if (!response.ok) {
-      throw new Error(`检测 Conda 失败: ${response.statusText}`);
+      throw new Error(`检测本地运行时失败: ${response.statusText}`);
     }
 
     return await response.json();

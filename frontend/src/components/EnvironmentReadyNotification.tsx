@@ -6,7 +6,6 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { CheckCircle, Play, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cn } from "@/lib/utils";
 
 interface EnvironmentReadyNotificationProps {
   agentName: string;

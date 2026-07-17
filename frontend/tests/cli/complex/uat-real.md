@@ -4,7 +4,7 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (前端 localhost:20880, 后端 localhost:20881)
+- 服务已启动 (前端 localhost:20815, 后端 localhost:20881)
 - test001 智能体已配置
 
 ---
@@ -13,7 +13,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880/?agent=test001&chat=true`，等待页面加载完成
+1. 导航到 `http://localhost:20815/?agent=test001&chat=true`，等待页面加载完成
 2. 等待 2 秒
 3. 截图保存到 `test-results/cli/uat-real/real-01-chat-page.png`
 4. 找到消息输入框 (textarea)，输入 "你好，请介绍一下你自己"
@@ -46,7 +46,7 @@
 
 > 在后续操作中注意观察: 监听所有网络请求的 `X-Request-ID` / `x-request-id` 请求头
 
-1. 导航到 `http://localhost:20880/?agent=test001&chat=true`，等待页面加载完成
+1. 导航到 `http://localhost:20815/?agent=test001&chat=true`，等待页面加载完成
 2. 等待 2 秒
 3. 找到消息输入框 (textarea)，输入 "测试 Trace ID"
 4. 在 snapshot 中找到 "发送" 按钮，点击

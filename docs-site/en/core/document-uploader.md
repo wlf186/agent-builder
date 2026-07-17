@@ -1,7 +1,8 @@
 ---
-title: Document Uploader
+title: "Document Uploader"
 category: core
 component: DocumentUploader
+generated: true
 related:
   - KnowledgeBaseDialog
   - KnowledgeBaseSelector

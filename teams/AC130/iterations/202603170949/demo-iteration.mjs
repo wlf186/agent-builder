@@ -1,14 +1,15 @@
 import { chromium } from 'playwright';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, resolve } from 'path';
 import { mkdirSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const KB_ID = 'kb_7116e7ed'; // 人力资源库
-const SUCCESS_DIR = join(__dirname, 'success');
+const PROJECT_ROOT = resolve(__dirname, '../../../..');
+const SUCCESS_DIR = join(PROJECT_ROOT, '.runtime', 'test-results', 'demo-iteration');
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

@@ -293,7 +293,7 @@ export interface ToolCallEvent extends StreamEvent {
   name: string;
   call_id?: string;
   service?: string;
-  args?: Record<string, any>;
+  args?: Record<string, unknown>;
 }
 
 /**

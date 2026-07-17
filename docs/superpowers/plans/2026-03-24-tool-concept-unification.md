@@ -83,7 +83,7 @@
 - [ ] **Step 3: 验证 i18n 更改**
 
 ```bash
-cd /home/wremote/claude-dev/agent-builder-general/frontend && npm run build 2>&1 | head -30
+cd frontend && npm run build 2>&1 | head -30
 ```
 
 Expected: 无 TypeScript 错误
@@ -569,7 +569,7 @@ import {
 - [ ] **Step 6: 验证前端编译**
 
 ```bash
-cd /home/wremote/claude-dev/agent-builder-general/frontend && npm run build 2>&1 | tail -20
+cd frontend && npm run build 2>&1 | tail -20
 ```
 
 Expected: 编译成功，无错误
@@ -593,7 +593,7 @@ git commit -m "feat(page): restructure tool config as nested panel with 4 sub-se
 - [ ] **Step 1: 清除缓存并启动服务**
 
 ```bash
-cd /home/wremote/claude-dev/agent-builder-general && rm -rf frontend/.next && ./start.sh --skip-deps
+rm -rf frontend/.next && ./start.sh --skip-deps
 ```
 
 Expected: 前端在 20880 端口启动成功

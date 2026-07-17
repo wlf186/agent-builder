@@ -19,13 +19,11 @@
 import { useState } from "react";
 import {
   AlertTriangle,
-  X,
   ChevronDown,
   ChevronUp,
   Copy,
   Check,
   ExternalLink,
-  Download,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -197,14 +195,11 @@ export function EnvironmentErrorDialog({
               variant="outline"
               className="flex-1"
               onClick={() => {
-                window.open(
-                  "https://docs.conda.io/en/latest/miniconda.html",
-                  "_blank"
-                );
+                window.open("/docs/zh/help/troubleshooting", "_blank");
               }}
             >
               <ExternalLink className="h-4 w-4 mr-2" />
-              查看 Miniconda 文档
+              查看项目故障排除指南
             </Button>
             <Button
               className="flex-1"

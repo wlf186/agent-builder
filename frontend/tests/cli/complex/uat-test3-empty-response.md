@@ -5,7 +5,7 @@
 > 迭代: AC130-202603151517
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 存在 "test3" 智能体
 - test3 agent 发送 "你好" 后应返回非空响应
 
@@ -15,7 +15,7 @@
 
 > 验收标准: 发送"你好"后 assistant 返回非空字符串
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/test3-empty-response-01-homepage.png
 3. snapshot 找到 "test3" 智能体卡片，点击
 4. 等待 3 秒
@@ -37,7 +37,7 @@
 
 > 验收标准: 流式打字机效果正常
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "test3" 智能体卡片，点击
 3. 等待 3 秒
 4. snapshot 找到调试对话输入框 `input[type="text"]`，输入 "请做一个简单的自我介绍"
@@ -57,7 +57,7 @@
 
 > 验收标准: thinking/tool_call 等事件正常显示
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "test3" 智能体卡片，点击
 3. 等待 3 秒
 4. snapshot 找到调试对话输入框 `input[type="text"]`，输入 "帮我计算一下25乘以4等于多少"
@@ -73,7 +73,7 @@
 
 > 验收标准: 发送简单问候后返回非空响应
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "test3" 智能体卡片，点击
 3. 等待 3 秒
 4. snapshot 找到调试对话输入框 `input[type="text"]`，输入 "嗨"

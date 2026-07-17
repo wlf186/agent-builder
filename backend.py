@@ -3,19 +3,22 @@
 """
 import json
 import asyncio
+from collections.abc import Callable
 import os
+import re
+import uuid
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
 from datetime import datetime
 
 # 加载 .env 环境变量
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, UploadFile, Request, File, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, Field
 import uvicorn
 
 
@@ -27,7 +30,7 @@ def _calculate_mock_progress(elapsed_seconds: float) -> tuple[float, int]:
     """
     计算环境创建的模拟进度
 
-    基于观察到的Conda环境创建时间模式：
+    基于环境创建时间的保守估算：
     - 0-5秒: 初始化阶段 (0-30%)
     - 5-15秒: 下载依赖阶段 (30-70%)
     - 15-30秒: 安装配置阶段 (70-95%)
@@ -59,7 +62,7 @@ from src.models import (
     AgentConfig, LLMProvider, PlanningMode, MCPServiceConfig, MCPConnectionType,
     MCPAuthType, ModelServiceConfig, ModelProvider,
     # 新增：环境相关模型
-    AgentEnvironment, EnvironmentStatus, EnvironmentType,
+    EnvironmentStatus,
     FileInfo, ExecutionRecord, ExecutionStatus,
     # 新增：RAG 知识库相关模型 (AC130-202603161542)
     KnowledgeBase, Document, DocumentStatus, RetrievalConfig, RetrievalResult
@@ -67,7 +70,11 @@ from src.models import (
 from src.agent_manager import AgentManager
 from src.mcp_registry import MCPServiceRegistry
 from src.mcp_manager import test_mcp_connection
-from src.builtin_services import setup_builtin_services, BuiltinServiceManager, shutdown_builtin_services
+from src.builtin_services import (
+    is_builtin_service_name,
+    setup_builtin_services,
+    shutdown_builtin_services,
+)
 from src.skill_registry import SkillRegistry
 from src.skill_loader import SkillLoader
 from src.model_service_registry import ModelServiceRegistry
@@ -81,18 +88,74 @@ from src.file_storage_manager import FileStorageManager, FileStorageError
 from src.execution_engine import ExecutionEngine, ExecutionError
 # 【AC130-202603142210】循环检测器
 from src.cycle_detector import CycleDetector
+from src.observability import get_observability_status, get_tracer
+from src.security import (
+    APIAuthenticationError,
+    RequestBodyLimitMiddleware,
+    SecurityValidationError,
+    authenticate_api_headers,
+    parse_cors_origins,
+    read_json_body_limited,
+    redact_arguments,
+    redact_mapping,
+    resolve_contained_path,
+    sanitise_filename,
+    validate_execution_arguments,
+    validate_headers,
+    validate_outbound_url,
+    validate_package_specs,
+    validate_stdio_configuration,
+)
+from src.blocking_work import run_blocking_with_semaphore
+from src.log_safety import content_length, serialized_length, summarize_arguments
+from src.local_log_store import append_rotating_log, write_client_log
+from src.storage_paths import UnsafeStoragePathError, ensure_real_directory
 
 
 # 初始化
-DATA_DIR = Path(__file__).parent / "data"
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
 SKILLS_DIR = Path(__file__).parent / "skills"
-ENVIRONMENTS_DIR = Path(__file__).parent / "environments"
+RUNTIME_DIR = Path(
+    os.environ.get(
+        "AGENT_BUILDER_RUNTIME_DIR",
+        str(Path(__file__).parent / ".runtime"),
+    )
+)
+ENVIRONMENTS_DIR = RUNTIME_DIR / "environments"
+TMP_DIR = RUNTIME_DIR / "tmp"
 FILES_DIR = DATA_DIR / "files"
+try:
+    RUNTIME_DIR.absolute().relative_to(PROJECT_ROOT)
+except ValueError as exc:
+    raise RuntimeError("AGENT_BUILDER_RUNTIME_DIR must stay inside this checkout") from exc
+BLOCKING_WORK_LIMIT = max(
+    1, min(int(os.environ.get("AGENT_BUILDER_BLOCKING_WORKERS", "2")), 4)
+)
+blocking_work_semaphore = asyncio.Semaphore(BLOCKING_WORK_LIMIT)
 
-# 确保目录存在
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-ENVIRONMENTS_DIR.mkdir(parents=True, exist_ok=True)
-FILES_DIR.mkdir(parents=True, exist_ok=True)
+
+async def run_blocking_work(function: Callable[..., Any], *args: Any) -> Any:
+    """Run a synchronous mutation without releasing capacity before it exits.
+
+    Cancelling ``asyncio.to_thread`` only cancels its Future, not the underlying
+    thread. Shield and drain the real worker before propagating cancellation so
+    callers cannot accumulate invisible writers after a timeout or disconnect.
+    """
+
+    return await run_blocking_with_semaphore(
+        blocking_work_semaphore, function, *args
+    )
+
+# Recursive mkdir would follow an attacker-precreated data/runtime symlink.
+try:
+    DATA_DIR = ensure_real_directory(DATA_DIR)
+    RUNTIME_DIR = ensure_real_directory(RUNTIME_DIR)
+    ENVIRONMENTS_DIR = ensure_real_directory(ENVIRONMENTS_DIR)
+    TMP_DIR = ensure_real_directory(TMP_DIR)
+    FILES_DIR = ensure_real_directory(FILES_DIR)
+except UnsafeStoragePathError as exc:
+    raise RuntimeError("Project storage path is unsafe") from exc
 
 mcp_registry = MCPServiceRegistry(DATA_DIR)
 skill_registry = SkillRegistry(DATA_DIR, SKILLS_DIR)
@@ -107,8 +170,8 @@ execution_engine = ExecutionEngine(environment_manager, file_storage_manager, DA
 # 新增：RAG 知识库管理器 (AC130-202603161542)
 from src.knowledge_base_manager import KnowledgeBaseManager
 from src.embedder import Embedder
-kb_manager = KnowledgeBaseManager(DATA_DIR)
 embedder = Embedder()  # 【AC130-202603170949】向量化器
+kb_manager = KnowledgeBaseManager(DATA_DIR, embedder=embedder)
 
 # 初始化 AgentManager，传入 execution_engine、kb_manager 和 embedder
 manager = AgentManager(
@@ -121,112 +184,67 @@ manager = AgentManager(
     embedder=embedder       # 【AC130-202603170949】
 )
 
-# 注册预置 MCP 服务
-builtin_service_manager = BuiltinServiceManager(mcp_registry)
-registered_services = setup_builtin_services(mcp_registry)
-print(f"预置服务已注册: {registered_services}")
+# Built-in subprocesses are started by the FastAPI lifecycle, never at module
+# import.  This keeps CLI tooling, test discovery and ASGI inspection free of
+# hidden child processes.
+registered_services: List[str] = []
 
 app = FastAPI(title="Agent Builder API")
 
-# CORS
+# CORS is deliberately limited to the local frontend by default. Additional
+# origins must be explicitly configured with AGENT_BUILDER_CORS_ORIGINS.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=parse_cors_origins(),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "X-API-Key", "Content-Type", "X-Request-ID"],
 )
 
 
-# === 应用生命周期事件 ===
-from contextlib import asynccontextmanager
+@app.middleware("http")
+async def authenticate_api_request(request: Request, call_next):
+    """Fail closed for every management/execution endpoint under /api."""
+    if request.url.path == "/api" or request.url.path.startswith("/api/"):
+        # CORS preflight carries no application credentials; CORSMiddleware
+        # still validates the requesting origin before answering it.
+        if request.method != "OPTIONS":
+            try:
+                authenticate_api_headers(request.headers)
+            except APIAuthenticationError as exc:
+                headers = {"Cache-Control": "no-store"}
+                if exc.status_code == 401:
+                    headers["WWW-Authenticate"] = "Bearer"
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": exc.detail},
+                    headers=headers,
+                )
+    return await call_next(request)
 
 
-@asynccontextmanager
-async def lifespan(app):
-    """应用生命周期管理"""
-    # 启动时
-    print("\n" + "=" * 50)
-    print("🚀 Agent Builder 启动中...")
-    print("=" * 50)
-
-    # 检查MCP库依赖
-    print("\n📦 检查依赖库...")
-    try:
-        import mcp
-        import importlib.metadata
-        version = importlib.metadata.version("mcp")
-        print(f"  ✓ MCP 库已加载 (版本 {version})")
-    except ImportError:
-        print("  ✗ 警告: MCP 库未安装，远程 MCP 服务将不可用")
-        print("    修复方法: pip install mcp")
-    except Exception:
-        print("  ✓ MCP 库已加载")
-
-    print(f"\n预置 MCP 服务: {registered_services}")
-    print("=" * 50 + "\n")
-
-    yield  # 应用运行
-
-    # 关闭时
-    print("\n" + "=" * 50)
-    print("🛑 Agent Builder 关闭中...")
-    print("=" * 50)
-
-    # 关闭所有 Agent 实例
-    await manager.shutdown_all()
-    print("✓ 所有 Agent 实例已关闭")
-
-    print("=" * 50 + "\n")
+# Enforce limits at the ASGI receive boundary so multipart and chunked bodies
+# cannot be fully spooled before an endpoint gets a chance to reject them.
+app.add_middleware(RequestBodyLimitMiddleware)
 
 
-# 将生命周期管理应用到 FastAPI
-# 注意：需要在创建 app 时使用 lifespan 参数，但这里我们用事件处理代替
+def _security_error(_exc: SecurityValidationError) -> HTTPException:
+    """Translate internal validation failures without leaking implementation details."""
+    return HTTPException(status_code=400, detail="请求未通过安全校验")
 
 
 @app.on_event("startup")
 async def startup_event():
     """应用启动事件"""
+    global registered_services
+    if not registered_services:
+        registered_services = setup_builtin_services(mcp_registry)
     print("\n" + "=" * 50)
     print("🚀 Agent Builder 启动完成")
     print(f"   预置 MCP 服务: {registered_services}")
     print("=" * 50)
 
-    # 数据迁移：清空存量智能体的旧模型配置
-    _migrate_agent_configs()
-
     print("=" * 50 + "\n")
-
-
-def _migrate_agent_configs():
-    """迁移存量智能体配置，清空旧的LLM字段"""
-    configs_file = DATA_DIR / "agent_configs.json"
-    if not configs_file.exists():
-        return
-
-    try:
-        with open(configs_file, "r", encoding="utf-8") as f:
-            configs_data = json.load(f)
-
-        migrated = False
-        for name, config in configs_data.items():
-            # 清空旧的LLM配置字段
-            if config.get("llm_provider") is not None:
-                config["llm_provider"] = None
-                migrated = True
-            if config.get("llm_model") is not None:
-                config["llm_model"] = None
-                migrated = True
-            if config.get("llm_base_url") is not None:
-                config["llm_base_url"] = None
-                migrated = True
-
-        if migrated:
-            with open(configs_file, "w", encoding="utf-8") as f:
-                json.dump(configs_data, f, ensure_ascii=False, indent=2)
-            print("   ✓ 已迁移存量智能体配置")
-    except Exception as e:
-        print(f"   ✗ 迁移智能体配置失败: {e}")
 
 
 @app.on_event("shutdown")
@@ -236,13 +254,31 @@ async def shutdown_event():
     print("🛑 Agent Builder 正在关闭...")
     print("=" * 50)
 
+    # Stop background environment creation before shutting down agents.
+    await environment_creator.shutdown()
+    print("✓ 环境创建任务已关闭")
+
+    await environment_manager.shutdown()
+    print("✓ 受管 uv/Skill 子进程已关闭")
+
     # 关闭所有 Agent 实例
     await manager.shutdown_all()
     print("✓ 所有 Agent 实例已关闭")
 
     # 关闭预置服务
     shutdown_builtin_services()
+    registered_services.clear()
     print("✓ 预置 MCP 服务已关闭")
+
+    # Flush and close the process-wide vendor-neutral tracer last so shutdown
+    # spans from other components are still exportable.
+    try:
+        tracer = get_tracer()
+        tracer.force_flush()
+        await tracer.shutdown()
+        print("✓ 可观测链路已刷新并关闭")
+    except Exception as exc:
+        print(f"✗ 可观测链路关闭失败: {type(exc).__name__}")
 
     print("=" * 50 + "\n")
 
@@ -250,117 +286,117 @@ async def shutdown_event():
 # === 请求/响应模型 ===
 
 class CreateAgentRequest(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=100_000)
     # 【AC130-202603141800】支持创建时指定子Agent
-    model_service: Optional[str] = None
-    temperature: float = 0.7
-    max_iterations: int = 10
-    short_term_memory: int = 5
-    planning_mode: str = "react"
-    mcp_services: List[str] = []
-    skills: List[str] = []
-    sub_agents: List[str] = []
-    sub_agent_timeout: int = 60
-    sub_agent_max_retries: int = 1
-    sub_agent_max_concurrent: int = 3
+    model_service: Optional[str] = Field(default=None, max_length=100)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    max_iterations: int = Field(default=10, ge=1, le=50)
+    short_term_memory: int = Field(default=5, ge=0, le=50)
+    planning_mode: PlanningMode = PlanningMode.REACT
+    mcp_services: List[str] = Field(default_factory=list, max_length=100)
+    skills: List[str] = Field(default_factory=list, max_length=100)
+    sub_agents: List[str] = Field(default_factory=list, max_length=50)
+    sub_agent_timeout: int = Field(default=60, ge=10, le=300)
+    sub_agent_max_retries: int = Field(default=1, ge=0, le=3)
+    sub_agent_max_concurrent: int = Field(default=3, ge=1, le=10)
     # 【AC130-202603170949】RAG 知识库配置
-    knowledge_bases: List[str] = []
+    knowledge_bases: List[str] = Field(default_factory=list, max_length=100)
     retrieval_config: Optional[Dict[str, Any]] = None
 
 
 class UpdateAgentRequest(BaseModel):
-    persona: str
-    model_service: Optional[str] = None  # 新版：引用模型服务
+    persona: str = Field(max_length=100_000)
+    model_service: Optional[str] = Field(default=None, max_length=100)  # 新版：引用模型服务
     # 旧字段已废弃，但保留用于向后兼容
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
     llm_base_url: Optional[str] = None
-    temperature: float = 0.7
-    max_iterations: int = 10
-    short_term_memory: int = 5
-    planning_mode: str = "react"
-    mcp_services: List[str] = []
-    skills: List[str] = []
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    max_iterations: int = Field(default=10, ge=1, le=50)
+    short_term_memory: int = Field(default=5, ge=0, le=50)
+    planning_mode: PlanningMode = PlanningMode.REACT
+    mcp_services: List[str] = Field(default_factory=list, max_length=100)
+    skills: List[str] = Field(default_factory=list, max_length=100)
     # ====================================================================
     # 【AC130-202603142210】Agent-as-a-Tool: 子Agent字段
     # ====================================================================
-    sub_agents: List[str] = []
-    sub_agent_timeout: int = 60
-    sub_agent_max_retries: int = 1
-    sub_agent_max_concurrent: int = 3
+    sub_agents: List[str] = Field(default_factory=list, max_length=50)
+    sub_agent_timeout: int = Field(default=60, ge=10, le=300)
+    sub_agent_max_retries: int = Field(default=1, ge=0, le=3)
+    sub_agent_max_concurrent: int = Field(default=3, ge=1, le=10)
     # ====================================================================
     # 【AC130-202603170949】RAG 知识库配置
     # ====================================================================
-    knowledge_bases: List[str] = []
+    knowledge_bases: List[str] = Field(default_factory=list, max_length=100)
     retrieval_config: Optional[Dict[str, Any]] = None
 
 
 class CreateModelServiceRequest(BaseModel):
     """创建模型服务请求"""
-    name: str
-    description: str = ""
-    provider: str  # zhipu / alibaba_bailian / ollama
-    base_url: str
-    api_key: Optional[str] = None
-    selected_model: str
-    available_models: List[str] = []
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=2_000)
+    provider: str = Field(max_length=50)  # zhipu / alibaba_bailian / ollama
+    base_url: str = Field(max_length=2_048)
+    api_key: Optional[str] = Field(default=None, max_length=16_384)
+    selected_model: str = Field(max_length=200)
+    available_models: List[str] = Field(default_factory=list, max_length=500)
     enabled: bool = True
 
 
 class UpdateModelServiceRequest(BaseModel):
     """更新模型服务请求"""
-    description: str = ""
-    provider: str
-    base_url: str
-    api_key: Optional[str] = None
-    selected_model: str
-    available_models: List[str] = []
+    description: str = Field(default="", max_length=2_000)
+    provider: str = Field(max_length=50)
+    base_url: str = Field(max_length=2_048)
+    api_key: Optional[str] = Field(default=None, max_length=16_384)
+    selected_model: str = Field(max_length=200)
+    available_models: List[str] = Field(default_factory=list, max_length=500)
     enabled: bool = True
 
 
 class TestModelServiceRequest(BaseModel):
     """测试模型服务连接请求"""
-    provider: str
-    base_url: str
-    api_key: Optional[str] = None
+    provider: str = Field(max_length=50)
+    base_url: str = Field(max_length=2_048)
+    api_key: Optional[str] = Field(default=None, max_length=16_384)
 
 
 class ChatRequest(BaseModel):
-    message: str
-    history: List[Dict[str, str]] = []  # 对话历史 [{"role": "user/assistant", "content": "..."}]
-    file_ids: List[str] = []  # 上传文件的ID列表
-    conversation_id: Optional[str] = None  # 【Langfuse】会话ID，用于反向查询
+    message: str = Field(min_length=1, max_length=200_000)
+    history: List[Dict[str, str]] = Field(default_factory=list, max_length=200)
+    file_ids: List[str] = Field(default_factory=list, max_length=50)
+    conversation_id: Optional[str] = Field(default=None, max_length=100)
 
 
 class CreateMCPServiceRequest(BaseModel):
     """创建MCP服务请求"""
-    name: str
-    description: str = ""
-    connection_type: str = "stdio"  # stdio / sse
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(default="", max_length=2_000)
+    connection_type: str = Field(default="stdio", max_length=16)  # stdio / sse
     # stdio 配置
-    command: Optional[str] = None
-    args: List[str] = []
-    env: Dict[str, str] = {}
+    command: Optional[str] = Field(default=None, max_length=1_024)
+    args: List[str] = Field(default_factory=list, max_length=128)
+    env: Dict[str, str] = Field(default_factory=dict, max_length=128)
     # SSE 配置
-    url: Optional[str] = None
-    auth_type: str = "none"  # none / bearer / apikey
-    auth_value: Optional[str] = None
-    headers: Dict[str, str] = {}
+    url: Optional[str] = Field(default=None, max_length=2_048)
+    auth_type: str = Field(default="none", max_length=16)  # none / bearer / apikey
+    auth_value: Optional[str] = Field(default=None, max_length=16_384)
+    headers: Dict[str, str] = Field(default_factory=dict, max_length=64)
     enabled: bool = True
 
 
 class UpdateMCPServiceRequest(BaseModel):
     """更新MCP服务请求"""
-    description: str = ""
-    connection_type: str = "stdio"
-    command: Optional[str] = None
-    args: List[str] = []
-    env: Dict[str, str] = {}
-    url: Optional[str] = None
-    auth_type: str = "none"
-    auth_value: Optional[str] = None
-    headers: Dict[str, str] = {}
+    description: str = Field(default="", max_length=2_000)
+    connection_type: str = Field(default="stdio", max_length=16)
+    command: Optional[str] = Field(default=None, max_length=1_024)
+    args: List[str] = Field(default_factory=list, max_length=128)
+    env: Dict[str, str] = Field(default_factory=dict, max_length=128)
+    url: Optional[str] = Field(default=None, max_length=2_048)
+    auth_type: str = Field(default="none", max_length=16)
+    auth_value: Optional[str] = Field(default=None, max_length=16_384)
+    headers: Dict[str, str] = Field(default_factory=dict, max_length=64)
     enabled: bool = True
 
 
@@ -372,26 +408,96 @@ class AgentResponse(BaseModel):
     created_at: str
 
 
+def _validate_resource_name(name: str, label: str) -> str:
+    candidate = name.strip() if isinstance(name, str) else ""
+    if (
+        not candidate
+        or len(candidate) > 100
+        or candidate in {".", ".."}
+        or "/" in candidate
+        or "\\" in candidate
+        or any(ord(char) < 32 for char in candidate)
+        or re.fullmatch(r"[\w .-]+", candidate, flags=re.UNICODE) is None
+    ):
+        raise HTTPException(status_code=400, detail=f"{label}无效")
+    return candidate
+
+
+async def _validate_mcp_payload(req) -> MCPConnectionType:
+    try:
+        connection_type = MCPConnectionType(req.connection_type)
+        if req.auth_value is not None and len(req.auth_value) > 16_384:
+            raise SecurityValidationError("MCP authentication value is too long")
+        validate_headers(req.headers)
+        if connection_type == MCPConnectionType.STDIO:
+            validate_stdio_configuration(req.command, req.args, req.env)
+        else:
+            if not req.url:
+                raise SecurityValidationError("SSE MCP URL is required")
+            await validate_outbound_url(req.url)
+    except (ValueError, SecurityValidationError) as exc:
+        raise _security_error(
+            exc if isinstance(exc, SecurityValidationError) else SecurityValidationError(str(exc))
+        ) from exc
+    return connection_type
+
+
+async def _validate_model_service_url(base_url: str) -> str:
+    try:
+        return await validate_outbound_url(base_url)
+    except SecurityValidationError as exc:
+        raise _security_error(exc) from exc
+
+
+def _restore_redacted_mapping(existing: Dict[str, str], submitted: Dict[str, str]) -> Dict[str, str]:
+    return {
+        key: existing[key] if value == "***" and key in existing else value
+        for key, value in submitted.items()
+    }
+
+
+def _restore_redacted_arguments(existing: List[str], submitted: List[str]) -> List[str]:
+    restored: List[str] = []
+    for index, value in enumerate(submitted):
+        if value == "***" and index < len(existing):
+            restored.append(existing[index])
+        elif value.endswith("=***") and index < len(existing):
+            key = value[:-3]
+            if existing[index].startswith(key):
+                restored.append(existing[index])
+            else:
+                restored.append(value)
+        else:
+            restored.append(value)
+    return restored
+
+
 # === API 路由 ===
 
 # === 系统级 API ===
 
-@app.get("/api/system/check-conda")
-async def check_conda():
+@app.get("/api/system/check-runtime")
+async def check_runtime():
     """
-    检测 Conda 是否可用
+    检测项目内 uv/Python 运行时是否可用
 
     Returns:
         {
-            "available": bool,           # conda 是否可用
-            "path": str | None,          # conda 可执行文件路径
-            "version": str | None,       # conda 版本
+            "available": bool,           # uv 是否可用
+            "path": str | None,          # uv 可执行文件路径
+            "version": str | None,       # uv 版本
             "error": str | None,         # 错误代码
             "message": str               # 用户友好的消息
         }
     """
-    result = await EnvironmentManager.check_conda_available()
+    result = await EnvironmentManager.check_runtime_available()
     return result
+
+
+@app.get("/api/system/observability")
+async def observability_status():
+    """Return the active vendor-neutral tracing backend status."""
+    return get_observability_status()
 
 
 @app.get("/api/agents")
@@ -428,11 +534,12 @@ async def create_agent(req: CreateAgentRequest):
     创建智能体后立即返回，环境在后台异步创建。
     前端应轮询 GET /api/agents/{name}/environment 获取环境状态。
     """
-    if not req.name or not req.name.strip():
-        raise HTTPException(status_code=400, detail="Agent名称不能为空")
+    agent_name = _validate_resource_name(req.name, "Agent名称")
 
-    if req.name in manager.list_agents():
+    if agent_name in manager.list_agents():
         raise HTTPException(status_code=400, detail="Agent名称已存在")
+    if len(manager.list_agents()) >= manager.MAX_AGENT_CONFIGS:
+        raise HTTPException(status_code=409, detail="Agent 数量已达到 100 个上限")
 
     # 【AC130-202603141800】创建时进行循环检测
     if req.sub_agents:
@@ -441,19 +548,19 @@ async def create_agent(req: CreateAgentRequest):
 
         # 构建调用图
         configs = {}
-        for agent_name in all_agent_names:
-            config = manager.get_config(agent_name)
+        for existing_agent_name in all_agent_names:
+            config = manager.get_config(existing_agent_name)
             if config:
-                configs[agent_name] = getattr(config, 'sub_agents', []) or []
+                configs[existing_agent_name] = getattr(config, 'sub_agents', []) or []
 
         # 添加正在创建的Agent
-        configs[req.name.strip()] = req.sub_agents
+        configs[agent_name] = req.sub_agents
 
         # 检测循环
-        detector = CycleDetector(all_agent_names + [req.name.strip()])
+        detector = CycleDetector(all_agent_names + [agent_name])
         detector.build_from_configs(configs)
 
-        cycle_result = detector.validate_config(req.name.strip(), req.sub_agents)
+        cycle_result = detector.validate_config(agent_name, req.sub_agents)
         if cycle_result.has_cycle:
             raise HTTPException(
                 status_code=400,
@@ -465,13 +572,13 @@ async def create_agent(req: CreateAgentRequest):
             )
 
     config = AgentConfig(
-        name=req.name.strip(),
+        name=agent_name,
         persona=req.description or "你是一个有帮助的AI助手。",
         model_service=req.model_service,
         temperature=req.temperature,
         max_iterations=req.max_iterations,
         short_term_memory=req.short_term_memory,
-        planning_mode=PlanningMode(req.planning_mode),
+        planning_mode=req.planning_mode,
         mcp_services=req.mcp_services,
         skills=req.skills,
         # 【AC130-202603141800】子Agent字段
@@ -485,21 +592,10 @@ async def create_agent(req: CreateAgentRequest):
     )
 
     if manager.create_agent_config(config):
-        agent_name = req.name.strip()
-
-        # 创建初始环境元数据（状态为creating）
-        initial_env = AgentEnvironment(
-            agent_name=agent_name,
-            environment_type=EnvironmentType.CONDA,
-            status=EnvironmentStatus.CREATING,
-            python_version="3.11"
-        )
-        environment_manager._save_metadata(initial_env)
-
-        # 异步启动环境创建任务（不阻塞响应）
-        asyncio.create_task(
-            environment_creator.create(agent_name)
-        )
+        # create() only registers the managed background task and returns
+        # immediately. Awaiting registration closes the create/delete race;
+        # EnvironmentManager writes CREATING metadata inside its writer gate.
+        await environment_creator.create(agent_name)
 
         print(f"[AGENT] 已创建智能体 {agent_name}，后台环境创建任务已启动")
 
@@ -511,6 +607,26 @@ async def create_agent(req: CreateAgentRequest):
         }
     else:
         raise HTTPException(status_code=500, detail="创建失败")
+
+
+@app.get("/api/agents/call-graph")
+async def get_global_call_graph():
+    """获取系统中所有 Agent 之间的调用关系。"""
+    all_agent_names = list(manager.list_agents())
+    configs = {}
+    for existing_agent_name in all_agent_names:
+        config = manager.get_config(existing_agent_name)
+        if config:
+            configs[existing_agent_name] = getattr(config, "sub_agents", []) or []
+
+    detector = CycleDetector(all_agent_names)
+    detector.build_from_configs(configs)
+    cycle_result = detector.detect_cycle()
+    return {
+        "call_graph": detector.get_call_graph().to_dict(),
+        "has_cycle": cycle_result.has_cycle,
+        "cycle_message": cycle_result.message if cycle_result.has_cycle else None,
+    }
 
 
 @app.get("/api/agents/{name}")
@@ -597,7 +713,7 @@ async def update_agent(name: str, req: UpdateAgentRequest):
         temperature=req.temperature,
         max_iterations=req.max_iterations,
         short_term_memory=req.short_term_memory,
-        planning_mode=PlanningMode(req.planning_mode),
+        planning_mode=req.planning_mode,
         mcp_services=req.mcp_services,
         skills=req.skills,
         # 【AC130-202603142210】子Agent字段
@@ -619,23 +735,47 @@ async def update_agent(name: str, req: UpdateAgentRequest):
 @app.delete("/api/agents/{name}")
 async def delete_agent(name: str):
     """删除 Agent"""
+    if name not in manager.list_agents():
+        raise HTTPException(status_code=404, detail="Agent不存在")
+
+    # Stop creation and in-flight execution before removing directories.  This
+    # prevents a late background task from recreating an environment after the
+    # Agent has been deleted.
+    await environment_creator.cancel(name)
     if manager.delete_agent_config(name):
+        await manager.ensure_agent_stopped(name)
+        cleanup_complete = True
         # 清理关联资源（环境和文件）
         try:
-            # 清理 Conda 环境
+            # 清理该 Agent 的项目内 Python 环境
             await environment_manager.delete_environment(name)
             print(f"[AGENT] 已删除 {name} 的执行环境")
         except Exception as e:
-            print(f"[AGENT] 删除环境失败: {e}")
+            print(f"[AGENT] 删除环境失败: error_type={type(e).__name__}")
+            cleanup_complete = False
 
         try:
             # 清理上传的文件
             await file_storage_manager.cleanup_agent_files(name)
             print(f"[AGENT] 已清理 {name} 的上传文件")
         except Exception as e:
-            print(f"[AGENT] 清理文件失败: {e}")
+            print(f"[AGENT] 清理文件失败: error_type={type(e).__name__}")
+            cleanup_complete = False
 
-        return {"success": True}
+        try:
+            await asyncio.to_thread(
+                conversation_manager.delete_agent_conversations, name
+            )
+            print(f"[AGENT] 已清理 {name} 的会话")
+        except Exception as e:
+            print(f"[AGENT] 清理会话失败: error_type={type(e).__name__}")
+            cleanup_complete = False
+
+        if not await execution_engine.cleanup_agent_executions(name):
+            print(f"[AGENT] 清理执行记录失败: {name}")
+            cleanup_complete = False
+
+        return {"success": True, "cleanup_complete": cleanup_complete}
     else:
         raise HTTPException(status_code=404, detail="Agent不存在")
 
@@ -727,35 +867,6 @@ async def validate_sub_agents(name: str, req: ValidateSubAgentsRequest):
     )
 
 
-@app.get("/api/agents/call-graph")
-async def get_global_call_graph():
-    """获取全局Agent调用关系图
-
-    返回系统中所有Agent之间的调用关系。
-    """
-    all_agent_names = list(manager.list_agents())
-
-    # 构建调用图
-    configs = {}
-    for agent_name in all_agent_names:
-        config = manager.get_config(agent_name)
-        if config:
-            configs[agent_name] = getattr(config, 'sub_agents', []) or []
-
-    # 创建循环检测器并构建调用图
-    detector = CycleDetector(all_agent_names)
-    detector.build_from_configs(configs)
-
-    # 检测循环
-    cycle_result = detector.detect_cycle()
-
-    return {
-        "call_graph": detector.get_call_graph().to_dict(),
-        "has_cycle": cycle_result.has_cycle,
-        "cycle_message": cycle_result.message if cycle_result.has_cycle else None
-    }
-
-
 @app.post("/api/agents/{name}/chat")
 async def chat_with_agent(name: str, req: ChatRequest):
     """与 Agent 对话"""
@@ -769,8 +880,8 @@ async def chat_with_agent(name: str, req: ChatRequest):
     try:
         response = await instance.chat(req.message, req.history)
         return {"response": response}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Agent 请求处理失败") from exc
 
 
 # ============================================================================
@@ -795,7 +906,7 @@ async def chat_with_agent(name: str, req: ChatRequest):
 # - frontend/src/components/AgentChat.tsx - 前端渲染
 # ============================================================================
 @app.post("/api/agents/{name}/chat/stream")
-async def chat_stream(name: str, req: ChatRequest):
+async def chat_stream(name: str, req: ChatRequest, request: Request):
     """流式对话 - 支持返回 thinking、工具调用和最终回答
 
     【AC130-202603150000】增强异常处理 - 添加结构化日志和错误事件
@@ -811,12 +922,11 @@ async def chat_stream(name: str, req: ChatRequest):
     # 从请求头或自动生成 request_id
     # ============================================================================
     from src.stream_logger import get_logger, cleanup_old_logs
-    import uuid
-    import traceback
-
-    # 这里需要从实际请求头获取，但由于 FastAPI 的限制，我们在 generate 内部处理
-    # 暂时生成一个临时 ID，后续可以从请求上下文获取
-    request_id = f"stream-{uuid.uuid4().hex[:8]}"
+    supplied_request_id = request.headers.get("x-request-id", "")
+    if re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", supplied_request_id):
+        request_id = supplied_request_id
+    else:
+        request_id = f"stream-{uuid.uuid4().hex[:16]}"
     logger = get_logger(request_id)
 
     async def generate():
@@ -831,10 +941,11 @@ async def chat_stream(name: str, req: ChatRequest):
         # ============================================================================
         logger.log_event("request_start", {
             "agent_name": name,
-            "message": req.message,
             "message_length": len(req.message),
             "history_count": len(req.history) if req.history else 0,
-            "file_ids": req.file_ids if req.file_ids else []
+            "file_count": len(req.file_ids) if req.file_ids else 0,
+            "conversation_id": req.conversation_id,
+            "request_id": request_id,
         })
 
         try:
@@ -855,13 +966,10 @@ async def chat_stream(name: str, req: ChatRequest):
             # 构建文件上下文（增强版，包含 file_id 表格和调用示例）
             file_context = ""
             file_ids_list = []
-            print(f"[DEBUG] req.file_ids = {req.file_ids}")
             if req.file_ids:
                 try:
                     files = await file_storage_manager.list_files(name)
-                    print(f"[DEBUG] 所有文件: {[(f.file_id, f.filename) for f in files]}")
                     matched_files = [f for f in files if f.file_id in req.file_ids]
-                    print(f"[DEBUG] matched_files = {[(f.file_id, f.filename) for f in matched_files]}")
                     if matched_files:
                         file_context = "\n\n=== 用户上传的文件 ===\n\n"
                         file_context += "| file_id | 文件名 | 类型 | 大小 |\n"
@@ -896,8 +1004,8 @@ async def chat_stream(name: str, req: ChatRequest):
                             "file_ids": file_ids_list
                         })
                 except Exception as e:
-                    logger.log_error("FileLoadError", str(e))
-                    print(f"[WARN] 获取文件信息失败: {e}")
+                    logger.log_error("FileLoadError", "文件信息加载失败")
+                    print(f"[WARN] 获取文件信息失败: error_type={type(e).__name__}")
 
             logger.log_event("llm_call_start", {
                 "message_length": len(req.message)
@@ -907,10 +1015,16 @@ async def chat_stream(name: str, req: ChatRequest):
             # 【AC130-202603150000】增强异常处理 - 捕获 LLM 调用异常
             # ============================================================================
             try:
-                # Generate session_id for Langfuse (group traces by conversation)
-                langfuse_session_id = req.conversation_id or f"anon-{uuid.uuid4().hex[:8]}"
+                # Group trace spans by conversation when one is available.
+                session_id = req.conversation_id or f"anon-{uuid.uuid4().hex[:8]}"
 
-                async for event in instance.chat_stream(req.message, req.history, file_context, conversation_id=langfuse_session_id):
+                async for event in instance.chat_stream(
+                    req.message,
+                    req.history,
+                    file_context,
+                    trace_id=request_id,
+                    conversation_id=session_id,
+                ):
                     # 记录 SSE 事件类型（用于调试）
                     event_type = event.get('type', 'unknown')
                     logger.log_sse_event(event_type)
@@ -952,11 +1066,11 @@ async def chat_stream(name: str, req: ChatRequest):
 
                 request_completed = True
 
-            except asyncio.TimeoutError as e:
+            except asyncio.TimeoutError:
                 # ============================================================================
                 # 【AC130-202603150000】超时异常处理
                 # ============================================================================
-                logger.log_error("TimeoutError", f"请求超时: {str(e)}")
+                logger.log_error("TimeoutError", "请求超时")
                 yield _error_event("请求超时，请稍后重试")
                 return
 
@@ -965,11 +1079,10 @@ async def chat_stream(name: str, req: ChatRequest):
                 # 【AC130-202603150000】LLM 流式输出异常处理
                 # ============================================================================
                 error_type = type(e).__name__
-                error_msg = str(e)
-                logger.log_error(error_type, error_msg, traceback.format_exc())
+                logger.log_error(error_type, "流式处理失败")
 
                 # 发送结构化错误事件
-                yield _error_event(f"处理请求时发生错误: {error_msg}")
+                yield _error_event("处理请求时发生错误，请查看服务端日志")
                 return
 
             finally:
@@ -1001,7 +1114,7 @@ async def chat_stream(name: str, req: ChatRequest):
                             if service:
                                 context_window = get_context_window_size(service.selected_model)
                 except Exception as e:
-                    print(f"[WARN] 获取 token 使用信息失败: {e}")
+                    print(f"[WARN] 获取 token 使用信息失败: error_type={type(e).__name__}")
 
                 metrics = {
                     'type': 'metrics',
@@ -1027,8 +1140,8 @@ async def chat_stream(name: str, req: ChatRequest):
             # ============================================================================
             # 【AC130-202603150000】端点级异常处理
             # ============================================================================
-            logger.log_error("EndpointError", str(e), traceback.format_exc())
-            yield _error_event(f"端点处理错误: {str(e)}")
+            logger.log_error("EndpointError", "端点处理失败")
+            yield _error_event("端点处理错误，请查看服务端日志")
         finally:
             # ============================================================================
             # 【AC130-202603150000】清理旧日志
@@ -1086,28 +1199,31 @@ async def list_mcp_services():
 @app.post("/api/mcp-services")
 async def create_mcp_service(req: CreateMCPServiceRequest):
     """创建 MCP 服务"""
-    if not req.name or not req.name.strip():
-        raise HTTPException(status_code=400, detail="服务名称不能为空")
+    name = _validate_resource_name(req.name, "服务名称")
+    connection_type = await _validate_mcp_payload(req)
 
-    if mcp_registry.service_exists(req.name):
+    if mcp_registry.service_exists(name):
         raise HTTPException(status_code=400, detail="服务名称已存在")
 
-    config = MCPServiceConfig(
-        name=req.name.strip(),
-        description=req.description,
-        connection_type=MCPConnectionType(req.connection_type),
-        command=req.command,
-        args=req.args,
-        env=req.env,
-        url=req.url,
-        auth_type=MCPAuthType(req.auth_type),
-        auth_value=req.auth_value,
-        headers=req.headers,
-        enabled=req.enabled
-    )
+    try:
+        config = MCPServiceConfig(
+            name=name,
+            description=req.description[:2_000],
+            connection_type=connection_type,
+            command=req.command,
+            args=req.args,
+            env=req.env,
+            url=req.url,
+            auth_type=MCPAuthType(req.auth_type),
+            auth_value=req.auth_value,
+            headers=req.headers,
+            enabled=req.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="MCP认证类型无效") from exc
 
-    if mcp_registry.create_service(config):
-        return {"success": True, "name": req.name}
+    if await run_blocking_work(mcp_registry.create_service, config):
+        return {"success": True, "name": name}
     else:
         raise HTTPException(status_code=500, detail="创建失败")
 
@@ -1124,12 +1240,12 @@ async def get_mcp_service(name: str):
         "description": service.description,
         "connection_type": service.connection_type.value,
         "command": service.command,
-        "args": service.args,
-        "env": service.env,
+        "args": redact_arguments(service.args),
+        "env": redact_mapping(service.env),
         "url": service.url,
         "auth_type": service.auth_type.value if service.auth_type else "none",
         "auth_value": "***" if service.auth_value else None,  # 隐藏敏感信息
-        "headers": service.headers,
+        "headers": redact_mapping(service.headers),
         "enabled": service.enabled,
         "created_at": service.created_at,
         "updated_at": service.updated_at
@@ -1139,26 +1255,40 @@ async def get_mcp_service(name: str):
 @app.put("/api/mcp-services/{name}")
 async def update_mcp_service(name: str, req: UpdateMCPServiceRequest):
     """更新 MCP 服务配置"""
+    _validate_resource_name(name, "服务名称")
+    if is_builtin_service_name(name):
+        raise HTTPException(status_code=403, detail="预置服务不能修改")
     existing = mcp_registry.get_service(name)
     if not existing:
         raise HTTPException(status_code=404, detail="服务不存在")
 
-    config = MCPServiceConfig(
-        name=name,
-        description=req.description,
-        connection_type=MCPConnectionType(req.connection_type),
-        command=req.command,
-        args=req.args,
-        env=req.env,
-        url=req.url,
-        auth_type=MCPAuthType(req.auth_type),
-        # 如果 auth_value 为空，保留原有的
-        auth_value=req.auth_value if req.auth_value else existing.auth_value,
-        headers=req.headers,
-        enabled=req.enabled
-    )
+    req.args = _restore_redacted_arguments(existing.args, req.args)
+    req.env = _restore_redacted_mapping(existing.env, req.env)
+    req.headers = _restore_redacted_mapping(existing.headers, req.headers)
+    connection_type = await _validate_mcp_payload(req)
+    try:
+        config = MCPServiceConfig(
+            name=name,
+            description=req.description[:2_000],
+            connection_type=connection_type,
+            command=req.command,
+            args=req.args,
+            env=req.env,
+            url=req.url,
+            auth_type=MCPAuthType(req.auth_type),
+            # 如果 auth_value 为空，保留原有的
+            auth_value=(
+                existing.auth_value
+                if req.auth_value in {None, "", "***"}
+                else req.auth_value
+            ),
+            headers=req.headers,
+            enabled=req.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="MCP认证类型无效") from exc
 
-    if mcp_registry.update_service(name, config):
+    if await run_blocking_work(mcp_registry.update_service, name, config):
         return {"success": True}
     else:
         raise HTTPException(status_code=500, detail="保存失败")
@@ -1168,10 +1298,10 @@ async def update_mcp_service(name: str, req: UpdateMCPServiceRequest):
 async def delete_mcp_service(name: str):
     """删除 MCP 服务"""
     # 检查是否为预置服务
-    if builtin_service_manager.is_builtin_service(name):
+    if is_builtin_service_name(name):
         raise HTTPException(status_code=403, detail="预置服务不能删除")
 
-    if mcp_registry.delete_service(name):
+    if await run_blocking_work(mcp_registry.delete_service, name):
         return {"success": True}
     else:
         raise HTTPException(status_code=404, detail="服务不存在")
@@ -1221,8 +1351,10 @@ async def diagnose_mcp_service_endpoint(name: str):
     try:
         report = await mcp_diag.diagnose_mcp_service(service)
         return report.model_dump()
+    except SecurityValidationError as e:
+        raise _security_error(e) from e
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"诊断失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="诊断失败") from e
 
 
 # === Skills API ===
@@ -1329,25 +1461,33 @@ async def get_skill_file_content(name: str, filepath: str):
         "filepath": filepath
     }
 
-
-from fastapi import UploadFile, File
-
-
 @app.post("/api/skills/upload")
 async def upload_skill(file: UploadFile = File(...)):
     """上传 Skill（zip包）"""
-    if not file.filename or not file.filename.endswith('.zip'):
+    if not file.filename or not file.filename.lower().endswith('.zip'):
         raise HTTPException(status_code=400, detail="只支持zip文件")
 
-    # 保存上传的文件到临时目录
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_file:
-        content = await file.read()
-        tmp_file.write(content)
-        tmp_path = Path(tmp_file.name)
-
+    # Stream to a bounded temporary file; never materialise the archive in RAM.
+    tmp_path = None
     try:
-        success, message, skill_config = skill_registry.extract_zip_and_register(tmp_path)
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix='.zip', dir=TMP_DIR
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            uploaded = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                uploaded += len(chunk)
+                if uploaded > skill_registry.MAX_ARCHIVE_SIZE:
+                    raise HTTPException(status_code=413, detail="Zip包过大，最大支持25MB")
+                tmp_file.write(chunk)
+
+        success, message, skill_config = await run_blocking_work(
+            skill_registry.extract_zip_and_register, tmp_path
+        )
         if success and skill_config:
             return {
                 "success": True,
@@ -1365,7 +1505,7 @@ async def upload_skill(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail=message)
     finally:
         # 清理临时文件
-        if tmp_path.exists():
+        if tmp_path and tmp_path.exists():
             tmp_path.unlink()
 
 
@@ -1396,25 +1536,28 @@ async def list_model_services():
 @app.post("/api/model-services")
 async def create_model_service(req: CreateModelServiceRequest):
     """创建模型服务"""
-    if not req.name or not req.name.strip():
-        raise HTTPException(status_code=400, detail="服务名称不能为空")
+    name = _validate_resource_name(req.name, "服务名称")
+    base_url = await _validate_model_service_url(req.base_url)
 
-    if model_service_registry.service_exists(req.name):
+    if model_service_registry.service_exists(name):
         raise HTTPException(status_code=400, detail="服务名称已存在")
 
-    config = ModelServiceConfig(
-        name=req.name.strip(),
-        description=req.description,
-        provider=ModelProvider(req.provider),
-        base_url=req.base_url,
-        api_key=req.api_key,
-        selected_model=req.selected_model,
-        available_models=req.available_models,
-        enabled=req.enabled
-    )
+    try:
+        config = ModelServiceConfig(
+            name=name,
+            description=req.description[:2_000],
+            provider=ModelProvider(req.provider),
+            base_url=base_url,
+            api_key=req.api_key,
+            selected_model=req.selected_model[:200],
+            available_models=req.available_models[:500],
+            enabled=req.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="模型供应商无效") from exc
 
-    if model_service_registry.create_service(config):
-        return {"success": True, "name": req.name}
+    if await run_blocking_work(model_service_registry.create_service, config):
+        return {"success": True, "name": name}
     else:
         raise HTTPException(status_code=500, detail="创建失败")
 
@@ -1443,23 +1586,32 @@ async def get_model_service(name: str):
 @app.put("/api/model-services/{name}")
 async def update_model_service(name: str, req: UpdateModelServiceRequest):
     """更新模型服务配置"""
+    _validate_resource_name(name, "服务名称")
     existing = model_service_registry.get_service(name)
     if not existing:
         raise HTTPException(status_code=404, detail="服务不存在")
 
-    config = ModelServiceConfig(
-        name=name,
-        description=req.description,
-        provider=ModelProvider(req.provider),
-        base_url=req.base_url,
-        # 如果 api_key 为空，保留原有的
-        api_key=req.api_key if req.api_key else existing.api_key,
-        selected_model=req.selected_model,
-        available_models=req.available_models,
-        enabled=req.enabled
-    )
+    base_url = await _validate_model_service_url(req.base_url)
+    try:
+        config = ModelServiceConfig(
+            name=name,
+            description=req.description[:2_000],
+            provider=ModelProvider(req.provider),
+            base_url=base_url,
+            # 如果 api_key 为空，保留原有的
+            api_key=(
+                existing.api_key
+                if req.api_key in {None, "", "***"}
+                else req.api_key
+            ),
+            selected_model=req.selected_model[:200],
+            available_models=req.available_models[:500],
+            enabled=req.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="模型供应商无效") from exc
 
-    if model_service_registry.update_service(name, config):
+    if await run_blocking_work(model_service_registry.update_service, name, config):
         return {"success": True}
     else:
         raise HTTPException(status_code=500, detail="保存失败")
@@ -1468,7 +1620,7 @@ async def update_model_service(name: str, req: UpdateModelServiceRequest):
 @app.delete("/api/model-services/{name}")
 async def delete_model_service(name: str):
     """删除模型服务"""
-    if model_service_registry.delete_service(name):
+    if await run_blocking_work(model_service_registry.delete_service, name):
         return {"success": True}
     else:
         raise HTTPException(status_code=404, detail="服务不存在")
@@ -1477,9 +1629,14 @@ async def delete_model_service(name: str):
 @app.post("/api/model-services/test")
 async def test_model_service(req: TestModelServiceRequest):
     """测试模型服务连接"""
+    base_url = await _validate_model_service_url(req.base_url)
+    try:
+        provider = ModelProvider(req.provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="模型供应商无效") from exc
     result = await test_model_service_connection(
-        ModelProvider(req.provider),
-        req.base_url,
+        provider,
+        base_url,
         req.api_key
     )
     return result
@@ -1489,7 +1646,7 @@ async def test_model_service(req: TestModelServiceRequest):
 async def get_default_url(provider: str):
     """获取供应商默认URL"""
     try:
-        default_url = model_service_registry.get_default_url(ModelProvider(provider))
+        default_url = model_service_registry.get_default_base_url(ModelProvider(provider))
         return {"default_url": default_url}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"不支持的供应商: {provider}")
@@ -1504,26 +1661,42 @@ async def health():
 
 class CreateConversationRequest(BaseModel):
     """创建会话请求"""
-    title: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=500)
 
 
 class UpdateConversationRequest(BaseModel):
     """更新会话请求"""
-    title: str
+    title: str = Field(min_length=1, max_length=500)
 
 
 class AddMessageRequest(BaseModel):
     """添加消息请求"""
-    role: str
-    content: str
-    thinking: Optional[str] = None
-    tool_calls: Optional[List[Dict]] = None
-    metrics: Optional[Dict] = None
+    role: str = Field(pattern=r"^(user|assistant|system)$")
+    content: str = Field(max_length=500_000)
+    thinking: Optional[str] = Field(default=None, max_length=500_000)
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=100)
+    metrics: Optional[Dict[str, Any]] = None
+
+
+class ConversationMessageRequest(BaseModel):
+    """Bounded message payload accepted by full and incremental sync APIs."""
+    id: str = Field(min_length=1, max_length=100, pattern=r"^[A-Za-z0-9._:-]+$")
+    role: str = Field(pattern=r"^(user|assistant|system)$")
+    content: str = Field(max_length=500_000)
+    thinking: Optional[str] = Field(default=None, max_length=500_000)
+    tool_calls: Optional[List[Dict[str, Any]]] = Field(default=None, max_length=100)
+    metrics: Optional[Dict[str, Any]] = None
+    timestamp: Optional[str] = Field(default=None, max_length=100)
 
 
 class SaveMessagesRequest(BaseModel):
     """批量保存消息请求"""
-    messages: List[Dict]
+    messages: List[ConversationMessageRequest] = Field(max_length=1_000)
+
+
+class SyncMessagesRequest(BaseModel):
+    """Incrementally synchronize one bounded conversation turn."""
+    messages: List[ConversationMessageRequest] = Field(min_length=1, max_length=10)
 
 
 @app.get("/api/agents/{name}/conversations")
@@ -1532,7 +1705,7 @@ async def list_conversations(name: str):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    conversations = conversation_manager.list_conversations(name)
+    conversations = await asyncio.to_thread(conversation_manager.list_conversations, name)
     return {
         "conversations": conversations,
         "total": len(conversations)
@@ -1545,7 +1718,12 @@ async def create_conversation(name: str, req: CreateConversationRequest):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    conversation = conversation_manager.create_conversation(name, req.title)
+    try:
+        conversation = await asyncio.to_thread(
+            conversation_manager.create_conversation, name, req.title
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="会话数量已达到存储上限") from exc
     return {
         "id": conversation.id,
         "title": conversation.title,
@@ -1561,7 +1739,9 @@ async def get_conversation(name: str, conversation_id: str):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    conversation = conversation_manager.get_conversation(name, conversation_id)
+    conversation = await asyncio.to_thread(
+        conversation_manager.get_conversation, name, conversation_id
+    )
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -1580,7 +1760,9 @@ async def update_conversation(name: str, conversation_id: str, req: UpdateConver
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    conversation = conversation_manager.update_conversation(name, conversation_id, req.title)
+    conversation = await asyncio.to_thread(
+        conversation_manager.update_conversation, name, conversation_id, req.title
+    )
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -1600,7 +1782,9 @@ async def delete_conversation(name: str, conversation_id: str):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    if conversation_manager.delete_conversation(name, conversation_id):
+    if await asyncio.to_thread(
+        conversation_manager.delete_conversation, name, conversation_id
+    ):
         return {"success": True}
     else:
         raise HTTPException(status_code=404, detail="会话不存在")
@@ -1612,15 +1796,19 @@ async def add_conversation_message(name: str, conversation_id: str, req: AddMess
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    message = conversation_manager.add_message(
-        name,
-        conversation_id,
-        req.role,
-        req.content,
-        req.thinking,
-        req.tool_calls,
-        req.metrics
-    )
+    try:
+        message = await asyncio.to_thread(
+            conversation_manager.add_message,
+            name,
+            conversation_id,
+            req.role,
+            req.content,
+            req.thinking,
+            req.tool_calls,
+            req.metrics,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail="会话消息超过存储限制") from exc
     if not message:
         raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -1636,7 +1824,13 @@ async def save_conversation_messages(name: str, conversation_id: str, req: SaveM
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    conversation = conversation_manager.save_messages(name, conversation_id, req.messages)
+    messages = [message.model_dump(exclude_none=True) for message in req.messages]
+    try:
+        conversation = await asyncio.to_thread(
+            conversation_manager.save_messages, name, conversation_id, messages
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail="会话消息超过存储限制") from exc
     if not conversation:
         raise HTTPException(status_code=404, detail="会话不存在")
 
@@ -1651,51 +1845,107 @@ async def save_conversation_messages(name: str, conversation_id: str, req: SaveM
     }
 
 
+@app.post("/api/agents/{name}/conversations/{conversation_id}/messages/sync")
+async def sync_conversation_messages(
+    name: str,
+    conversation_id: str,
+    req: SyncMessagesRequest,
+):
+    """Upsert only the messages changed by the current completed turn."""
+    if name not in manager.list_agents():
+        raise HTTPException(status_code=404, detail="Agent不存在")
+
+    messages = [message.model_dump(exclude_none=True) for message in req.messages]
+    try:
+        conversation = await asyncio.to_thread(
+            conversation_manager.sync_messages, name, conversation_id, messages
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail="会话消息超过存储限制") from exc
+    if not conversation:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return {
+        "success": True,
+        "conversation": {
+            "id": conversation.id,
+            "title": conversation.title,
+            "message_count": conversation.message_count,
+            "updated_at": conversation.updated_at,
+        },
+    }
+
+
 # === 日志收集 ===
-from datetime import datetime
+
+
+def _append_rotating_log(
+    path: Path,
+    entry: str,
+    max_bytes: int = 20 * 1024 * 1024,
+    backups: int = 5,
+) -> None:
+    append_rotating_log(DATA_DIR, path, entry, max_bytes, backups)
+
+
+def _write_client_log(log_file: Path, log_data: Any, logs_dir: Path) -> None:
+    write_client_log(DATA_DIR, log_file, log_data, logs_dir)
+
 
 @app.post("/api/log")
-async def save_log(log_data: dict):
-    """保存前端日志"""
+async def save_log(request: Request):
+    """保存前端日志的无内容摘要。"""
+    try:
+        log_data = await read_json_body_limited(request, 64 * 1024)
+    except SecurityValidationError as exc:
+        raise HTTPException(status_code=413, detail="请求正文无效或超过大小限制") from exc
+
     log_file = DATA_DIR / "frontend_logs.txt"
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
-    log_entry = f"[{timestamp}] {log_data.get('type', 'INFO')}: {log_data.get('message', '')}\n"
+    raw_type = log_data.get("type", "INFO")
+    log_type = raw_type if isinstance(raw_type, str) and re.fullmatch(
+        r"[A-Za-z0-9_.:-]{1,32}", raw_type
+    ) else "OTHER"
+    log_entry = (
+        f"[{timestamp}] {log_type}: "
+        f"message_length={content_length(log_data.get('message'))} "
+        f"details_length={content_length(log_data.get('details'))} "
+        f"url_length={content_length(log_data.get('url'))} "
+        f"error_length={content_length(log_data.get('error'))}\n"
+    )
 
-    if log_data.get('details'):
-        log_entry += f"  Details: {log_data.get('details')}\n"
-    if log_data.get('url'):
-        log_entry += f"  URL: {log_data.get('url')}\n"
-    if log_data.get('error'):
-        log_entry += f"  Error: {log_data.get('error')}\n"
-
-    log_entry += "\n"
-
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(log_entry)
+    await run_blocking_work(_append_rotating_log, log_file, log_entry)
 
     return {"success": True}
 
 
 @app.post("/api/client-logs")
-async def save_client_logs(log_data: dict):
-    """保存客户端完整日志信息"""
-    import json
+async def save_client_logs(request: Request):
+    """保存客户端日志的无内容、有界摘要。"""
+    try:
+        log_data = await read_json_body_limited(request, 256 * 1024)
+    except SecurityValidationError as exc:
+        raise HTTPException(status_code=413, detail="请求正文无效或超过大小限制") from exc
 
     logs_dir = DATA_DIR / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"client_log_{timestamp}.json"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"client_log_{timestamp}_{uuid.uuid4().hex[:8]}.json"
     log_file = logs_dir / filename
 
     try:
-        with open(log_file, "w", encoding="utf-8") as f:
-            json.dump(log_data, f, ensure_ascii=False, indent=2)
+        summary = {
+            "payload_type": type(log_data).__name__,
+            "payload_length": serialized_length(log_data),
+            "item_count": len(log_data) if isinstance(log_data, (dict, list)) else 0,
+        }
+        if isinstance(log_data, dict):
+            summary.update(summarize_arguments(log_data))
+        await run_blocking_work(_write_client_log, log_file, summary, logs_dir)
 
         return {"success": True, "filename": filename}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception:
+        return {"success": False, "error": "日志保存失败"}
 
 
 # ============================================================================
@@ -1714,9 +1964,13 @@ async def get_debug_logs(request_id: str):
     Returns:
         包含 meta 和 server 字段的结构化日志响应
     """
-    from src.stream_logger import get_logger, cleanup_old_logs
+    from src.stream_logger import StreamLogger, cleanup_old_logs
 
-    logger = get_logger(request_id)
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", request_id):
+        raise HTTPException(status_code=400, detail="请求 ID 无效")
+    logger = StreamLogger.find_logger(request_id)
+    if logger is None:
+        raise HTTPException(status_code=404, detail="调试日志不存在")
     logs = logger.get_logs()
 
     # 定期清理旧日志
@@ -1758,26 +2012,23 @@ async def list_debug_logs():
 # 【环境管理 API - 新增】
 # ============================================================================
 
-from fastapi import UploadFile, File
-
-
 class CreateEnvironmentRequest(BaseModel):
     """创建环境请求"""
-    python_version: str = "3.11"
+    python_version: Literal["3.11"] = "3.11"
 
 
 class InstallPackagesRequest(BaseModel):
     """安装包请求"""
-    packages: List[str]
+    packages: List[str] = Field(min_length=1, max_length=64)
 
 
 class ExecuteScriptRequest(BaseModel):
     """执行脚本请求"""
-    skill_name: str
-    script_path: str = "main.py"
-    arguments: List[str] = []
-    input_file_ids: List[str] = []
-    timeout: int = 60
+    skill_name: str = Field(min_length=1, max_length=200)
+    script_path: str = Field(default="main.py", min_length=1, max_length=1_024)
+    arguments: List[str] = Field(default_factory=list, max_length=128)
+    input_file_ids: List[str] = Field(default_factory=list, max_length=128)
+    timeout: int = Field(default=60, ge=1, le=300)
 
 
 @app.post("/api/agents/{name}/environment")
@@ -1801,8 +2052,8 @@ async def create_environment(name: str, req: CreateEnvironmentRequest):
                 "created_at": environment.created_at
             }
         }
-    except EnvironmentError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=500, detail="创建运行环境失败") from exc
 
 
 @app.get("/api/agents/{name}/environment")
@@ -1842,7 +2093,7 @@ async def get_environment(name: str):
             response["environment"] = {
                 "agent_name": name,
                 "status": "creating",
-                "environment_type": "conda",
+                "environment_type": "uv",
                 "python_version": "3.11",
                 "packages": [],
                 "created_at": datetime.now().isoformat(),
@@ -1908,8 +2159,8 @@ async def delete_environment(name: str):
     try:
         success = await environment_manager.delete_environment(name)
         return {"success": success}
-    except EnvironmentError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except EnvironmentError as exc:
+        raise HTTPException(status_code=500, detail="删除运行环境失败") from exc
 
 
 @app.post("/api/agents/{name}/environment/retry")
@@ -1945,16 +2196,10 @@ async def retry_environment_creation(name: str):
             await environment_manager.delete_environment(name)
             print(f"[ENV] 已清理失败的环境: {name}")
         except Exception as e:
-            print(f"[ENV] 清理失败环境时出错: {e}")
-
-    # 创建新的环境元数据（状态为creating）
-    initial_env = AgentEnvironment(
-        agent_name=name,
-        environment_type=EnvironmentType.CONDA,
-        status=EnvironmentStatus.CREATING,
-        python_version="3.11"
-    )
-    environment_manager._save_metadata(initial_env)
+            print(
+                "[ENV] 清理失败环境时出错: "
+                f"error_type={type(e).__name__}"
+            )
 
     # 重新启动环境创建任务
     await environment_creator.create(name)
@@ -1971,7 +2216,12 @@ async def install_packages(name: str, req: InstallPackagesRequest):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    success, message = await environment_manager.install_packages(name, req.packages)
+    try:
+        packages = validate_package_specs(req.packages)
+    except SecurityValidationError as exc:
+        raise _security_error(exc) from exc
+
+    success, message = await environment_manager.install_packages(name, packages)
     if success:
         return {"success": True, "message": message}
     else:
@@ -1999,10 +2249,9 @@ async def upload_file(name: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=404, detail="Agent不存在")
 
     try:
-        content = await file.read()
-        file_info = await file_storage_manager.upload_file(
+        file_info = await file_storage_manager.upload_stream(
             agent_name=name,
-            file_content=content,
+            upload=file,
             filename=file.filename or "unknown",
             mime_type=file.content_type
         )
@@ -2017,8 +2266,8 @@ async def upload_file(name: str, file: UploadFile = File(...)):
                 "uploaded_at": file_info.uploaded_at
             }
         }
-    except FileStorageError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except FileStorageError as exc:
+        raise HTTPException(status_code=400, detail="文件无效或超过存储限制") from exc
 
 
 @app.get("/api/agents/{name}/files")
@@ -2087,22 +2336,34 @@ async def execute_script(name: str, req: ExecuteScriptRequest):
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
 
-    # 获取技能路径
     skill = skill_registry.get_skill(req.skill_name)
-    skill_base_path = None
-    if skill and skill.skill_path:
-        # skill_path 是相对路径，需要转换为绝对路径
-        skill_base_path = str(SKILLS_DIR / skill.skill_path)
+    if not skill or not skill.enabled or not skill.skill_path:
+        raise HTTPException(status_code=404, detail="Skill不存在或已禁用")
+
+    try:
+        validate_execution_arguments(req.arguments, req.timeout)
+        skill_root = resolve_contained_path(
+            SKILLS_DIR,
+            skill.skill_path,
+            must_exist=True,
+            require_file=False,
+        )
+        script_file = resolve_contained_path(skill_root, req.script_path)
+        if script_file.suffix.lower() != ".py":
+            raise SecurityValidationError("Only Python Skill scripts may be executed")
+        script_path = script_file.relative_to(skill_root).as_posix()
+    except SecurityValidationError as exc:
+        raise _security_error(exc) from exc
 
     try:
         record = await execution_engine.execute_script(
             agent_name=name,
             skill_name=req.skill_name,
-            script_path=req.script_path,
+            script_path=script_path,
             args=req.arguments,
             input_file_ids=req.input_file_ids,
             timeout=req.timeout,
-            skill_base_path=skill_base_path
+            skill_base_path=str(skill_root)
         )
 
         return {
@@ -2118,12 +2379,14 @@ async def execute_script(name: str, req: ExecuteScriptRequest):
                 "finished_at": record.finished_at
             }
         }
+    except (ExecutionError, FileStorageError) as exc:
+        raise HTTPException(status_code=400, detail="脚本执行请求无效") from exc
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="脚本执行失败") from e
 
 
 @app.get("/api/agents/{name}/executions")
-async def list_executions(name: str, limit: int = 50):
+async def list_executions(name: str, limit: int = Query(default=50, ge=1, le=200)):
     """列出执行记录"""
     if name not in manager.list_agents():
         raise HTTPException(status_code=404, detail="Agent不存在")
@@ -2180,23 +2443,23 @@ async def get_execution(name: str, execution_id: str):
 
 class CreateKnowledgeBaseRequest(BaseModel):
     """创建知识库请求"""
-    name: str
-    description: str = ""
-    embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    name: str = Field(min_length=1, max_length=200)
+    description: str = Field(default="", max_length=5_000)
+    embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5", max_length=200)
 
 
 class SearchRequest(BaseModel):
     """检索请求"""
-    query: str
-    top_k: int = 3
-    score_threshold: float = 0.6
+    query: str = Field(min_length=1, max_length=20_000)
+    top_k: int = Field(default=3, ge=1, le=50)
+    score_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
 @app.get("/api/knowledge-bases")
 async def list_knowledge_bases():
     """列出所有知识库"""
     try:
-        kbs = kb_manager.list_kb()
+        kbs = await asyncio.to_thread(kb_manager.list_kb)
         return {
             "knowledge_bases": [
                 {
@@ -2213,18 +2476,19 @@ async def list_knowledge_bases():
                 for kb in kbs
             ]
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"获取知识库列表失败: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="获取知识库列表失败") from exc
 
 
 @app.post("/api/knowledge-bases")
 async def create_knowledge_base(req: CreateKnowledgeBaseRequest):
     """创建知识库"""
     try:
-        kb = kb_manager.create_kb(
-            name=req.name,
-            description=req.description,
-            embedding_model=req.embedding_model
+        kb = await run_blocking_work(
+            kb_manager.create_kb,
+            req.name,
+            req.description,
+            req.embedding_model,
         )
         return {
             "kb_id": kb.kb_id,
@@ -2236,16 +2500,16 @@ async def create_knowledge_base(req: CreateKnowledgeBaseRequest):
             "doc_count": kb.doc_count,
             "chunk_count": kb.chunk_count
         }
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"创建知识库失败: {e}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="知识库配置无效或已存在") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="创建知识库失败") from exc
 
 
 @app.get("/api/knowledge-bases/{kb_id}")
 async def get_knowledge_base(kb_id: str):
     """获取知识库详情"""
-    kb = kb_manager.get_kb(kb_id)
+    kb = await asyncio.to_thread(kb_manager.get_kb, kb_id)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
@@ -2265,7 +2529,7 @@ async def get_knowledge_base(kb_id: str):
 @app.delete("/api/knowledge-bases/{kb_id}")
 async def delete_knowledge_base(kb_id: str):
     """删除知识库"""
-    success = kb_manager.delete_kb(kb_id)
+    success = await run_blocking_work(kb_manager.delete_kb, kb_id)
     if not success:
         raise HTTPException(status_code=404, detail="知识库不存在")
     return {"message": "知识库已删除"}
@@ -2274,10 +2538,10 @@ async def delete_knowledge_base(kb_id: str):
 @app.get("/api/knowledge-bases/{kb_id}/documents")
 async def list_documents(kb_id: str):
     """列出知识库中的所有文档"""
-    if kb_id not in kb_manager._configs:
+    if not await asyncio.to_thread(kb_manager.get_kb, kb_id):
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    documents = kb_manager.list_documents(kb_id)
+    documents = await asyncio.to_thread(kb_manager.list_documents, kb_id)
     return {
         "documents": [
             {
@@ -2301,31 +2565,42 @@ async def upload_document(kb_id: str, file: UploadFile):
     """上传文档到知识库"""
     from src.document_processor import DocumentProcessor
 
-    if kb_id not in kb_manager._configs:
+    if not await asyncio.to_thread(kb_manager.get_kb, kb_id):
         raise HTTPException(status_code=404, detail="知识库不存在")
 
+    try:
+        filename = sanitise_filename(file.filename or "")
+    except SecurityValidationError as exc:
+        raise _security_error(exc) from exc
+
     # 验证文件类型
-    suffix = Path(file.filename).suffix.lower()
+    suffix = Path(filename).suffix.lower()
     if suffix not in DocumentProcessor.SUPPORTED_FORMATS:
         raise HTTPException(
             status_code=400,
             detail=f"不支持的文件格式: {suffix}。支持的格式: {', '.join(DocumentProcessor.SUPPORTED_FORMATS)}"
         )
 
-    # 验证文件大小
+    # Stream to disk and stop reading as soon as the hard limit is exceeded.
     import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
-        content = await file.read()
-        if len(content) > 10 * 1024 * 1024:  # 10MB
-            raise HTTPException(status_code=400, detail="文件过大，最大支持 10MB")
-        tmp_file.write(content)
-        tmp_path = Path(tmp_file.name)
-
+    tmp_path = None
     try:
-        document = kb_manager.add_document(
-            kb_id=kb_id,
-            file_path=tmp_path,
-            filename=file.filename
+        with tempfile.NamedTemporaryFile(
+            delete=False, suffix=suffix, dir=TMP_DIR
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            uploaded = 0
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                uploaded += len(chunk)
+                if uploaded > 10 * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail="文件过大，最大支持 10MB")
+                tmp_file.write(chunk)
+
+        document = await run_blocking_work(
+            kb_manager.add_document, kb_id, tmp_path, filename
         )
 
         return {
@@ -2341,23 +2616,25 @@ async def upload_document(kb_id: str, file: UploadFile):
             "error_message": document.error_message
         }
 
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文档处理失败: {e}")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="文档无效或超过处理限制") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="文档处理失败") from exc
     finally:
         # 清理临时文件
-        if tmp_path.exists():
+        if tmp_path and tmp_path.exists():
             tmp_path.unlink()
 
 
 @app.delete("/api/knowledge-bases/{kb_id}/documents/{doc_id}")
 async def delete_document(kb_id: str, doc_id: str):
     """删除文档"""
-    if kb_id not in kb_manager._configs:
+    if not await asyncio.to_thread(kb_manager.get_kb, kb_id):
         raise HTTPException(status_code=404, detail="知识库不存在")
 
-    success = kb_manager.delete_document(kb_id, doc_id)
+    success = await run_blocking_work(kb_manager.delete_document, kb_id, doc_id)
     if not success:
         raise HTTPException(status_code=404, detail="文档不存在")
 
@@ -2367,16 +2644,17 @@ async def delete_document(kb_id: str, doc_id: str):
 @app.post("/api/knowledge-bases/{kb_id}/search")
 async def search_knowledge_base(kb_id: str, req: SearchRequest):
     """检索知识库"""
-    if kb_id not in kb_manager._configs:
+    if not await asyncio.to_thread(kb_manager.get_kb, kb_id):
         raise HTTPException(status_code=404, detail="知识库不存在")
 
     try:
-        retriever = kb_manager.get_retriever(kb_id)
-        results = retriever.search(
-            query=req.query,
-            top_k=req.top_k,
-            score_threshold=req.score_threshold
-        )
+        def search_sync():
+            retriever = kb_manager.get_retriever(kb_id)
+            return retriever.search(
+                req.query, req.top_k, req.score_threshold
+            )
+
+        results = await run_blocking_work(search_sync)
 
         return {
             "results": [
@@ -2391,14 +2669,14 @@ async def search_knowledge_base(kb_id: str, req: SearchRequest):
             ]
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"检索失败: {e}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="检索失败") from exc
 
 
 @app.get("/api/knowledge-bases/{kb_id}/stats")
 async def get_knowledge_base_stats(kb_id: str):
     """获取知识库统计信息"""
-    kb = kb_manager.get_kb(kb_id)
+    kb = await asyncio.to_thread(kb_manager.get_kb, kb_id)
     if not kb:
         raise HTTPException(status_code=404, detail="知识库不存在")
 
@@ -2411,5 +2689,9 @@ async def get_knowledge_base_stats(kb_id: str):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 20881))
-    uvicorn.run("backend:app", host="0.0.0.0", port=port)
+    port = int(os.environ.get("BACKEND_PORT", os.environ.get("PORT", 20881)))
+    host = os.environ.get(
+        "AGENT_BUILDER_HOST",
+        os.environ.get("BACKEND_HOST", "127.0.0.1"),
+    )
+    uvicorn.run(app, host=host, port=port)

@@ -1,14 +1,14 @@
 """
 环境创建后台任务管理器
 
-负责在后台异步创建Conda环境，避免阻塞API响应。
+负责在后台异步创建项目内 uv 环境，避免阻塞 API 响应。
 """
 import asyncio
 from typing import Dict, Optional
 from datetime import datetime
 
-from .environment_manager import EnvironmentManager, EnvironmentError
-from .models import AgentEnvironment, EnvironmentStatus
+from .environment_manager import EnvironmentManager
+from .models import EnvironmentStatus
 
 
 class EnvironmentCreator:
@@ -30,6 +30,7 @@ class EnvironmentCreator:
         self.max_concurrent = max_concurrent
         self._tasks: Dict[str, asyncio.Task] = {}  # agent_name -> task
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._task_lock = asyncio.Lock()
 
     async def create(
         self,
@@ -37,7 +38,7 @@ class EnvironmentCreator:
         python_version: str = "3.11"
     ) -> bool:
         """
-        异步创建Conda环境
+        异步创建 uv 环境
 
         此方法立即返回，在后台任务中执行实际创建工作。
 
@@ -48,18 +49,18 @@ class EnvironmentCreator:
         Returns:
             bool: 是否成功启动创建任务
         """
-        # 检查是否已有进行中的任务
-        if agent_name in self._tasks:
-            existing_task = self._tasks[agent_name]
-            if not existing_task.done():
+        async with self._task_lock:
+            # Check-and-register atomically so duplicate requests cannot replace
+            # the tracked task and make cancellation miss the real creator.
+            existing_task = self._tasks.get(agent_name)
+            if existing_task is not None and not existing_task.done():
                 print(f"[ENV_CREATOR] 环境创建任务已在进行中: {agent_name}")
                 return True
 
-        # 创建后台任务
-        task = asyncio.create_task(
-            self._create_with_semaphore(agent_name, python_version)
-        )
-        self._tasks[agent_name] = task
+            task = asyncio.create_task(
+                self._create_with_semaphore(agent_name, python_version)
+            )
+            self._tasks[agent_name] = task
 
         print(f"[ENV_CREATOR] 已启动环境创建任务: {agent_name}")
         return True
@@ -70,12 +71,16 @@ class EnvironmentCreator:
         python_version: str
     ):
         """带并发控制的环境创建"""
-        async with self._semaphore:
-            try:
+        current = asyncio.current_task()
+        try:
+            async with self._semaphore:
                 await self._do_create(agent_name, python_version)
-            finally:
-                # 清理任务记录
-                self._tasks.pop(agent_name, None)
+        finally:
+            # This also runs if cancellation happens while waiting for capacity.
+            # Do not let an older task remove a newer registration.
+            async with self._task_lock:
+                if self._tasks.get(agent_name) is current:
+                    self._tasks.pop(agent_name, None)
 
     async def _do_create(
         self,
@@ -96,15 +101,10 @@ class EnvironmentCreator:
                 try:
                     await self.environment_manager.delete_environment(agent_name)
                 except Exception as e:
-                    print(f"[ENV_CREATOR] 清理失败环境时出错: {e}")
-
-            # 创建环境记录（状态为creating）
-            environment = AgentEnvironment(
-                agent_name=agent_name,
-                python_version=python_version,
-                status=EnvironmentStatus.CREATING
-            )
-            self.environment_manager._save_metadata(environment)
+                    print(
+                        "[ENV_CREATOR] 清理失败环境时出错: "
+                        f"error_type={type(e).__name__}"
+                    )
 
             # 执行环境创建
             print(f"[ENV_CREATOR] 开始创建环境: {agent_name}")
@@ -119,21 +119,13 @@ class EnvironmentCreator:
             print(f"[ENV_CREATOR] 环境创建完成: {agent_name}, 耗时: {elapsed:.1f}秒")
 
         except Exception as e:
-            print(f"[ENV_CREATOR] 环境创建失败: {agent_name}, 错误: {e}")
-            # 标记环境状态为错误
-            await self._mark_error(agent_name, str(e))
-
-    async def _mark_error(self, agent_name: str, error_message: str):
-        """标记环境创建失败"""
-        try:
-            existing = await self.environment_manager.get_environment_status(agent_name)
-            if existing:
-                existing.status = EnvironmentStatus.ERROR
-                existing.error_message = error_message
-                existing.updated_at = datetime.now().isoformat()
-                self.environment_manager._save_metadata(existing)
-        except Exception as e:
-            print(f"[ENV_CREATOR] 标记错误状态失败: {e}")
+            print(
+                f"[ENV_CREATOR] 环境创建失败: {agent_name}, "
+                f"error_type={type(e).__name__}"
+            )
+            # EnvironmentManager persists a sanitized ERROR state while holding
+            # the per-Agent writer gate. Writing it here could race deletion and
+            # resurrect metadata after the environment was removed.
 
     async def cancel(self, agent_name: str) -> bool:
         """
@@ -148,6 +140,12 @@ class EnvironmentCreator:
         task = self._tasks.get(agent_name)
         if task and not task.done():
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                self._tasks.pop(agent_name, None)
             print(f"[ENV_CREATOR] 已取消环境创建任务: {agent_name}")
             return True
         return False

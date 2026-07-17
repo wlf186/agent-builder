@@ -6,7 +6,7 @@
 > 智能体: test001
 
 ## 前置条件
-- 服务已启动 (localhost:20880 / localhost:20881)
+- 服务已启动 (localhost:20815 / localhost:20881)
 - 存在 test001 智能体
 - 截图目录 `test-results/cli/` 已创建
 
@@ -16,7 +16,7 @@
 
 > 验收标准: 智能体列表正常显示
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/uat-debug-log-export-001-agents.png
 
 ### 验证

@@ -1,7 +1,8 @@
 ---
-title: 对话卡片
+title: "对话卡片"
 category: core
 component: ConversationCard
+generated: true
 related:
   - ConversationList
   - ConversationDrawer

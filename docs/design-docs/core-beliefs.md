@@ -1,143 +1,77 @@
-# 黄金原则 (Golden Principles)
+# Core engineering beliefs
 
-> 本文档定义了 Agent Builder 项目中所有智能体（包括 Claude Code）必须遵守的核心工作原则。
+This document explains the durable reasoning behind the concise rules in
+[`CLAUDE.md`](../../CLAUDE.md). When the two disagree, fix them together and
+treat `CLAUDE.md` as the agent-facing rule source.
 
----
+## Local first means contained by default
 
-## 1. 无文档不执行 (No Documentation, No Execution)
+The supported stack must be reproducible from one checkout without global
+language environments or containers. Pinned uv, Python, and Node toolchains
+belong in `.tools/`, the application environment belongs in `.venv/`,
+disposable state belongs in `.runtime/`, and non-reproducible application data
+belongs in `data/`.
 
-**原则**: 任何复杂需求必须先有执行计划，再开始写代码。
+Source `env.sh` before development commands. It redirects home, temporary, XDG,
+package, model, and browser caches into the checkout. A feature is incomplete if
+its normal or error path writes state elsewhere.
 
-**执行标准**:
-- 复杂需求（涉及 3+ 文件或架构变更）必须在 `docs/exec-plans/active/` 下生成执行计划
-- 计划应包含：目标、步骤、风险评估、验收标准
-- 完成后计划移入 `docs/exec-plans/completed/`
+## Streaming is a protocol
 
-**例外**: 简单的 bug 修复、文档更新、单文件修改
+Thinking updates, content chunks, tool calls, tool results, cancellation, and
+terminal events are ordered protocol elements, not cosmetic animation. Code
+must preserve incremental delivery, exactly-once reconstruction, bounded
+buffering, and cancellation propagation. See
+[the streaming protocol](streaming-protocol.md).
 
----
+## Trust boundaries fail closed
 
-## 2. 闭环反馈 (Closed-Loop Feedback)
+The backend authenticates every `/api/**` request and remains loopback-bound by
+default. File paths, archives, URLs, headers, package specifications, MCP
+configuration, and subprocess arguments are untrusted inputs.
 
-**原则**: 每个错误都是改进系统的机会。
+Uploaded Skill execution requires Linux Landlock confinement and bounded
+resources. Network sockets are denied by default. A missing sandbox is an error,
+not permission to run unconfined. Local-process MCP is disabled until an
+operator explicitly opts in after reviewing the command.
 
-**执行标准**:
-- 遇到 Bug、编译失败、测试失败时，必须记录根因
-- 将教训提炼为规则，补充到以下位置：
-  - 代码模式 → `docs/references/coding-patterns.md`
-  - 调试经验 → `docs/references/troubleshooting.md`
-  - 架构约束 → `docs/design-docs/architecture-overview.md`
-- 避免在同一类问题上犯二次错误
+## Persistence should minimize write amplification
 
----
+Append or update transactional records instead of rewriting complete histories.
+Reuse expensive clients and collections. Batch streaming UI updates and trace
+exports. Logs, traces, caches, and temporary artifacts require explicit bounds,
+rotation, retention, and purge behavior.
 
-## 3. 严格边界 (Strict Boundaries)
+These rules protect latency and SSD lifetime as well as correctness.
 
-**原则**: 维持项目的"品味"和风格一致性。
+## Tests prove boundaries and failures
 
-**执行标准**:
-- 新代码必须遵循现有分层架构（Frontend → Backend API → Core Services）
-- 优先使用已有内部实现，不随意引入新的第三方库封装
-- 命名风格与现有代码保持一致
-- API 设计遵循 RESTful 规范，保持向后兼容
+Use the smallest focused regression first, then the complete relevant suite.
+Security-sensitive changes require negative and boundary cases. Lifecycle
+changes require clean/repeated start, rollback after failed health checks,
+graceful and forced stop, stale PID rejection, and port-ownership checks.
 
-**禁止行为**:
-- 在根目录创建新的临时脚本（应放入 `scripts/` 或 `tests/`）
-- 引入与现有功能重复的依赖包
-- 修改核心接口签名而不更新所有调用方
+Canonical checks are listed in [the testing guide](../references/testing-guide.md).
+Do not replace a committed regression with an interactive browser transcript.
 
----
+## Documentation is part of the change
 
-## 4. 流式输出不可破坏 (Streaming is Sacred)
+Behavior, configuration, API, lifecycle, security, storage, and user-flow
+changes update their authoritative documents in the same review. Obsolete
+instructions are deleted and remain available through Git history. Ownership,
+review cadence, and automated gates are defined in
+[documentation governance](../DOCUMENTATION.md).
 
-**原则**: 流式输出是调试对话的核心体验，任何代码修改都不能破坏它。
+## Dependency changes are locked
 
-**执行标准**:
-- 打字机效果必须保持流畅（逐字符流式显示）
-- 思考过程（thinking）必须实时更新
-- 工具调用（tool_call/tool_result）必须实时展示
-- 技能加载状态必须实时反馈
-- 性能指标必须准确统计
+Python dependencies are changed through the checkout-local uv and committed in
+both `pyproject.toml` and `uv.lock`:
 
-**修改后端流式逻辑时**:
-- 必须先阅读 `docs/design-docs/streaming-protocol.md`
-- 必须运行流式输出测试验证
+```bash
+source ./env.sh
+./.tools/uv add package-name
+./.tools/uv sync --frozen
+```
 
----
-
-## 5. 测试先行验证 (Test Before Trust)
-
-**原则**: 修改代码后必须验证系统正常运行。
-
-**执行标准**:
-- 后端代码修改后必须重启服务验证
-- 前端代码修改后必须清除 `.next` 缓存重启
-- API 变更必须用 curl 或 Playwright 验证
-- 流式输出变更必须用 SSE 测试脚本验证
-
-**测试前检查清单**:
-| 检查项 | 命令 |
-|--------|------|
-| 后端服务 | `curl http://localhost:20881/api/agents` |
-| 前端服务 | 浏览器访问 `http://localhost:20880` |
-| 流式输出 | `python tests/test_streaming_output.py` |
-
----
-
-## 6. 文档即代码 (Docs as Code)
-
-**原则**: 文档与代码同等重要，必须同步维护。
-
-**执行标准**:
-- API 变更必须更新 `docs/references/api-reference.md`
-- 新功能必须更新 `CLAUDE.md` 中的导航链接
-- 架构变更必须更新 `docs/design-docs/architecture-overview.md`
-- 过时文档必须删除或归档
-
----
-
----
-
-## 7. Python 虚拟环境强制使用 (Virtual Environment Mandatory)
-
-**原则**: 所有 Python 操作必须使用项目虚拟环境，确保依赖隔离和一致性。
-
-**执行标准**:
-- Python 脚本执行：`.venv/bin/python script.py`
-- 包安装：`.venv/bin/pip install package`
-- 或先激活虚拟环境：`source .venv/bin/activate`
-
-**禁止行为**:
-- 直接使用 `python` 或 `pip` 命令（可能调用系统级 Python）
-- 在虚拟环境外安装任何依赖
-
-**原因**:
-- 系统级安装可能导致版本冲突
-- 虚拟环境确保开发/生产环境一致性
-- 避免污染系统 Python 环境
-
----
-
-## 修订历史
-
-| 日期 | 版本 | 变更内容 |
-|------|------|----------|
-| 2026-03-17 | 1.0 | 初始版本，确立 6 条核心原则 |
-| 2026-03-22 | 1.1 | 新增第 7 条：Python 虚拟环境强制使用原则 |
-
----
-
-## 附录：典型 Bug 案例与教训
-
-### AC130-202603222100: 性能优化导致工具调用失效
-
-**症状**: 智能体不再使用工具
-
-**根因**: commit `6d2a146` 添加了优化 `if self.llm_with_tools and might_be_tool_call:`，只有当 `might_be_tool_call=True` 时才调用 `ainvoke()`。但 `might_be_tool_call` 的检测逻辑只看文本内容（`{` 或 `"tool"`），而原生工具调用（bind_tools）的信息在 `chunk.tool_call_chunks` 属性中，不在 content 里。
-
-**修复**: 在流式阶段检测 `tool_call_chunks` 属性，确保原生工具调用被正确标记。
-
-**教训**:
-1. 性能优化时必须考虑所有代码路径
-2. LLM 工具调用有两种模式：原生（bind_tools）和文本格式，检测逻辑需同时支持
-3. 修改流式输出逻辑后，必须测试工具调用场景
+Do not use system Python, system `pip`, global npm installation, a user package
+cache, or direct edits that leave the lockfile inconsistent.

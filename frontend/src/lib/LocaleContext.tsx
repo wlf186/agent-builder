@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useContext, useState, useEffect, ReactNode } from "react";
+import { createContext, useContext, useSyncExternalStore, ReactNode } from "react";
 import { Locale, t, TranslationKey, getLocaleName } from "./i18n";
 
 interface LocaleContextType {
@@ -11,22 +11,30 @@ interface LocaleContextType {
 }
 
 const LocaleContext = createContext<LocaleContextType | undefined>(undefined);
+const LOCALE_CHANGE_EVENT = "agent-builder-locale-change";
+
+function readStoredLocale(): Locale {
+  if (typeof window === "undefined") return "zh";
+  const saved = localStorage.getItem("locale");
+  return saved === "en" || saved === "zh" ? saved : "zh";
+}
+
+function subscribeToLocale(onStoreChange: () => void): () => void {
+  window.addEventListener("storage", onStoreChange);
+  window.addEventListener(LOCALE_CHANGE_EVENT, onStoreChange);
+  return () => {
+    window.removeEventListener("storage", onStoreChange);
+    window.removeEventListener(LOCALE_CHANGE_EVENT, onStoreChange);
+  };
+}
 
 export function LocaleProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocale] = useState<Locale>("zh");
-
-  // 从 localStorage 恢复语言设置
-  useEffect(() => {
-    const saved = localStorage.getItem("locale") as Locale;
-    if (saved && (saved === "zh" || saved === "en")) {
-      setLocale(saved);
-    }
-  }, []);
+  const locale = useSyncExternalStore<Locale>(subscribeToLocale, readStoredLocale, () => "zh");
 
   // 保存语言设置到 localStorage
   const handleSetLocale = (newLocale: Locale) => {
-    setLocale(newLocale);
     localStorage.setItem("locale", newLocale);
+    window.dispatchEvent(new Event(LOCALE_CHANGE_EVENT));
   };
 
   return (

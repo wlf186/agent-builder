@@ -1,15 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { useCallback, useEffect, useState } from "react";
+import { useParams } from "next/navigation";
 import Link from "next/link";
-import { kbApi, KnowledgeBase, Document } from "@/lib/kbApi";
+import { kbApi, KnowledgeBase, Document, RetrievalResult } from "@/lib/kbApi";
 import { ArrowLeft, Upload, Trash2, FileText, Search, Loader2 } from "lucide-react";
 import { DocumentUploader } from "@/components/DocumentUploader";
 
 export default function KnowledgeBaseDetailPage() {
   const params = useParams();
-  const router = useRouter();
   const kbId = params.id as string;
 
   const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBase | null>(null);
@@ -18,9 +17,9 @@ export default function KnowledgeBaseDetailPage() {
   const [uploadDialogOpen, setUploadDialogOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching] = useState(false);
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<RetrievalResult[]>([]);
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true);
     try {
       const [kb, docs] = await Promise.all([
@@ -34,11 +33,12 @@ export default function KnowledgeBaseDetailPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [kbId]);
 
   useEffect(() => {
-    loadData();
-  }, [kbId]);
+    const timeout = window.setTimeout(() => void loadData(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [loadData]);
 
   const handleDeleteDocument = async (docId: string) => {
     if (!confirm("确定要删除这个文档吗？")) return;

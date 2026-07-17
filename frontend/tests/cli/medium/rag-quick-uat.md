@@ -4,14 +4,14 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 
 ---
 
 ### 测试用例 1: RAG 验收测试 - 行政助手
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 点击智能体选择器（`.agent-selector`）
 4. 在下拉菜单中点击 "UAT行政助手"
@@ -31,7 +31,7 @@
 ### 测试用例 2: RAG 验收测试 - 技术支持
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 点击智能体选择器（`.agent-selector`）
 4. 在下拉菜单中点击 "UAT技术支持"

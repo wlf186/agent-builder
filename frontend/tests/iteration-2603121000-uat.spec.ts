@@ -5,9 +5,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { AC130_PDF_FIXTURE, testOutputDir } from './test-paths';
 
-const BASE_URL = process.env.UAT_URL || 'http://localhost:20880';
+const BASE_URL = process.env.UAT_URL || 'http://localhost:20815';
 const TEST_TIMEOUT = 120000;
+const SCREENSHOT_DIR = testOutputDir('iteration-2603121000-uat');
 
 test.describe('UAT验收 - iteration-2603121000', () => {
   test.setTimeout(TEST_TIMEOUT);
@@ -39,8 +41,8 @@ test.describe('UAT验收 - iteration-2603121000', () => {
     console.log('File upload button found:', hasUploadButton > 0);
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-uc001-upload.png', fullPage: true });
-    console.log('Screenshot saved: /tmp/uat-uc001-upload.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uc001-upload.png`, fullPage: true });
+    console.log(`Screenshot saved: ${SCREENSHOT_DIR}/uc001-upload.png`);
   });
 
   test('UC-005: test001 例行验证 - 3轮对话', async ({ page }) => {
@@ -77,8 +79,8 @@ test.describe('UAT验收 - iteration-2603121000', () => {
     }
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-uc005-test001.png', fullPage: true });
-    console.log('\nScreenshot saved: /tmp/uat-uc005-test001.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uc005-test001.png`, fullPage: true });
+    console.log(`\nScreenshot saved: ${SCREENSHOT_DIR}/uc005-test001.png`);
   });
 
   test('UC-006: 流式输出验证', async ({ page }) => {
@@ -104,8 +106,8 @@ test.describe('UAT验收 - iteration-2603121000', () => {
     await page.waitForTimeout(10000);
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-uc006-streaming.png', fullPage: true });
-    console.log('Screenshot saved: /tmp/uat-uc006-streaming.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uc006-streaming.png`, fullPage: true });
+    console.log(`Screenshot saved: ${SCREENSHOT_DIR}/uc006-streaming.png`);
   });
 
   test('UC-007: 大文件上传验证', async ({ page }) => {
@@ -124,7 +126,7 @@ test.describe('UAT验收 - iteration-2603121000', () => {
     if (uploadCount > 0) {
       // 上传大文件
       const startTime = Date.now();
-      await uploadInput.setInputFiles('/work/agent-builder-general/test/测试1.pdf');
+      await uploadInput.setInputFiles(AC130_PDF_FIXTURE);
 
       // 等待上传完成
       await page.waitForTimeout(5000);
@@ -135,8 +137,8 @@ test.describe('UAT验收 - iteration-2603121000', () => {
     }
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-uc007-large-file.png', fullPage: true });
-    console.log('Screenshot saved: /tmp/uat-uc007-large-file.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uc007-large-file.png`, fullPage: true });
+    console.log(`Screenshot saved: ${SCREENSHOT_DIR}/uc007-large-file.png`);
   });
 
   test('API验证: 文件上传接口', async ({ request }) => {

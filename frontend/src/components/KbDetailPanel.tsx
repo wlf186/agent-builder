@@ -26,9 +26,9 @@
  * @related KnowledgeBaseDialog
  */
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { X, Upload, FileText, Trash2, Search, Loader2 } from "lucide-react";
-import { kbApi, KnowledgeBase, Document } from "@/lib/kbApi";
+import { kbApi, KnowledgeBase, Document, RetrievalResult } from "@/lib/kbApi";
 
 interface KbDetailPanelProps {
   knowledgeBase: KnowledgeBase;
@@ -42,7 +42,7 @@ export function KbDetailPanel({ knowledgeBase, onClose, onUpdate }: KbDetailPane
   const [uploading, setUploading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searching, setSearching] = useState(false);
-  const [searchResults, setSearchResults] = useState<any[]>([]);
+  const [searchResults, setSearchResults] = useState<RetrievalResult[]>([]);
   const [isDragging, setIsDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -77,7 +77,7 @@ export function KbDetailPanel({ knowledgeBase, onClose, onUpdate }: KbDetailPane
     }
   };
 
-  const loadDocuments = async () => {
+  const loadDocuments = useCallback(async () => {
     setLoading(true);
     try {
       const docs = await kbApi.listDocuments(knowledgeBase.kb_id);
@@ -87,11 +87,12 @@ export function KbDetailPanel({ knowledgeBase, onClose, onUpdate }: KbDetailPane
     } finally {
       setLoading(false);
     }
-  };
+  }, [knowledgeBase.kb_id]);
 
   useEffect(() => {
-    loadDocuments();
-  }, [knowledgeBase.kb_id]);
+    const timeout = window.setTimeout(() => void loadDocuments(), 0);
+    return () => window.clearTimeout(timeout);
+  }, [loadDocuments]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;

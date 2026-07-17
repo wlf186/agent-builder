@@ -170,8 +170,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         else:
             return [types.TextContent(type="text", text=f"未知工具: {name}")]
 
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"获取笑话失败: {str(e)}")]
+    except Exception:
+        return [types.TextContent(type="text", text="获取笑话失败，请稍后重试")]
 
 
 async def main():

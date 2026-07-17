@@ -5,8 +5,10 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = process.env.UAT_URL || 'http://100.113.66.46:20880';
+const BASE_URL = process.env.UAT_URL || 'http://100.113.66.46:20815';
+const SCREENSHOT_DIR = testOutputDir('uat-walkthrough');
 
 test.describe('UAT走查 - 首页验证', () => {
   test.beforeEach(async ({ page }) => {
@@ -18,7 +20,7 @@ test.describe('UAT走查 - 首页验证', () => {
 
   test('页面样式正常加载', async ({ page }) => {
     // 截图保存
-    await page.screenshot({ path: '/tmp/uat-homepage.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/homepage.png`, fullPage: true });
 
     // 检查背景色不是纯白（说明CSS加载了）
     const body = page.locator('body');
@@ -45,7 +47,7 @@ test.describe('UAT走查 - 首页验证', () => {
     console.log('test001 visible:', test001Visible);
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-agents.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/agents.png`, fullPage: true });
   });
 
   test('API数据加载正常', async ({ page }) => {
@@ -92,7 +94,7 @@ test.describe('UAT走查 - 首页验证', () => {
     const modelSection = page.locator('text=/模型服务|Model Service/i');
 
     // 截图侧边栏
-    await page.screenshot({ path: '/tmp/uat-sidebar.png', clip: { x: 0, y: 0, width: 256, height: 800 } });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/sidebar.png`, clip: { x: 0, y: 0, width: 256, height: 800 } });
   });
 
   test('MCP服务列表不为空', async ({ page }) => {
@@ -102,7 +104,7 @@ test.describe('UAT走查 - 首页验证', () => {
     const mcpSection = page.locator('text=/MCP|MCP服务/i');
 
     // 截图
-    await page.screenshot({ path: '/tmp/uat-mcp.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/mcp.png` });
   });
 
   test('检查数字显示', async ({ page }) => {
@@ -123,7 +125,7 @@ test.describe('UAT走查 - 首页验证', () => {
     const hasTestLLM = pageContent.includes('TESTLLM');
     console.log('Has TESTLLM:', hasTestLLM);
 
-    await page.screenshot({ path: '/tmp/uat-full.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/full.png`, fullPage: true });
   });
 });
 

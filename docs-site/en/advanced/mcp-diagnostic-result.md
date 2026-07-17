@@ -1,7 +1,8 @@
 ---
-title: MCP Diagnostics
+title: "MCP Diagnostics"
 category: advanced
 component: MCPDiagnosticResult
+generated: true
 related:
   - MCPServiceDialog
 ---

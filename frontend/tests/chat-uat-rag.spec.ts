@@ -9,9 +9,10 @@
 
 import { test, expect } from '@playwright/test';
 import fs from 'fs';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/screenshots';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('chat-uat-rag');
 
 // 确保截图目录存在
 if (!fs.existsSync(SCREENSHOT_DIR)) {

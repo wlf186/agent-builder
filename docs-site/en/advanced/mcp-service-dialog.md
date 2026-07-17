@@ -1,7 +1,8 @@
 ---
-title: MCP Service Configuration
+title: "MCP Service Configuration"
 category: advanced
 component: MCPServiceDialog
+generated: true
 related:
   - MCPDiagnosticResult
 ---

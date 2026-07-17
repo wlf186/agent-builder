@@ -2,10 +2,16 @@
 脚本执行引擎 - 在隔离环境中执行Skill脚本
 """
 import asyncio
+import hashlib
 import json
+import os
+import re
 import shutil
 import tempfile
+import threading
 import time
+import unicodedata
+from functools import partial
 from pathlib import Path
 from typing import Optional, List, Dict
 from datetime import datetime
@@ -13,6 +19,8 @@ from datetime import datetime
 from .models import ExecutionRecord, ExecutionStatus
 from .environment_manager import EnvironmentManager, EnvironmentError
 from .file_storage_manager import FileStorageManager
+from .blocking_work import run_blocking_with_semaphore
+from .storage_paths import UnsafeStoragePathError, ensure_real_directory
 
 
 class ExecutionError(Exception):
@@ -25,6 +33,8 @@ class ExecutionEngine:
 
     DEFAULT_TIMEOUT = 60  # 默认超时60秒
     MAX_CONCURRENT_PER_AGENT = 3  # 每个Agent最多3个并发执行
+    MAX_RECORDS_PER_AGENT = 500
+    MAX_CONCURRENT_DISK_OPERATIONS = 4
 
     def __init__(
         self,
@@ -44,21 +54,76 @@ class ExecutionEngine:
         self.file_storage = file_storage
         self.data_dir = Path(data_dir)
         self.executions_dir = self.data_dir / "executions"
-        self._running_executions: Dict[str, asyncio.subprocess.Process] = {}
+        runtime_dir = Path(
+            os.environ.get(
+                "AGENT_BUILDER_RUNTIME_DIR",
+                self.data_dir.resolve().parent / ".runtime",
+            )
+        )
+        self.work_root = runtime_dir / "tmp" / "executions"
+        self._cancel_requested: set[str] = set()
         self._semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._disk_slots = asyncio.Semaphore(self.MAX_CONCURRENT_DISK_OPERATIONS)
+        self._storage_lock = threading.RLock()
         self._ensure_dirs()
+
+    async def _run_disk(self, function, *args, **kwargs):
+        return await run_blocking_with_semaphore(
+            self._disk_slots,
+            partial(function, *args, **kwargs),
+        )
 
     def _ensure_dirs(self):
         """确保目录存在"""
-        self.executions_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.executions_dir = ensure_real_directory(self.executions_dir)
+            self.work_root = ensure_real_directory(self.work_root)
+        except UnsafeStoragePathError as exc:
+            raise ExecutionError("执行存储目录不安全") from exc
 
     def get_executions_dir(self, agent_name: str) -> Path:
         """获取Agent执行记录目录"""
-        safe_name = agent_name.replace("/", "_").replace("\\", "_")
-        return self.executions_dir / safe_name
+        if not isinstance(agent_name, str) or not agent_name or "\x00" in agent_name:
+            raise ExecutionError("Agent 名称无效")
+        normalized = unicodedata.normalize("NFKC", agent_name).strip()
+        slug = re.sub(r"[^\w.-]+", "-", normalized, flags=re.UNICODE).strip(".-_")
+        if not slug:
+            raise ExecutionError("Agent 名称无效")
+        digest = hashlib.sha256(agent_name.encode("utf-8")).hexdigest()[:16]
+        safe_name = f"{slug[:80]}-{digest}"
+        target = self.executions_dir / safe_name
+
+        # Migrate the former slash-only directory name only when every record
+        # proves ownership by this exact Agent.  Ambiguous legacy directories
+        # are left untouched rather than merged.
+        legacy_name = agent_name.replace("/", "_").replace("\\", "_")
+        legacy = self.executions_dir / legacy_name
+        if (
+            legacy != target
+            and not legacy.is_symlink()
+            and legacy.is_dir()
+            and not target.exists()
+        ):
+            with self._storage_lock:
+                if legacy.is_dir() and not target.exists():
+                    try:
+                        records = list(legacy.glob("*.json"))
+                        if records and all(
+                            json.loads(path.read_text(encoding="utf-8")).get("agent_name")
+                            == agent_name
+                            for path in records
+                        ):
+                            legacy.replace(target)
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        pass
+        if target.exists() and target.is_symlink():
+            raise ExecutionError("Agent 执行记录目录不安全")
+        return target
 
     def get_execution_path(self, agent_name: str, execution_id: str) -> Path:
         """获取执行记录文件路径"""
+        if re.fullmatch(r"(?:[0-9a-f]{8}|[0-9a-f]{32})", execution_id or "") is None:
+            raise ExecutionError("执行 ID 无效")
         return self.get_executions_dir(agent_name) / f"{execution_id}.json"
 
     def _get_semaphore(self, agent_name: str) -> asyncio.Semaphore:
@@ -103,7 +168,7 @@ class ExecutionEngine:
 
         # 创建执行记录
         import uuid
-        execution_id = str(uuid.uuid4())[:8]
+        execution_id = uuid.uuid4().hex
 
         record = ExecutionRecord(
             execution_id=execution_id,
@@ -116,33 +181,39 @@ class ExecutionEngine:
         )
 
         # 保存初始记录
-        self._save_record(record)
+        await self._run_disk(self._save_record, record)
 
         # 获取并发控制
         semaphore = self._get_semaphore(agent_name)
 
+        work_dir: Optional[Path] = None
         async with semaphore:
             try:
                 # 更新状态为运行中
                 record.status = ExecutionStatus.RUNNING
                 record.started_at = datetime.now().isoformat()
-                self._save_record(record)
+                await self._run_disk(self._save_record, record)
 
                 # 获取或创建环境
                 env = await self.environment_manager.get_or_create_environment(agent_name)
 
                 # 安装 Skill 依赖（如果有 requirements.txt）
                 if skill_base_path:
-                    skill_path = Path(skill_base_path).parent  # skill_base_path 是 scripts 目录，需要获取父目录
+                    skill_path = Path(skill_base_path)
+                    if skill_path.name == "scripts":
+                        skill_path = skill_path.parent
                     success, message, packages = await self.environment_manager.install_skill_dependencies(
                         agent_name=agent_name,
                         skill_path=skill_path,
                         skill_name=skill_name
                     )
                     if not success:
-                        print(f"[EXEC] 警告: 依赖安装失败 - {message}")
+                        print(
+                            "[EXEC] 警告: 依赖安装失败 "
+                            f"message_length={len(message or '')}"
+                        )
                     elif packages:
-                        print(f"[EXEC] 已安装依赖: {packages}")
+                        print(f"[EXEC] 已安装依赖: package_count={len(packages)}")
 
                 # 准备工作目录（包含复制技能文件）
                 work_dir = await self._prepare_work_dir_with_skill(
@@ -159,10 +230,12 @@ class ExecutionEngine:
                 # 执行脚本
                 exit_code, stdout, stderr, duration_ms = await self._execute_in_environment(
                     agent_name=agent_name,
+                    execution_id=execution_id,
                     script_path=script_path,
                     args=args,
                     work_dir=work_dir,
-                    timeout=timeout
+                    timeout=timeout,
+                    skill_base_path=skill_base_path,
                 )
 
                 # 更新执行记录
@@ -172,67 +245,106 @@ class ExecutionEngine:
                 record.duration_ms = duration_ms
                 record.finished_at = datetime.now().isoformat()
 
-                if exit_code == 0:
+                if execution_id in self._cancel_requested:
+                    record.status = ExecutionStatus.CANCELLED
+                elif exit_code == 0:
                     record.status = ExecutionStatus.SUCCESS
                 else:
                     record.status = ExecutionStatus.FAILED
 
-                self._save_record(record)
-
-                # 清理工作目录
-                self._cleanup_work_dir(work_dir)
-
+                await self._run_disk(self._save_record, record)
                 return record
 
             except asyncio.TimeoutError:
                 record.status = ExecutionStatus.TIMEOUT
                 record.stderr = f"执行超时 ({timeout}秒)"
                 record.finished_at = datetime.now().isoformat()
-                self._save_record(record)
+                await self._run_disk(self._save_record, record)
                 return record
 
             except EnvironmentError as e:
                 record.status = ExecutionStatus.FAILED
-                record.stderr = str(e)
+                record.stderr = f"执行失败 ({type(e).__name__})"
                 record.finished_at = datetime.now().isoformat()
-                self._save_record(record)
+                await self._run_disk(self._save_record, record)
                 return record
 
             except Exception as e:
                 record.status = ExecutionStatus.FAILED
-                record.stderr = f"执行错误: {str(e)}"
+                record.stderr = f"执行失败 ({type(e).__name__})"
                 record.finished_at = datetime.now().isoformat()
-                self._save_record(record)
+                await self._run_disk(self._save_record, record)
                 return record
+            finally:
+                self._cancel_requested.discard(execution_id)
+                await self._run_disk(
+                    self._cleanup_execution_artifacts,
+                    work_dir,
+                    agent_name,
+                )
 
     async def _execute_in_environment(
         self,
         agent_name: str,
+        execution_id: str,
         script_path: str,
         args: List[str],
         work_dir: Path,
-        timeout: int
+        timeout: int,
+        skill_base_path: Optional[str] = None,
     ) -> tuple:
         """
-        在Conda环境中执行脚本
+        在项目内 uv 环境中执行脚本
 
         Returns:
             (exit_code, stdout, stderr, duration_ms)
         """
-        # 构建命令
-        command = ["python", script_path] + args
+        # Skill sources are mounted read-only by Landlock.  Executing them in
+        # place avoids copying and deleting megabytes of identical assets for
+        # every call, while all mutable input/output remains in this workdir.
+        source_root, candidate = await self._run_disk(
+            self._resolve_script_paths,
+            skill_base_path,
+            work_dir,
+            script_path,
+        )
+        command = ["python", str(candidate), *args]
 
         try:
             return await self.environment_manager.execute_in_environment(
                 agent_name=agent_name,
                 command=command,
                 cwd=str(work_dir),
-                timeout=timeout
+                timeout=timeout,
+                execution_id=execution_id,
+                additional_readable_paths=(
+                    [source_root] if skill_base_path is not None else []
+                ),
             )
         except EnvironmentError as e:
             if "超时" in str(e):
-                raise asyncio.TimeoutError(str(e))
+                raise asyncio.TimeoutError from e
             raise
+
+    @staticmethod
+    def _resolve_script_paths(
+        skill_base_path: Optional[str],
+        work_dir: Path,
+        script_path: str,
+    ) -> tuple[Path, Path]:
+        source_root = (
+            Path(skill_base_path).resolve()
+            if skill_base_path
+            else work_dir.resolve()
+        )
+        candidate = (source_root / script_path).resolve()
+        try:
+            candidate.relative_to(source_root)
+        except ValueError as exc:
+            raise ExecutionError("脚本路径超出 Skill 源目录") from exc
+        if not candidate.is_file():
+            raise ExecutionError(f"脚本不存在: {script_path}")
+        return source_root, candidate
 
     def _prepare_work_dir(
         self,
@@ -252,7 +364,12 @@ class ExecutionEngine:
             工作目录路径
         """
         # 创建临时工作目录
-        work_dir = Path(tempfile.mkdtemp(prefix=f"exec_{execution_id}_"))
+        work_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"exec_{execution_id}_",
+                dir=self.work_root,
+            )
+        )
 
         # 创建输入文件目录
         input_dir = work_dir / "input"
@@ -279,26 +396,40 @@ class ExecutionEngine:
         Returns:
             工作目录路径
         """
-        # 创建临时工作目录
-        work_dir = Path(tempfile.mkdtemp(prefix=f"exec_{execution_id}_"))
+        return await self._run_disk(
+            self._prepare_work_dir_with_skill_sync,
+            execution_id,
+            skill_base_path,
+        )
+
+    def _prepare_work_dir_with_skill_sync(
+        self,
+        execution_id: str,
+        skill_base_path: Optional[str],
+    ) -> Path:
+        """Create and validate one execution directory in a disk worker."""
+        # Skill source files are exposed read-only to the sandbox at execution
+        # time. Validate before allocating a work directory so failure leaves
+        # no orphan on disk.
+        if skill_base_path:
+            skill_path = Path(skill_base_path)
+            if (
+                not skill_path.exists()
+                or not skill_path.is_dir()
+                or skill_path.is_symlink()
+            ):
+                raise ExecutionError("Skill 源目录不存在或不安全")
+
+        work_dir = Path(
+            tempfile.mkdtemp(
+                prefix=f"exec_{execution_id}_",
+                dir=self.work_root,
+            )
+        )
 
         # 创建输入文件目录
         input_dir = work_dir / "input"
         input_dir.mkdir(exist_ok=True)
-
-        # 复制技能文件到工作目录
-        if skill_base_path:
-            skill_path = Path(skill_base_path)
-            if skill_path.exists() and skill_path.is_dir():
-                # 复制整个技能目录
-                for item in skill_path.iterdir():
-                    if item.is_file():
-                        shutil.copy2(item, work_dir / item.name)
-                    elif item.is_dir():
-                        shutil.copytree(item, work_dir / item.name)
-                print(f"[EXEC] 已复制技能文件到工作目录: {skill_path}")
-            else:
-                print(f"[EXEC] 警告: 技能路径不存在: {skill_base_path}")
 
         return work_dir
 
@@ -319,7 +450,7 @@ class ExecutionEngine:
             return
 
         input_dir = work_dir / "input"
-        input_dir.mkdir(exist_ok=True)
+        await self._run_disk(input_dir.mkdir, parents=True, exist_ok=True)
 
         for file_id in input_file_ids:
             try:
@@ -329,11 +460,14 @@ class ExecutionEngine:
                     workdir=input_dir
                 )
                 if target_path:
-                    print(f"[EXEC] 已复制输入文件: {target_path}")
+                    print("[EXEC] 已复制输入文件")
                 else:
-                    print(f"[EXEC] 警告: 无法复制文件 {file_id}")
+                    print("[EXEC] 警告: 无法复制输入文件")
             except Exception as e:
-                print(f"[EXEC] 复制文件 {file_id} 失败: {e}")
+                print(
+                    "[EXEC] 复制输入文件失败: "
+                    f"error_type={type(e).__name__}"
+                )
 
     def _cleanup_work_dir(self, work_dir: Path):
         """清理工作目录"""
@@ -341,7 +475,16 @@ class ExecutionEngine:
             if work_dir.exists():
                 shutil.rmtree(work_dir, ignore_errors=True)
         except Exception as e:
-            print(f"清理工作目录失败: {e}")
+            print(f"清理工作目录失败: error_type={type(e).__name__}")
+
+    def _cleanup_execution_artifacts(
+        self,
+        work_dir: Optional[Path],
+        agent_name: str,
+    ) -> None:
+        if work_dir is not None:
+            self._cleanup_work_dir(work_dir)
+        self._enforce_record_limit(agent_name)
 
     async def get_execution_status(self, agent_name: str, execution_id: str) -> Optional[ExecutionRecord]:
         """
@@ -354,17 +497,28 @@ class ExecutionEngine:
         Returns:
             ExecutionRecord或None
         """
-        execution_path = self.get_execution_path(agent_name, execution_id)
+        return await self._run_disk(
+            self._get_execution_status_sync,
+            agent_name,
+            execution_id,
+        )
 
+    def _get_execution_status_sync(
+        self,
+        agent_name: str,
+        execution_id: str,
+    ) -> Optional[ExecutionRecord]:
+        try:
+            execution_path = self.get_execution_path(agent_name, execution_id)
+        except ExecutionError:
+            return None
         if not execution_path.exists():
             return None
-
         try:
-            with open(execution_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return ExecutionRecord(**data)
-        except Exception as e:
-            print(f"读取执行记录失败: {e}")
+            with open(execution_path, "r", encoding="utf-8") as handle:
+                return ExecutionRecord(**json.load(handle))
+        except Exception as exc:
+            print(f"读取执行记录失败: error_type={type(exc).__name__}")
             return None
 
     async def list_executions(self, agent_name: str, limit: int = 50) -> List[ExecutionRecord]:
@@ -378,24 +532,25 @@ class ExecutionEngine:
         Returns:
             执行记录列表
         """
-        executions_dir = self.get_executions_dir(agent_name)
+        return await self._run_disk(self._list_executions_sync, agent_name, limit)
 
+    def _list_executions_sync(
+        self,
+        agent_name: str,
+        limit: int,
+    ) -> List[ExecutionRecord]:
+        executions_dir = self.get_executions_dir(agent_name)
         if not executions_dir.exists():
             return []
-
         records = []
         for json_file in executions_dir.glob("*.json"):
             try:
-                with open(json_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                records.append(ExecutionRecord(**data))
-            except:
+                with open(json_file, "r", encoding="utf-8") as handle:
+                    records.append(ExecutionRecord(**json.load(handle)))
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 continue
-
-        # 按创建时间倒序排序
-        records.sort(key=lambda r: r.created_at, reverse=True)
-
-        return records[:limit]
+        records.sort(key=lambda record: record.created_at, reverse=True)
+        return records[: max(0, min(int(limit), self.MAX_RECORDS_PER_AGENT))]
 
     async def cancel_execution(self, agent_name: str, execution_id: str) -> bool:
         """
@@ -408,34 +563,63 @@ class ExecutionEngine:
         Returns:
             是否取消成功
         """
-        # 检查是否在运行中
-        if execution_id in self._running_executions:
-            process = self._running_executions[execution_id]
-            try:
-                process.kill()
-                await process.wait()
-            except:
-                pass
+        if re.fullmatch(r"(?:[0-9a-f]{8}|[0-9a-f]{32})", execution_id or "") is None:
+            return False
+        self._cancel_requested.add(execution_id)
+        process_stopped = await self.environment_manager.cancel_process(execution_id)
 
         # 更新状态
         record = await self.get_execution_status(agent_name, execution_id)
         if record and record.status == ExecutionStatus.RUNNING:
             record.status = ExecutionStatus.CANCELLED
             record.finished_at = datetime.now().isoformat()
-            self._save_record(record)
+            await self._run_disk(self._save_record, record)
             return True
 
-        return False
+        self._cancel_requested.discard(execution_id)
+        return process_stopped
 
     def _save_record(self, record: ExecutionRecord):
         """保存执行记录"""
         executions_dir = self.get_executions_dir(record.agent_name)
-        executions_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            executions_dir = ensure_real_directory(executions_dir)
+        except UnsafeStoragePathError as exc:
+            raise ExecutionError("Agent 执行记录目录不安全") from exc
 
         execution_path = self.get_execution_path(record.agent_name, record.execution_id)
 
-        with open(execution_path, 'w', encoding='utf-8') as f:
-            json.dump(record.model_dump(), f, ensure_ascii=False, indent=2)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{execution_path.name}.", dir=executions_dir
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(
+                    record.model_dump(),
+                    handle,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, execution_path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+
+    def _enforce_record_limit(self, agent_name: str) -> None:
+        """Keep execution metadata bounded without rewriting existing records."""
+        executions_dir = self.get_executions_dir(agent_name)
+        try:
+            records = sorted(
+                executions_dir.glob("*.json"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+            for stale in records[self.MAX_RECORDS_PER_AGENT :]:
+                stale.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"清理执行记录失败: error_type={type(exc).__name__}")
 
     async def cleanup_old_executions(self, agent_name: str, days: int = 7) -> int:
         """
@@ -448,22 +632,37 @@ class ExecutionEngine:
         Returns:
             清理的记录数
         """
-        executions_dir = self.get_executions_dir(agent_name)
+        return await self._run_disk(
+            self._cleanup_old_executions_sync,
+            agent_name,
+            days,
+        )
 
+    def _cleanup_old_executions_sync(self, agent_name: str, days: int) -> int:
+        executions_dir = self.get_executions_dir(agent_name)
         if not executions_dir.exists():
             return 0
-
-        import time
-        cutoff_time = time.time() - (days * 24 * 60 * 60)
+        cutoff_time = time.time() - (max(0, days) * 24 * 60 * 60)
         cleaned = 0
-
         for json_file in executions_dir.glob("*.json"):
             try:
-                # 检查文件修改时间
                 if json_file.stat().st_mtime < cutoff_time:
                     json_file.unlink()
                     cleaned += 1
-            except:
+            except OSError:
                 continue
-
         return cleaned
+
+    async def cleanup_agent_executions(self, agent_name: str) -> bool:
+        """Remove all bounded execution metadata owned by an Agent."""
+        try:
+            await self._run_disk(self._cleanup_agent_executions_sync, agent_name)
+            self._semaphores.pop(agent_name, None)
+            return True
+        except OSError:
+            return False
+
+    def _cleanup_agent_executions_sync(self, agent_name: str) -> None:
+        executions_dir = self.get_executions_dir(agent_name)
+        if executions_dir.exists():
+            shutil.rmtree(executions_dir)

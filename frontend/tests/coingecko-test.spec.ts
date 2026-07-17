@@ -7,9 +7,10 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = 'teams/AC130/iterations/iteration-202603151840/screenshots';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('coingecko-test');
 
 async function saveScreenshot(page: Page, name: string) {
   await page.screenshot({

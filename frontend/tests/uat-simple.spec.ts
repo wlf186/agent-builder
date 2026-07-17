@@ -5,9 +5,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = '../teams/AC130/iterations/AC130-202603151423/screenshots';
+const BASE_URL = process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:20815';
+const BACKEND_URL = process.env.AGENT_BUILDER_BACKEND_URL || 'http://localhost:20881';
+const SCREENSHOT_DIR = testOutputDir('uat-simple');
 
 test.describe('UAT: 调试日志导出功能 (简化版)', () => {
 
@@ -90,7 +92,7 @@ test.describe('UAT: 调试日志导出功能 (简化版)', () => {
     const testTraceId = 'test-trace-' + Date.now();
 
     try {
-      const response = await page.request.get(`${BASE_URL.replace('20880', '20881')}/api/debug-logs/${testTraceId}`);
+      const response = await page.request.get(`${BACKEND_URL}/api/debug-logs/${testTraceId}`);
 
       if (response.status() === 200 || response.status() === 404) {
         console.log(`✅ 后端日志 API 端点可用 (${response.status()})`);

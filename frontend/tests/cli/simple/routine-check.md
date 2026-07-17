@@ -4,13 +4,13 @@
 > 复杂度: simple
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 
 ## 测试用例
 
 ### 测试 1: 主页加载正常
 
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. snapshot 查看页面是否显示 h1 或 h2 标题
 
@@ -18,7 +18,7 @@
 
 ### 测试 2: 智能体列表显示
 
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 等待 2 秒
 4. snapshot 查看是否有 h3 元素（智能体卡片标题）
@@ -27,7 +27,7 @@
 
 ### 测试 3: 智能体选择和对话
 
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. snapshot 找到 "test3" 标题，点击它
 4. 等待 2 秒
@@ -40,7 +40,7 @@
 
 ### 测试 4: 知识库页面可访问
 
-1. 打开 http://localhost:20880/knowledge-bases
+1. 打开 http://localhost:20815/knowledge-bases
 2. 等待页面加载完成
 3. 等待 2 秒
 4. snapshot 查看页面内容

@@ -5,7 +5,7 @@
 > 测试目标: 知识库创建、文档上传、智能体关联、对话检索、隔离性测试
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 测试文档路径: `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.txt`
 
 ---
@@ -13,7 +13,7 @@
 ### 测试用例 测试1: 知识库创建
 
 ## 步骤
-1. 访问 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 访问 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. 截图保存到 `test-results/cli/simple-uat-rag-01-kb-list.png`
 3. snapshot 找到"创建知识库"或"Create"按钮，点击
 4. 等待 1 秒
@@ -33,7 +33,7 @@
 ### 测试用例 测试2: 文档上传
 
 ## 步骤
-1. 访问 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 访问 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. snapshot 找到第一个知识库卡片（`h3` 或 `a` 或包含"card"的元素），点击
 3. 等待 2 秒
 4. 截图保存到 `test-results/cli/simple-uat-rag-05-kb-detail.png`
@@ -50,7 +50,7 @@
 ### 测试用例 测试3: 智能体关联
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/simple-uat-rag-07-homepage.png`
 3. snapshot 找到"创建智能体"或"Create Agent"按钮，点击
 4. 等待 1 秒
@@ -72,7 +72,7 @@
 ### 测试用例 测试4: 对话检索
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到"行政助手"文本，点击
 3. 等待 2 秒
 4. 截图保存到 `test-results/cli/simple-uat-rag-11-agent-selected.png`
@@ -91,7 +91,7 @@
 ### 测试用例 测试5: 隔离性测试
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到"创建智能体"或"Create Agent"按钮，点击
 3. 等待 1 秒
 4. 遍历 `input[type="text"]` 元素，找到 placeholder 包含"名称"或"name"的输入框，输入"技术支持"

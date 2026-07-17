@@ -1,7 +1,8 @@
 ---
-title: 文件上传器
+title: "文件上传器"
 category: core
 component: FileUploader
+generated: true
 related:
   - AgentChat
 ---

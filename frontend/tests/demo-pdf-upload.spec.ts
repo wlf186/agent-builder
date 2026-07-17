@@ -1,5 +1,6 @@
 import { test, expect } from '@playwright/test';
 import path from 'path';
+import { AC130_PDF_FIXTURE, testOutputDir } from './test-paths';
 
 /**
  * 演示脚本：PDF 文件上传 + 内容提取
@@ -16,13 +17,13 @@ test.use({ headless: false }); // headed 模式
 test.setTimeout(120000); // 120 秒超时
 
 test('演示: PDF 上传 + 内容提取', async ({ page }) => {
-  const screenshotDir = 'teams/AC130/iterations/iteration-202603151910/demo';
+  const screenshotDir = testOutputDir('demo-pdf-upload');
 
   // PDF 文件路径
-  const pdfPath = '/home/wremote/claude-dev/agent-builder-general/resources/Thinking Fast and Slow (Daniel Kahneman) (Z-Library).pdf';
+  const pdfPath = AC130_PDF_FIXTURE;
 
   // ========== 初始化 ==========
-  await page.goto('http://localhost:20880');
+  await page.goto('http://localhost:20815');
   await page.waitForLoadState('networkidle');
 
   // 修复 X11 远程投屏渲染问题：触发浏览器重绘

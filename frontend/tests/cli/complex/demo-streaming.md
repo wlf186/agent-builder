@@ -4,14 +4,14 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 
 ---
 
 ### 测试用例 1: 演示流式对话完整流程
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/demo-streaming-01-homepage.png`
 3. 等待 2 秒
 4. 在 snapshot 中找到 "test3" 智能体卡片，点击选择。如果找不到 test3，选择第一个可用智能体
@@ -37,7 +37,7 @@
 
 ## 步骤
 1. 在后续操作中注意观察控制台错误（`page.on('console')` 监听 error 类型消息）
-2. 访问 `http://localhost:20880`，等待 h3/h2 或智能体卡片元素出现
+2. 访问 `http://localhost:20815`，等待 h3/h2 或智能体卡片元素出现
 3. 在 snapshot 中找到第一个智能体卡片（h3 标签），点击选择
 4. 等待 1 秒
 5. 在 snapshot 中找到聊天输入框（`input[type="text"]`），输入 "演示测试"

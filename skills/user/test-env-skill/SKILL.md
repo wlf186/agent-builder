@@ -6,4 +6,4 @@ description: Test skill for environment isolation
 
 # Test Environment Isolation
 
-This skill tests the isolated Conda environment execution.
+This skill tests project-local uv environment isolation.

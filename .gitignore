@@ -1,7 +1,12 @@
 # Dependencies
 node_modules/
-.conda/
 .venv/
+.tools/
+.runtime/
+.superpowers/
+.playwright-cli/
+docs-site/.playwright-cli/
+docs-site/.vitepress/cache/
 
 # Build outputs
 frontend/.next/
@@ -28,7 +33,6 @@ __pycache__/
 .env.test.local
 .env.production.local
 *.env
-.env.langfuse
 
 # Encrypted secrets files (optional - uncomment to exclude encrypted files)
 # data/.secrets.json.enc
@@ -52,7 +56,7 @@ yarn-debug.log*
 yarn-error.log*
 
 # Runtime data
-data/
+data/*
 !data/.gitkeep
 
 # Temporary files
@@ -72,6 +76,7 @@ screenshots/
 debug_*.py
 test_*.py
 !tests/
+!tests/**/*.py
 
 # Bug reports
 bug/
@@ -85,7 +90,7 @@ bug/
 # Test Data
 test/
 
-# Conda environments
+# Per-agent uv environments
 environments/
 
 # PID files

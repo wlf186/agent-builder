@@ -6,9 +6,10 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = 'teams/AC130/iterations/iteration-202603150000/screenshots/demo';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('demo-streaming');
 
 async function saveScreenshot(page: Page, name: string) {
   await page.screenshot({
@@ -83,11 +84,11 @@ test.describe('演示: 流式对话功能', () => {
     console.log('\n步骤6: 验证响应完成...');
     await saveScreenshot(page, '07-response-complete');
 
-    const pageContent = await page.textContent('body');
-    const hasResponse = pageContent?.includes('你好') ||
-                        pageContent?.includes('我是') ||
-                        pageContent?.includes('帮助') ||
-                        pageContent?.length > 2000;
+    const pageContent = await page.textContent('body') ?? '';
+    const hasResponse = pageContent.includes('你好') ||
+                        pageContent.includes('我是') ||
+                        pageContent.includes('帮助') ||
+                        pageContent.length > 2000;
 
     if (hasResponse) {
       console.log('✓ 响应完成，有有效内容');

@@ -36,17 +36,16 @@
  * @related MCPDiagnosticResult
  */
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { X, Loader2, Server, Link, Key, Settings, Activity, AlertCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { useLocale } from "@/lib/LocaleContext";
 import { MCPDiagnosticResult, diagnoseMCPService, MCPDiagnosticReport } from "@/components/MCPDiagnosticResult";
-
-const API_BASE = "/api";
+import { apiPath } from "@/lib/apiPath";
 
 interface MCPService {
   name: string;
@@ -71,15 +70,17 @@ export function MCPServiceDialog({ isOpen, onClose, onSave, service }: MCPServic
   const { locale } = useLocale();
   const isEdit = !!service;
 
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [enabled, setEnabled] = useState(true);
+  const [name, setName] = useState(() => service?.name ?? "");
+  const [description, setDescription] = useState(() => service?.description ?? "");
+  const [enabled, setEnabled] = useState(() => service?.enabled ?? true);
 
   // SSE 配置 (唯一支持的连接方式)
-  const [url, setUrl] = useState("");
-  const [authType, setAuthType] = useState<"none" | "bearer" | "apikey">("none");
+  const [url, setUrl] = useState(() => service?.url ?? "");
+  const [authType, setAuthType] = useState<"none" | "bearer" | "apikey">(
+    () => (service?.auth_type as "none" | "bearer" | "apikey" | undefined) ?? "none",
+  );
   const [authValue, setAuthValue] = useState("");
-  const [headers, setHeaders] = useState("");
+  const [headers, setHeaders] = useState(() => JSON.stringify(service?.headers ?? {}, null, 2));
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
@@ -89,28 +90,6 @@ export function MCPServiceDialog({ isOpen, onClose, onSave, service }: MCPServic
   const [isDiagnosing, setIsDiagnosing] = useState(false);
   const [diagnosticReport, setDiagnosticReport] = useState<MCPDiagnosticReport | null>(null);
   const [diagnosticError, setDiagnosticError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (service) {
-      setName(service.name);
-      setDescription(service.description || "");
-      setEnabled(service.enabled);
-      setUrl(service.url || "");
-      setAuthType((service.auth_type as "none" | "bearer" | "apikey") || "none");
-      setAuthValue("");
-      setHeaders(JSON.stringify(service.headers || {}, null, 2));
-    } else {
-      // 重置表单
-      setName("");
-      setDescription("");
-      setEnabled(true);
-      setUrl("");
-      setAuthType("none");
-      setAuthValue("");
-      setHeaders("{}");
-    }
-    setError("");
-  }, [service, isOpen]);
 
   const handleSave = async () => {
     if (!name.trim()) {
@@ -147,10 +126,10 @@ export function MCPServiceDialog({ isOpen, onClose, onSave, service }: MCPServic
         headers: headersObj,
       };
 
-      const url_path = isEdit ? `/api/mcp-services/${service.name}` : "/api/mcp-services";
+      const urlPath = isEdit ? apiPath('mcp-services', service.name) : apiPath('mcp-services');
       const method = isEdit ? "PUT" : "POST";
 
-      const res = await fetch(`${API_BASE}${url_path}`, {
+      const res = await fetch(urlPath, {
         method,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
@@ -191,15 +170,6 @@ export function MCPServiceDialog({ isOpen, onClose, onSave, service }: MCPServic
       setIsDiagnosing(false);
     }
   };
-
-  // 重置诊断状态（对话框关闭时）
-  useEffect(() => {
-    if (!isOpen) {
-      setShowDiagnostic(false);
-      setDiagnosticReport(null);
-      setDiagnosticError(null);
-    }
-  }, [isOpen]);
 
   return (
     <AnimatePresence>

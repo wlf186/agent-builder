@@ -8,6 +8,9 @@ from pathlib import Path
 import defusedxml.minidom
 import lxml.etree
 
+from safe_zip import safe_extract_zip
+from secure_temp import secure_temp_root
+
 
 class BaseSchemaValidator:
 
@@ -151,10 +154,10 @@ class BaseSchemaValidator:
                     f"  {xml_file.relative_to(self.unpacked_dir)}: "
                     f"Line {e.lineno}: {e.msg}"
                 )
-            except Exception as e:
+            except Exception:
                 errors.append(
                     f"  {xml_file.relative_to(self.unpacked_dir)}: "
-                    f"Unexpected error: {str(e)}"
+                    "Unexpected validation error"
                 )
 
         if errors:
@@ -271,9 +274,9 @@ class BaseSchemaValidator:
                                 else:
                                     file_ids[key][id_value] = elem.sourceline
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {xml_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {xml_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -354,9 +357,9 @@ class BaseSchemaValidator:
                             f"  {rel_path}: Line {line_num}: Broken reference to {broken_ref}"
                         )
 
-            except Exception as e:
+            except Exception:
                 rel_path = rels_file.relative_to(self.unpacked_dir)
-                errors.append(f"  Error parsing {rel_path}: {e}")
+                errors.append(f"  Error parsing {rel_path}")
 
         unreferenced_files = set(all_files) - all_referenced_files
 
@@ -451,9 +454,9 @@ class BaseSchemaValidator:
                                         f"but should point to a '{expected_type}' relationship"
                                     )
 
-            except Exception as e:
+            except Exception:
                 xml_rel_path = xml_file.relative_to(self.unpacked_dir)
-                errors.append(f"  Error processing {xml_rel_path}: {e}")
+                errors.append(f"  Error processing {xml_rel_path}")
 
         if errors:
             print(f"FAILED - Found {len(errors)} relationship ID reference errors:")
@@ -580,8 +583,8 @@ class BaseSchemaValidator:
                             f'  {relative_path}: File with extension \'{extension}\' not declared in [Content_Types].xml - should add: <Default Extension="{extension}" ContentType="{media_extensions[extension]}"/>'
                         )
 
-        except Exception as e:
-            errors.append(f"  Error parsing [Content_Types].xml: {e}")
+        except Exception:
+            errors.append("  Error parsing [Content_Types].xml")
 
         if errors:
             print(f"FAILED - Found {len(errors)} content type declaration errors:")
@@ -781,25 +784,23 @@ class BaseSchemaValidator:
                     errors.add(error.message)
                 return False, errors
 
-        except Exception as e:
-            return False, {str(e)}
+        except Exception:
+            return False, {"Schema validation failed"}
 
     def _get_original_file_errors(self, xml_file):
         if self.original_file is None:
             return set()
 
         import tempfile
-        import zipfile
 
         xml_file = Path(xml_file).resolve()
         unpacked_dir = self.unpacked_dir.resolve()
         relative_path = xml_file.relative_to(unpacked_dir)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=secure_temp_root()) as temp_dir:
             temp_path = Path(temp_dir)
 
-            with zipfile.ZipFile(self.original_file, "r") as zip_ref:
-                zip_ref.extractall(temp_path)
+            safe_extract_zip(self.original_file, temp_path)
 
             original_xml_file = temp_path / relative_path
 

@@ -4,7 +4,7 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - test3 智能体可用
 
 > 注意: 调试对话输入框使用 `<input type="text">`（不是 textarea），人设与提示词编辑使用 `<textarea>`。
@@ -14,7 +14,7 @@
 ### 测试用例 1: TC-001 - test3 agent 基本响应验证
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 截图保存到 test-results/cli/streaming-01-homepage.png
 4. 等待并找到包含 "test3" 的 h3 元素（最多等待 15 秒），点击它

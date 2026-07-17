@@ -1,7 +1,13 @@
 {
   "scripts": {
     "docs:extract": "tsx scripts/extract-user-guide.ts",
+    "docs:extract:check": "tsx scripts/extract-user-guide.ts --check",
     "docs:validate": "tsx scripts/validate-user-guide.ts",
+    "docs:lint": "markdownlint-cli2",
+    "docs:links": "node scripts/check-doc-links.mjs",
+    "docs:check": "python3 scripts/check_docs.py && npm run docs:extract:check && npm run docs:lint && npm run docs:validate && npm run docs:links && npm run docs:build",
+    "secrets:check": "node scripts/check-secrets.mjs",
+    "governance:check": "npm run docs:check && npm run secrets:check",
     "docs:dev": "cd docs-site && npm run dev",
     "docs:build": "cd docs-site && npm run build",
     "docs:preview": "cd docs-site && npm run preview"
@@ -20,6 +26,12 @@
     "@tailwindcss/typography": "^0.5.19",
     "@types/glob": "^8.1.0",
     "glob": "^13.0.6",
+    "markdownlint-cli2": "^0.23.0",
     "tsx": "^4.21.0"
+  },
+  "overrides": {
+    "brace-expansion": "5.0.7",
+    "esbuild": "0.28.1",
+    "postcss": "8.5.19"
   }
 }

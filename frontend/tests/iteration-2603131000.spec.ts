@@ -16,8 +16,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const SCREENSHOT_DIR = testOutputDir('iteration-2603131000');
+
+const BASE_URL = 'http://localhost:20815';
 const API_BASE = 'http://localhost:20881';
 
 // 测试用智能体名称
@@ -100,7 +103,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     // 刷新页面查看新创建的智能体
     await page.goto(BASE_URL);
     await page.waitForTimeout(1000);
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc01-immediate-return.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc01-immediate-return.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc01);
@@ -139,7 +142,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     );
 
     // 截图
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc02-banner-check.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc02-banner-check.png` });
 
     // 检查页面内容
     const pageContent = await page.content();
@@ -181,7 +184,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     const disabledElements = await page.locator('[disabled], [aria-disabled="true"], [class*="opacity-50"]').count();
     console.log(`禁用元素数量: ${disabledElements}`);
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc03-skills-locked.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc03-skills-locked.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc03);
@@ -222,7 +225,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
       }
     }
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc04-other-configs-usable.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc04-other-configs-usable.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc04);
@@ -263,7 +266,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     const hasDisabledMessage = pageContent.includes('初始化') || pageContent.includes('不可用') || pageContent.includes('disabled');
     console.log(`有禁用相关提示: ${hasDisabledMessage}`);
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc05-chat-disabled.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc05-chat-disabled.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc05);
@@ -324,7 +327,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
       console.log(`聊天输入框启用状态: ${isEnabled}`);
     }
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc06-auto-unlock.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc06-auto-unlock.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc06);
@@ -361,7 +364,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     const hasRetryButton = pageContent.includes('重试') || pageContent.includes('Retry');
     console.log(`有重试相关文本: ${hasRetryButton}`);
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc07-error-handling.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc07-error-handling.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc07);
@@ -394,7 +397,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     const exists = await agentCard.isVisible({ timeout: 2000 }).catch(() => false);
     console.log(`智能体卡片是否显示: ${exists}`);
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc08-delete-agent.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc08-delete-agent.png` });
 
     console.log('=== TC-08 完成 ===');
   });
@@ -488,7 +491,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
     // 验证有轮询请求（至少1次）
     expect(envRequests.length).toBeGreaterThan(0);
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc10-polling-mechanism.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc10-polling-mechanism.png` });
 
     // 清理
     await cleanupAgent(TEST_AGENTS.tc10);
@@ -530,7 +533,7 @@ test.describe('Iteration 2603131000: 异步环境初始化功能', () => {
       console.log(`错误: ${err}`);
     }
 
-    await page.screenshot({ path: 'test-results/iteration-2603131000/tc11-baseline.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc11-baseline.png` });
 
     console.log('=== TC-11 完成 ===');
   });

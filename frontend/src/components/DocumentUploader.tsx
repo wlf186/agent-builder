@@ -38,7 +38,7 @@
 
 import { useState, useRef, useCallback } from "react";
 import { X, Upload, FileText, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
-import { kbApi } from "@/lib/kbApi";
+import { kbApi, type Document } from "@/lib/kbApi";
 
 interface DocumentUploaderProps {
   kbId: string;
@@ -50,7 +50,7 @@ interface UploadFile {
   file: File;
   status: "pending" | "uploading" | "success" | "error";
   error?: string;
-  result?: any;
+  result?: Document;
 }
 
 const SUPPORTED_FORMATS = [".pdf", ".txt", ".md", ".docx"];

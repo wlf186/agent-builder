@@ -5,14 +5,14 @@
 > 测试目标: 验证系统页面显示正常，数据加载正确
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 
 ---
 
 ### 测试用例 1: 页面样式正常加载
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待 2 秒
+1. 访问 `http://localhost:20815`，等待 2 秒
 2. 截图保存到 `test-results/cli/uat-walkthrough-homepage.png`
 
 ## 验证
@@ -24,7 +24,7 @@
 ### 测试用例 2: 智能体列表不为空
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待 3 秒
+1. 访问 `http://localhost:20815`，等待 3 秒
 2. 截图保存到 `test-results/cli/uat-walkthrough-agents.png`
 
 ## 验证
@@ -37,7 +37,7 @@
 
 ## 步骤
 1. 在后续操作中注意观察网络请求响应（`page.on('response')` 监听 `/api/` 路径的响应状态和内容）
-2. 访问 `http://localhost:20880`
+2. 访问 `http://localhost:20815`
 3. 刷新页面，等待 3 秒
 4. 在后续操作中注意观察控制台错误（`page.on('console')` 监听 error 类型消息）
 5. 等待 2 秒
@@ -51,7 +51,7 @@
 ### 测试用例 4: 模型服务列表不为空
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待 2 秒
+1. 访问 `http://localhost:20815`，等待 2 秒
 2. 截图保存到 `test-results/cli/uat-walkthrough-sidebar.png`
 
 ## 验证
@@ -62,7 +62,7 @@
 ### 测试用例 5: MCP 服务列表不为空
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待 2 秒
+1. 访问 `http://localhost:20815`，等待 2 秒
 2. 截图保存到 `test-results/cli/uat-walkthrough-mcp.png`
 
 ## 验证
@@ -73,7 +73,7 @@
 ### 测试用例 6: 检查数字显示
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待 3 秒
+1. 访问 `http://localhost:20815`，等待 3 秒
 2. 截图保存到 `test-results/cli/uat-walkthrough-full.png`
 
 ## 验证
@@ -86,7 +86,7 @@
 
 ## 步骤
 1. 在后续操作中注意观察控制台错误（`page.on('console')` 监听 error 类型消息）和页面错误（`page.on('pageerror')` 监听）
-2. 访问 `http://localhost:20880`
+2. 访问 `http://localhost:20815`
 3. 等待 5 秒
 
 ## 验证
@@ -98,7 +98,7 @@
 
 ## 步骤
 1. 在后续操作中注意观察失败的网络请求（`page.on('requestfailed')` 监听）
-2. 访问 `http://localhost:20880`
+2. 访问 `http://localhost:20815`
 3. 等待 5 秒
 
 ## 验证

@@ -1,16 +1,17 @@
 import { test, expect } from '@playwright/test';
 import * as path from 'path';
+import { testOutputDir } from './test-paths';
 
-const SCREENSHOT_DIR = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/screenshots';
+const SCREENSHOT_DIR = testOutputDir('iteration-demo');
 
 test.describe('知识库功能演示', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
   });
 
   test('1. 知识库列表页', async ({ page }) => {
-    await page.goto('http://localhost:20880/knowledge-bases');
+    await page.goto('http://localhost:20815/knowledge-bases');
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(2000);
 
@@ -24,7 +25,7 @@ test.describe('知识库功能演示', () => {
 
   test('2. 知识库详情页', async ({ page }) => {
     // 访问人力资源库详情页
-    await page.goto('http://localhost:20880/knowledge-bases/kb_7116e7ed');
+    await page.goto('http://localhost:20815/knowledge-bases/kb_7116e7ed');
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(2000);
 

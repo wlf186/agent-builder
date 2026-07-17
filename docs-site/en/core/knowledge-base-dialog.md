@@ -1,7 +1,8 @@
 ---
-title: Knowledge Base Management
+title: "Knowledge Base Management"
 category: core
 component: KnowledgeBaseDialog
+generated: true
 related:
   - KnowledgeBaseSelector
   - DocumentUploader

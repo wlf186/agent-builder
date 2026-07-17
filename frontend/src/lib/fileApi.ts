@@ -18,21 +18,26 @@
  */
 
 import { UploadedFile } from '@/types';
-
-const API_BASE = '/api';
+import { apiPath } from '@/lib/apiPath';
 
 /**
  * 后端上传响应格式
  */
+interface BackendFile {
+  file_id: string;
+  filename: string;
+  file_size: number;
+  mime_type: string;
+  uploaded_at: string;
+}
+
 interface UploadResponse {
   success: boolean;
-  file: {
-    file_id: string;
-    filename: string;
-    file_size: number;
-    mime_type: string;
-    uploaded_at: string;
-  };
+  file: BackendFile;
+}
+
+interface ListFilesResponse {
+  files?: BackendFile[];
 }
 
 /**
@@ -50,7 +55,7 @@ export async function uploadFile(
   formData.append('file', file);
 
   const response = await fetch(
-    `${API_BASE}/agents/${agentName}/files`,
+    apiPath('agents', agentName, 'files'),
     {
       method: 'POST',
       body: formData,
@@ -135,7 +140,7 @@ export async function listFiles(
   agentName: string
 ): Promise<UploadedFile[]> {
   const response = await fetch(
-    `${API_BASE}/agents/${agentName}/files`,
+    apiPath('agents', agentName, 'files'),
     {
       method: 'GET',
     }
@@ -145,10 +150,10 @@ export async function listFiles(
     throw new Error(`Failed to list files: ${response.statusText}`);
   }
 
-  const data = await response.json();
+  const data: ListFilesResponse = await response.json();
 
   // 转换后端响应为前端 UploadedFile 格式
-  return (data.files || []).map((f: any) => ({
+  return (data.files || []).map((f) => ({
     id: f.file_id,
     filename: f.filename,
     size: f.file_size,
@@ -168,7 +173,7 @@ export async function deleteFile(
   fileId: string
 ): Promise<void> {
   const response = await fetch(
-    `${API_BASE}/agents/${agentName}/files/${fileId}`,
+    apiPath('agents', agentName, 'files', fileId),
     {
       method: 'DELETE',
     }
@@ -190,7 +195,7 @@ export function getFileDownloadUrl(
   agentName: string,
   fileId: string
 ): string {
-  return `${API_BASE}/agents/${agentName}/files/${fileId}/download`;
+  return apiPath('agents', agentName, 'files', fileId, 'download');
 }
 
 /**

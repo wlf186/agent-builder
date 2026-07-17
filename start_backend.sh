@@ -1,58 +1,30 @@
-#!/bin/bash
-# Agent Builder 后端服务启动脚本
-# 确保使用虚拟环境中的Python和依赖
+#!/usr/bin/env bash
+# Foreground backend launcher for development and service supervisors.
 
-set -e
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=env.sh
+source "$ROOT/env.sh"
+cd "$ROOT"
 
-# 项目目录
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$PROJECT_DIR"
-
-# 虚拟环境路径
-VENV_DIR="$PROJECT_DIR/.venv"
-VENV_PYTHON="$VENV_DIR/bin/python"
-
-echo "=========================================="
-echo "  Agent Builder 后端服务"
-echo "=========================================="
-
-# 检查虚拟环境是否存在
-if [ ! -d "$VENV_DIR" ]; then
-    echo "❌ 错误: 虚拟环境不存在"
-    echo "   请先运行: python3 -m venv .venv"
-    echo "   然后运行: pip install -r requirements.txt"
+[[ -x "$ROOT/.venv/bin/python" ]] || {
+    echo "Missing project environment; run ./bootstrap.sh first" >&2
     exit 1
-fi
-
-# 检查虚拟环境中的Python是否可用
-if [ ! -f "$VENV_PYTHON" ]; then
-    echo "❌ 错误: 虚拟环境中的Python不可用: $VENV_PYTHON"
+}
+[[ -s "$AGENT_BUILDER_TOKEN_FILE" ]] || {
+    echo "Missing local API token; run ./bootstrap.sh first" >&2
     exit 1
-fi
+}
 
-# 检查MCP库是否安装
-echo ""
-echo "📦 检查依赖库..."
-if "$VENV_PYTHON" -c "import mcp" 2>/dev/null; then
-    VERSION=$("$VENV_PYTHON" -c "import importlib.metadata; print(importlib.metadata.version('mcp'))" 2>/dev/null || echo "未知")
-    echo "  ✓ MCP 库已安装 (版本 $VERSION)"
-else
-    echo "  ✗ 警告: MCP 库未安装"
-    echo "    远程 MCP 服务（如 CoinGecko）将不可用"
-    echo "    修复方法: $VENV_PYTHON -m pip install mcp"
-    echo ""
-    read -p "是否继续启动？(y/N): " confirm
-    if [[ ! $confirm =~ ^[Yy]$ ]]; then
-        echo "启动已取消"
-        exit 0
-    fi
-fi
+API_TOKEN="$(<"$AGENT_BUILDER_TOKEN_FILE")"
+[[ ${#API_TOKEN} -ge 32 ]] || {
+    echo "Invalid local API token; regenerate it with bootstrap" >&2
+    exit 1
+}
+BUILTIN_MCP_ALLOWLIST="localhost:${MCP_SSE_PORT},127.0.0.1:${MCP_SSE_PORT},mcp.api.coingecko.com:443"
+SSRF_ALLOWLIST="${BUILTIN_MCP_ALLOWLIST},${AGENT_BUILDER_SSRF_ALLOWLIST}"
 
-echo ""
-echo "🚀 启动后端服务..."
-echo "  Python: $VENV_PYTHON"
-echo "  端口: 20881"
-echo ""
-
-# 使用虚拟环境中的Python启动后端
-exec "$VENV_PYTHON" backend.py
+export AGENT_BUILDER_API_TOKEN="$API_TOKEN"
+export AGENT_BUILDER_SSRF_ALLOWLIST="$SSRF_ALLOWLIST"
+unset API_TOKEN BUILTIN_MCP_ALLOWLIST SSRF_ALLOWLIST
+exec "$ROOT/.venv/bin/python" "$ROOT/backend.py"

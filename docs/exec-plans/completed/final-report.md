@@ -197,17 +197,15 @@ const [currentConversationMessages, setCurrentConversationMessages] = useState<a
 ### 运行测试
 
 ```bash
-cd /work/agent-builder-general/frontend
-
-# 安装Playwright依赖
-npm install playwright
-npx playwright install chromium
+source ./env.sh
+./start.sh --skip-bootstrap
 
 # 运行测试
-npx playwright test tests/history-conversation.spec.ts
+npm --prefix frontend exec playwright test tests/history-conversation.spec.ts
 
 # 显示浏览器运行
-npx playwright test tests/history-conversation.spec.ts --headed
+PLAYWRIGHT_HEADED=true npm --prefix frontend exec playwright test \
+  tests/history-conversation.spec.ts
 ```
 
 ---

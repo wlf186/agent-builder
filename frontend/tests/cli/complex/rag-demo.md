@@ -5,7 +5,7 @@
 > 演示流程: 创建知识库 -> 上传文档 -> 配置智能体 -> 对话测试
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 存在已配置知识库的智能体（如 "UAT行政助手"、"DEMO" 或 "行政助手"）
 
 ---
@@ -13,18 +13,18 @@
 ### 测试用例: 完整演示 - 知识库管理 + 智能体挂载 + RAG 对话
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 等待 2 秒
 3. 截图保存到 `test-results/cli/rag-demo-01-homepage.png`
 
-4. 在 snapshot 中找到 "知识库" 菜单项，点击进入知识库管理页面。如果找不到，直接导航到 `http://localhost:20880/knowledge-bases`
+4. 在 snapshot 中找到 "知识库" 菜单项，点击进入知识库管理页面。如果找不到，直接导航到 `http://localhost:20815/knowledge-bases`
 5. 等待页面加载完成
 6. 截图保存到 `test-results/cli/rag-demo-02-kb-page.png`
 
 7. 检查页面中是否有 "人力资源" 相关知识库
 8. 截图保存到 `test-results/cli/rag-demo-03-kb-list.png`
 
-9. 返回主页 `http://localhost:20880`，等待页面加载完成
+9. 返回主页 `http://localhost:20815`，等待页面加载完成
 10. 等待 1.5 秒
 
 11. 在 snapshot 中找到已配置知识库的智能体，按以下优先级尝试: "UAT行政助手" > "DEMO" > "行政助手"。如果都找不到，遍历所有智能体卡片查找包含 "行政"、"DEMO" 或 "UAT" 文本的卡片

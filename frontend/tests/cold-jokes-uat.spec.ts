@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
 /**
  * UAT Test: cold-jokes MCP 工具修复验证
@@ -14,10 +15,10 @@ import { test, expect } from '@playwright/test';
  */
 
 test('UAT: cold-jokes MCP 工具修复验证', async ({ page }) => {
-  const screenshotDir = 'teams/AC130/iterations/iteration-202603151910/screenshots';
+  const screenshotDir = testOutputDir('cold-jokes-uat');
 
   // Step 1: 访问主页
-  await page.goto('http://localhost:20880');
+  await page.goto('http://localhost:20815');
   await page.waitForLoadState('networkidle');
   await page.screenshot({ path: `${screenshotDir}/01-homepage.png` });
   console.log('✅ Step 1: 主页加载成功');

@@ -3,6 +3,7 @@
 使用 Sentence Transformers 加载 BGE 模型进行文本编码
 """
 import logging
+import threading
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class Embedder:
         self.device = device
         self._model = None  # 延迟加载
         self._dimension = 512  # bge-small-zh-v1.5 的维度
+        self._lock = threading.RLock()
 
     @property
     def dimension(self) -> int:
@@ -48,23 +50,26 @@ class Embedder:
         if self._model is not None:
             return
 
-        try:
-            from sentence_transformers import SentenceTransformer
+        with self._lock:
+            if self._model is not None:
+                return
+            try:
+                from sentence_transformers import SentenceTransformer
 
-            logger.info(f"正在加载嵌入模型: {self.model_name}")
-            self._model = SentenceTransformer(
-                self.model_name,
-                device=self.device
-            )
-            self._dimension = self._model.get_sentence_embedding_dimension()
-            logger.info(f"模型加载完成，向量维度: {self._dimension}")
-        except ImportError as e:
-            raise ImportError(
-                "sentence_transformers 未安装。请运行: pip install sentence-transformers"
-            ) from e
-        except Exception as e:
-            logger.error(f"模型加载失败: {e}")
-            raise
+                logger.info(f"正在加载嵌入模型: {self.model_name}")
+                self._model = SentenceTransformer(
+                    self.model_name,
+                    device=self.device
+                )
+                self._dimension = self._model.get_sentence_embedding_dimension()
+                logger.info(f"模型加载完成，向量维度: {self._dimension}")
+            except ImportError as e:
+                raise ImportError(
+                    "sentence_transformers 未安装。请运行: pip install sentence-transformers"
+                ) from e
+            except Exception as e:
+                logger.error("模型加载失败: error_type=%s", type(e).__name__)
+                raise
 
     def encode(
         self,
@@ -88,21 +93,20 @@ class Embedder:
         self._load_model()
 
         try:
-            import numpy as np
-
-            embeddings = self._model.encode(
-                texts,
-                normalize_embeddings=normalize,
-                batch_size=batch_size,
-                show_progress_bar=False,
-                convert_to_numpy=True
-            )
+            with self._lock:
+                embeddings = self._model.encode(
+                    texts,
+                    normalize_embeddings=normalize,
+                    batch_size=batch_size,
+                    show_progress_bar=False,
+                    convert_to_numpy=True
+                )
 
             # 转换为列表格式
             return embeddings.tolist()
 
         except Exception as e:
-            logger.error(f"文本编码失败: {e}")
+            logger.error("文本编码失败: error_type=%s", type(e).__name__)
             raise
 
     def encode_single(self, text: str, normalize: bool = True) -> List[float]:
@@ -127,10 +131,11 @@ class Embedder:
 
     def unload(self):
         """卸载模型，释放内存"""
-        if self._model is not None:
-            del self._model
-            self._model = None
-            logger.info("模型已卸载")
+        with self._lock:
+            if self._model is not None:
+                del self._model
+                self._model = None
+                logger.info("模型已卸载")
 
 
 # 全局单例（可选，用于跨请求共享模型）

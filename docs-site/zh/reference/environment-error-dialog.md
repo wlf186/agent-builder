@@ -1,9 +1,9 @@
 ---
-title: 环境错误对话框
+title: "环境错误对话框"
 category: reference
 component: EnvironmentErrorDialog
-related:
-
+generated: true
+related: []
 ---
 # 环境错误对话框
 

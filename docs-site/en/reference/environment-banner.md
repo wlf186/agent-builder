@@ -1,9 +1,9 @@
 ---
-title: Environment Status Banner
+title: "Environment Status Banner"
 category: reference
 component: EnvironmentBanner
-related:
-
+generated: true
+related: []
 ---
 # Environment Status Banner
 

@@ -1,124 +1,163 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Stop only processes that were started and recorded by this checkout.
 
-# Agent Builder 系统停止脚本
-# 用法: ./stop.sh [--force]
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=env.sh
+source "$ROOT/env.sh"
+cd "$ROOT"
 
-set -e
-cd /home/wremote/claude-dev/agent-builder-general
+FORCE=false
+ONLY_SERVICE=""
+FAILURES=0
 
-# 参数解析
-FORCE_MODE=false
-for arg in "$@"; do
-    case $arg in
-        --force|-f) FORCE_MODE=true ;;
+usage() {
+    cat <<'EOF'
+Usage: ./stop.sh [--force] [--service phoenix|backend|frontend|docs]
+
+The normal path waits up to 15 seconds before escalating to SIGKILL. --force
+uses a one-second grace period. Processes not owned by this checkout are never
+killed; an occupied unmanaged port makes the command fail.
+EOF
+}
+
+while (($#)); do
+    case "$1" in
+        --force|-f) FORCE=true; shift ;;
+        --service)
+            (($# >= 2)) || { usage >&2; exit 2; }
+            ONLY_SERVICE="$2"; shift 2
+            ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+case "$ONLY_SERVICE" in
+    ""|phoenix|backend|frontend|docs) ;;
+    *) echo "Unknown service: $ONLY_SERVICE" >&2; exit 2 ;;
+esac
 
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log() { printf '[stop] %s\n' "$*"; }
+warn() { printf '[stop] WARNING: %s\n' "$*" >&2; }
+pid_file() { printf '%s/%s.pid' "$AGENT_BUILDER_RUNTIME_DIR/pids" "$1"; }
 
-# 停止进程（支持强制模式）
-stop_process() {
-    local pid=$1
-    local name=$2
-    if kill -0 $pid 2>/dev/null; then
-        kill $pid 2>/dev/null || true
-        sleep 1
-        # 检查是否还在运行
-        if kill -0 $pid 2>/dev/null; then
-            if [ "$FORCE_MODE" = true ]; then
-                log_warn "$name 未响应 SIGTERM，强制终止 (PID: $pid)"
-                kill -9 $pid 2>/dev/null || true
-            else
-                log_warn "$name 未响应 SIGTERM (使用 --force 强制终止)"
-            fi
-        fi
-        log_info "$name 已停止 (PID: $pid)"
+process_marker() {
+    local stat
+    if [[ -r "/proc/$1/stat" ]]; then
+        stat="$(<"/proc/$1/stat")"
+        stat="${stat##*) }"
+        printf 'linux:%s\n' "$(awk '{print $20}' <<<"$stat")"
     else
-        log_warn "$name 进程不存在 (PID: $pid)"
+        printf 'ps:%s\n' "$(ps -o lstart= -p "$1" 2>/dev/null | tr -d '[:space:]')"
     fi
 }
 
-# 通过端口清理进程
-cleanup_port() {
-    local port=$1
-    local pid=$(lsof -t -i :$port 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-        kill $pid 2>/dev/null || true
-        sleep 1
-        # 检查是否还在运行
-        if lsof -i :$port > /dev/null 2>&1; then
-            if [ "$FORCE_MODE" = true ]; then
-                pid=$(lsof -t -i :$port 2>/dev/null || true)
-                kill -9 $pid 2>/dev/null || true
-                log_info "强制清理端口 $port (PID: $pid)"
-            else
-                log_warn "端口 $port 进程未响应 (使用 --force 强制终止)"
-            fi
-        else
-            log_info "清理端口 $port 的进程 (PID: $pid)"
+managed_running() {
+    local name="$1" file pid pgid recorded_marker recorded_root current_marker current_pgid command_line attempt
+    file="$(pid_file "$name")"
+    [[ -r "$file" && ! -L "$file" ]] || return 1
+    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
+    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
+    recorded_marker="$(awk -F= '$1 == "marker" {print $2}' "$file")"
+    recorded_root="$(awk -F= '$1 == "root" {sub(/^root=/, ""); print}' "$file")"
+    [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ && -n "$recorded_marker" ]] || return 1
+    [[ "$recorded_root" == "$ROOT" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    for ((attempt = 0; attempt < 3; attempt++)); do
+        current_marker="$(process_marker "$pid")"
+        current_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        command_line="$(ps -o command= -p "$pid" 2>/dev/null)"
+        if [[ "$current_marker" == "$recorded_marker" && "$current_pgid" == "$pgid" \
+            && "$command_line" == *"$ROOT/scripts/run_with_rotating_log.py"* ]]; then
+            return 0
         fi
-    fi
+        sleep 0.1
+    done
+    return 1
 }
 
-echo ""
-echo "========================================"
-echo "   Agent Builder 系统停止"
-if [ "$FORCE_MODE" = true ]; then
-    echo "   [强制模式: 已启用]"
-fi
-echo "========================================"
+group_alive() {
+    kill -0 -- "-$1" 2>/dev/null
+}
 
-# 停止后端
-if [ -f backend.pid ]; then
-    stop_process $(cat backend.pid) "后端"
-    rm -f backend.pid
-else
-    log_warn "backend.pid 不存在"
+stop_service() {
+    local name="$1" file pid pgid ticks max_ticks
+    file="$(pid_file "$name")"
+    if ! managed_running "$name"; then
+        if [[ -e "$file" || -L "$file" ]]; then
+            warn "removing stale or invalid PID record for $name"
+            rm -f -- "$file"
+        else
+            log "$name is already stopped"
+        fi
+        return 0
+    fi
+
+    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
+    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
+    log "stopping $name process group $pgid"
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    if [[ "$FORCE" == true ]]; then max_ticks=5; else max_ticks=75; fi
+    for ((ticks = 0; ticks < max_ticks; ticks++)); do
+        group_alive "$pgid" || break
+        sleep 0.2
+    done
+    if group_alive "$pgid"; then
+        warn "$name exceeded its grace period; sending SIGKILL"
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+        for ((ticks = 0; ticks < 25; ticks++)); do
+            group_alive "$pgid" || break
+            sleep 0.2
+        done
+    fi
+    if group_alive "$pgid"; then
+        warn "$name process group $pgid is still alive"
+        FAILURES=$((FAILURES + 1))
+        return 1
+    fi
+    rm -f -- "$file"
+    log "$name stopped"
+}
+
+tcp_open() {
+    local host="$1" port="$2"
+    (exec 9<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+}
+
+verify_port_closed() {
+    local name="$1" host="$2" port="$3"
+    if tcp_open "$host" "$port"; then
+        warn "$name port $host:$port is still occupied by an unmanaged process"
+        FAILURES=$((FAILURES + 1))
+        return 1
+    fi
+    return 0
+}
+
+services=(docs frontend backend phoenix)
+if [[ -n "$ONLY_SERVICE" ]]; then
+    services=("$ONLY_SERVICE")
 fi
 
-# 停止前端
-if [ -f frontend.pid ]; then
-    stop_process $(cat frontend.pid) "前端"
-    rm -f frontend.pid
-else
-    log_warn "frontend.pid 不存在"
-fi
-
-# 额外清理：通过端口查找并杀掉进程
-for port in 20880 20881; do
-    cleanup_port $port
+for service in "${services[@]}"; do
+    stop_service "$service" || true
 done
 
-# 停止文档站点
-if [ -f docs-site.pid ]; then
-    stop_process $(cat docs-site.pid) "文档站点"
-    rm -f docs-site.pid
+for service in "${services[@]}"; do
+    case "$service" in
+        docs) verify_port_closed docs "$DOCS_HOST" "$DOCS_PORT" || true ;;
+        frontend) verify_port_closed frontend "$FRONTEND_HOST" "$FRONTEND_PORT" || true ;;
+        backend)
+            verify_port_closed backend "$BACKEND_HOST" "$BACKEND_PORT" || true
+            verify_port_closed builtin-mcp "$MCP_SSE_HOST" "$MCP_SSE_PORT" || true
+            ;;
+        phoenix) verify_port_closed phoenix "$PHOENIX_HOST" "$PHOENIX_PORT" || true ;;
+    esac
+done
+
+if ((FAILURES > 0)); then
+    warn "shutdown incomplete ($FAILURES verification failure(s))"
+    exit 1
 fi
-
-# 额外清理：通过端口查找并杀掉 docs-site 进程
-cleanup_port 4173
-
-# 停止 Langfuse 可观测性服务
-echo ""
-log_info "停止 Langfuse 可观测性服务..."
-if [ -f "docker-compose.langfuse.yml" ]; then
-    if docker compose version &> /dev/null; then
-        docker compose -f docker-compose.langfuse.yml down 2>/dev/null || true
-    elif command -v docker-compose &> /dev/null; then
-        docker-compose -f docker-compose.langfuse.yml down 2>/dev/null || true
-    fi
-    log_info "Langfuse 服务已停止"
-else
-    log_warn "docker-compose.langfuse.yml 不存在，跳过 Langfuse 停止"
-fi
-
-echo ""
-log_info "系统已完全停止"
-echo "========================================"
+log "all requested services are stopped"

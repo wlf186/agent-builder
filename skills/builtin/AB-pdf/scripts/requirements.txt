@@ -1,17 +1,5 @@
-# AB-pdf Skill Dependencies
-# PDF 文件处理所需的 Python 依赖包
-
-# PDF 读取和基础操作
-PyPDF2==3.0.1
-
-# PDF 文本和表格提取（更好的提取效果）
-pdfplumber==0.10.3
-
-# 图像处理（用于 PDF 转图片）
-Pillow==10.2.0
-
-# PDF 创建和生成
-reportlab==4.1.0
-
-# PDF 转图片（可选，需要系统安装 poppler）
-# pdf2image==1.16.3
+pypdf>=5.0.0
+pdfplumber>=0.11.0
+Pillow>=10.0.0
+reportlab>=4.0.0
+pypdfium2>=4.0.0

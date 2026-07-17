@@ -1,7 +1,8 @@
 ---
-title: 知识库管理
+title: "知识库管理"
 category: core
 component: KnowledgeBaseDialog
+generated: true
 related:
   - KnowledgeBaseSelector
   - DocumentUploader

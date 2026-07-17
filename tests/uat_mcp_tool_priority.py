@@ -18,6 +18,8 @@ import aiohttp
 
 BASE_URL = "http://localhost:20881"
 AGENT_NAME = "test3"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = PROJECT_ROOT / ".runtime" / "test-results" / "uat-mcp-tool-priority"
 
 TEST_CASES = [
     {
@@ -245,9 +247,8 @@ async def main():
         print(report)
 
         # 保存报告
-        report_dir = Path("/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/iteration-2603141808")
-        report_dir.mkdir(parents=True, exist_ok=True)
-        report_path = report_dir / "uat_report.md"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        report_path = OUTPUT_DIR / "uat-report.md"
 
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)

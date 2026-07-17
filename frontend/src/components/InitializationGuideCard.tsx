@@ -29,8 +29,8 @@
  */
 
 import { useEffect, useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
-import { Loader2, Settings, User, Plug, Play } from "lucide-react";
+import { motion } from "framer-motion";
+import { Loader2, Settings, User, Plug } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MockProgressCalculator } from "@/lib/progress";
 
@@ -241,7 +241,6 @@ export function InitializationGuideCard({
  * 精简版引导卡片（用于空间受限场景）
  */
 export function InitializationGuideCardSimple({
-  locale = "zh",
   progress = 0,
   estimatedSeconds = 30,
 }: {

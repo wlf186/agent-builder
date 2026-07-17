@@ -9,7 +9,9 @@ SSE 模式的 MCP 服务 - 将所有预置服务暴露为 HTTP API
 - POST /tools/call - 调用工具
 """
 import asyncio
+import ast
 import json
+import math
 import random
 import sys
 import argparse
@@ -19,8 +21,84 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import uvicorn
+
+from src.security import parse_cors_origins
+
+
+MAX_REQUEST_BYTES = 64 * 1024
+MAX_EXPRESSION_CHARS = 256
+MAX_EXPRESSION_NODES = 64
+MAX_ABSOLUTE_NUMBER = 10**15
+MAX_POWER_EXPONENT = 12
+
+
+class BodyLimitMiddleware:
+    """Reject oversized chunked or declared request bodies before parsing."""
+
+    def __init__(self, app, max_bytes: int = MAX_REQUEST_BYTES):
+        self.app = app
+        self.max_bytes = max_bytes
+
+    @staticmethod
+    def _is_limit_error(exc: BaseException) -> bool:
+        return (
+            isinstance(exc, ValueError)
+            and str(exc) == "request body too large"
+        ) or any(
+            BodyLimitMiddleware._is_limit_error(child)
+            for child in getattr(exc, "exceptions", ())
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        for key, value in scope.get("headers", []):
+            if key.lower() == b"content-length":
+                try:
+                    if int(value) > self.max_bytes:
+                        await self._reject(send)
+                        return
+                except ValueError:
+                    await self._reject(send, status=400, detail="Invalid Content-Length")
+                    return
+
+        received = 0
+
+        async def bounded_receive():
+            nonlocal received
+            message = await receive()
+            if message.get("type") == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise ValueError("request body too large")
+            return message
+
+        try:
+            await self.app(scope, bounded_receive, send)
+        except Exception as exc:
+            if self._is_limit_error(exc):
+                await self._reject(send)
+                return
+            raise
+
+    @staticmethod
+    async def _reject(send, status: int = 413, detail: str = "Request body too large"):
+        payload = json.dumps({"detail": detail}, separators=(",", ":")).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode()),
+                    (b"cache-control", b"no-store"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload})
 
 
 # === 工具定义 ===
@@ -220,64 +298,109 @@ COLD_JOKES_TOOLS = [
 
 # === 工具执行函数 ===
 
+
+def _bounded_number(value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("参数必须是数字")
+    if not math.isfinite(float(value)) or abs(value) > MAX_ABSOLUTE_NUMBER:
+        raise ValueError("数字超出安全范围")
+    return value
+
+
+def _safe_arithmetic(expression: str) -> int | float:
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("表达式不能为空")
+    if len(expression) > MAX_EXPRESSION_CHARS:
+        raise ValueError("表达式过长")
+    clean_expr = expression.replace(" ", "").replace(",", "")
+    if re.fullmatch(r"[\d+\-*/.()]+", clean_expr) is None:
+        raise ValueError("表达式包含不允许的字符")
+    try:
+        tree = ast.parse(clean_expr, mode="eval")
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError("表达式语法无效") from exc
+    if sum(1 for _ in ast.walk(tree)) > MAX_EXPRESSION_NODES:
+        raise ValueError("表达式过于复杂")
+
+    def evaluate(node: ast.AST) -> int | float:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant):
+            return _bounded_number(node.value)
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            operand = evaluate(node.operand)
+            return _bounded_number(operand if isinstance(node.op, ast.UAdd) else -operand)
+        if not isinstance(node, ast.BinOp) or not isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow)
+        ):
+            raise ValueError("表达式包含不支持的操作")
+        left = evaluate(node.left)
+        right = evaluate(node.right)
+        if isinstance(node.op, ast.Add):
+            result = left + right
+        elif isinstance(node.op, ast.Sub):
+            result = left - right
+        elif isinstance(node.op, ast.Mult):
+            result = left * right
+        elif isinstance(node.op, ast.Div):
+            if right == 0:
+                raise ValueError("除数不能为 0")
+            result = left / right
+        else:
+            if abs(right) > MAX_POWER_EXPONENT:
+                raise ValueError("指数超出安全范围")
+            result = left ** right
+        return _bounded_number(result)
+
+    return evaluate(tree)
+
+
 def execute_calculator_tool(name: str, arguments: Dict[str, Any]) -> str:
     """执行计算器工具"""
     try:
         if name == "evaluate":
-            # 计算数学表达式
             expression = arguments.get("expression", "")
-            if not expression:
-                return "错误: 请提供要计算的表达式"
-
-            # 安全检查：只允许数字、运算符、括号、小数点和空格
-            # 移除空格和逗号（数字分隔符）
-            clean_expr = expression.replace(" ", "").replace(",", "")
-
-            # 检查是否只包含允许的字符
-            if not re.match(r'^[\d+\-*/.()]+$', clean_expr):
-                return f"错误: 表达式包含不允许的字符。只支持数字、+-*/、小数点和括号"
-
-            try:
-                # 使用 eval 计算表达式（已做安全检查）
-                result = eval(clean_expr)
-                # 格式化结果（保留合适的小数位数）
-                if isinstance(result, float):
-                    # 如果是整数结果，显示为整数
-                    if result == int(result):
-                        result = int(result)
-                    else:
-                        # 保留最多6位小数，去除末尾的0
-                        result = float(f"{result:.6f}".rstrip('0').rstrip('.'))
-                return f"计算结果: {expression} = {result:,}" if isinstance(result, int) else f"计算结果: {expression} = {result}"
-            except Exception as e:
-                return f"计算错误: 表达式 '{expression}' 无法计算 - {str(e)}"
+            result = _safe_arithmetic(expression)
+            if isinstance(result, float):
+                result = int(result) if result.is_integer() else round(result, 6)
+            return f"计算结果: {expression} = {result}"
 
         elif name == "add":
-            result = arguments["a"] + arguments["b"]
-            return f"计算结果: {arguments['a']} + {arguments['b']} = {result}"
+            a, b = _bounded_number(arguments["a"]), _bounded_number(arguments["b"])
+            result = _bounded_number(a + b)
+            return f"计算结果: {a} + {b} = {result}"
         elif name == "subtract":
-            result = arguments["a"] - arguments["b"]
-            return f"计算结果: {arguments['a']} - {arguments['b']} = {result}"
+            a, b = _bounded_number(arguments["a"]), _bounded_number(arguments["b"])
+            result = _bounded_number(a - b)
+            return f"计算结果: {a} - {b} = {result}"
         elif name == "multiply":
-            result = arguments["a"] * arguments["b"]
-            return f"计算结果: {arguments['a']} × {arguments['b']} = {result}"
+            a, b = _bounded_number(arguments["a"]), _bounded_number(arguments["b"])
+            result = _bounded_number(a * b)
+            return f"计算结果: {a} × {b} = {result}"
         elif name == "divide":
-            if arguments["b"] == 0:
+            a, b = _bounded_number(arguments["a"]), _bounded_number(arguments["b"])
+            if b == 0:
                 return "错误: 除数不能为0"
-            result = arguments["a"] / arguments["b"]
-            return f"计算结果: {arguments['a']} ÷ {arguments['b']} = {result}"
+            result = _bounded_number(a / b)
+            return f"计算结果: {a} ÷ {b} = {result}"
         elif name == "power":
-            result = arguments["a"] ** arguments["b"]
-            return f"计算结果: {arguments['a']} ^ {arguments['b']} = {result}"
+            a, b = _bounded_number(arguments["a"]), _bounded_number(arguments["b"])
+            if abs(b) > MAX_POWER_EXPONENT:
+                raise ValueError("指数超出安全范围")
+            result = _bounded_number(a ** b)
+            return f"计算结果: {a} ^ {b} = {result}"
         elif name == "sqrt":
-            if arguments["a"] < 0:
+            a = _bounded_number(arguments["a"])
+            if a < 0:
                 return "错误: 不能对负数求平方根"
-            result = arguments["a"] ** 0.5
-            return f"计算结果: √{arguments['a']} = {result}"
+            result = _bounded_number(math.sqrt(a))
+            return f"计算结果: √{a} = {result}"
         else:
             return f"未知工具: {name}"
-    except Exception as e:
-        return f"计算错误: {str(e)}"
+    except ValueError as exc:
+        return f"计算错误: {exc}"
+    except (KeyError, TypeError, OverflowError, ZeroDivisionError):
+        return "计算错误: 参数无效或超出安全范围"
 
 
 def execute_joke_tool(name: str, arguments: Dict[str, Any]) -> str:
@@ -313,8 +436,8 @@ def execute_joke_tool(name: str, arguments: Dict[str, Any]) -> str:
             return result
         else:
             return f"未知工具: {name}"
-    except Exception as e:
-        return f"获取笑话失败: {str(e)}"
+    except Exception:
+        return "获取笑话失败，请稍后重试"
 
 
 # === FastAPI 应用 ===
@@ -324,11 +447,12 @@ app = FastAPI(title="Builtin MCP Services (SSE)")
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=parse_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
 )
+app.add_middleware(BodyLimitMiddleware)
 
 
 class ToolsListRequest(BaseModel):
@@ -338,8 +462,8 @@ class ToolsListRequest(BaseModel):
 
 class ToolCallRequest(BaseModel):
     """工具调用请求"""
-    name: str
-    arguments: Dict[str, Any] = {}
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    arguments: Dict[str, Any] = Field(default_factory=dict, max_length=32)
 
 
 class ToolCallResponse(BaseModel):
@@ -390,6 +514,8 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=20882, help="服务端口")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="服务地址")
     args = parser.parse_args()
+    if args.host not in {"localhost", "127.0.0.1"}:
+        parser.error("--host must be a loopback hostname/address")
 
     print(f"Starting MCP SSE Server on {args.host}:{args.port}")
     print(f"Services:")

@@ -19,6 +19,7 @@ from pathlib import Path
 
 import defusedxml.minidom
 
+from secure_temp import secure_temp_root
 from validators import DOCXSchemaValidator, PPTXSchemaValidator, RedliningValidator
 
 def pack(
@@ -49,7 +50,7 @@ def pack(
             if not success:
                 return None, f"Error: Validation failed for {input_dir}"
 
-    with tempfile.TemporaryDirectory() as temp_dir:
+    with tempfile.TemporaryDirectory(dir=secure_temp_root()) as temp_dir:
         temp_content_dir = Path(temp_dir) / "content"
         shutil.copytree(input_dir, temp_content_dir)
 
@@ -80,8 +81,8 @@ def _run_validation(
         if infer_author_func:
             try:
                 author = infer_author_func(unpacked_dir, original_file)
-            except ValueError as e:
-                print(f"Warning: {e} Using default author 'Claude'.", file=sys.stderr)
+            except ValueError:
+                print("Warning: unable to infer author. Using default author 'Claude'.", file=sys.stderr)
 
         validators = [
             DOCXSchemaValidator(unpacked_dir, original_file),
@@ -123,8 +124,8 @@ def _condense_xml(xml_file: Path) -> None:
                     element.removeChild(child)
 
         xml_file.write_bytes(dom.toxml(encoding="UTF-8"))
-    except Exception as e:
-        print(f"ERROR: Failed to parse {xml_file.name}: {e}", file=sys.stderr)
+    except Exception:
+        print(f"ERROR: Failed to parse {xml_file.name}", file=sys.stderr)
         raise
 
 

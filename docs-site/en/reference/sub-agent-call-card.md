@@ -1,9 +1,9 @@
 ---
-title: Sub-Agent Call Card
+title: "Sub-Agent Call Card"
 category: reference
 component: SubAgentCallCard
-related:
-
+generated: true
+related: []
 ---
 # Sub-Agent Call Card
 

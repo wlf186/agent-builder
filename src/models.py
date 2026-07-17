@@ -209,7 +209,7 @@ class Message(BaseModel):
 
 class ConversationConfig(BaseModel):
     """会话配置"""
-    id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8], description="会话唯一ID")
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex, description="会话唯一ID")
     agent_name: str = Field(default="", description="所属智能体名称")
     title: str = Field(default="新对话", description="会话标题")
     messages: List[Dict[str, Any]] = Field(default_factory=list, description="消息列表")
@@ -238,9 +238,8 @@ class ConversationConfig(BaseModel):
 
 class EnvironmentType(str, Enum):
     """环境类型"""
-    CONDA = "conda"              # Conda 虚拟环境
+    UV = "uv"                    # uv 管理的项目内虚拟环境
     SYSTEM_PYTHON = "system"     # 系统 Python（降级模式）
-    DOCKER = "docker"            # 预留扩展
 
 
 class EnvironmentStatus(str, Enum):
@@ -265,7 +264,7 @@ class AgentEnvironment(BaseModel):
     """Agent运行环境"""
     environment_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8], description="环境唯一ID")
     agent_name: str = Field(description="所属Agent名称")
-    environment_type: EnvironmentType = Field(default=EnvironmentType.CONDA, description="环境类型")
+    environment_type: EnvironmentType = Field(default=EnvironmentType.UV, description="环境类型")
     status: EnvironmentStatus = Field(default=EnvironmentStatus.CREATING, description="环境状态")
     python_version: str = Field(default="3.11", description="Python版本")
     packages: List[str] = Field(default_factory=list, description="已安装的包列表")
@@ -280,19 +279,19 @@ class AgentEnvironment(BaseModel):
 
 class FileInfo(BaseModel):
     """文件信息"""
-    file_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8], description="文件唯一ID")
+    file_id: str = Field(default_factory=lambda: uuid.uuid4().hex, description="文件唯一ID")
     agent_name: str = Field(description="所属Agent名称")
     filename: str = Field(description="原始文件名")
     file_size: int = Field(description="文件大小(字节)")
     mime_type: str = Field(default="application/octet-stream", description="MIME类型")
-    checksum: str = Field(description="文件校验和(MD5)")
+    checksum: str = Field(description="文件校验和(SHA-256)")
     file_path: str = Field(description="存储路径")
     uploaded_at: str = Field(default_factory=lambda: datetime.now().isoformat(), description="上传时间")
 
 
 class ExecutionRecord(BaseModel):
     """执行记录"""
-    execution_id: str = Field(default_factory=lambda: str(uuid.uuid4())[:8], description="执行唯一ID")
+    execution_id: str = Field(default_factory=lambda: uuid.uuid4().hex, description="执行唯一ID")
     agent_name: str = Field(description="所属Agent名称")
     skill_name: str = Field(description="执行的Skill名称")
     script_path: str = Field(description="脚本路径")
@@ -321,7 +320,7 @@ class DocumentStatus(str, Enum):
 
 class KnowledgeBase(BaseModel):
     """知识库配置"""
-    kb_id: str = Field(default_factory=lambda: f"kb_{str(uuid.uuid4())[:8]}", description="知识库唯一ID")
+    kb_id: str = Field(default_factory=lambda: f"kb_{uuid.uuid4().hex}", description="知识库唯一ID")
     name: str = Field(description="知识库名称")
     description: str = Field(default="", description="知识库描述")
     embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5", description="嵌入模型名称")
@@ -336,7 +335,7 @@ class KnowledgeBase(BaseModel):
 
 class Document(BaseModel):
     """文档元数据"""
-    doc_id: str = Field(default_factory=lambda: f"doc_{str(uuid.uuid4())[:8]}", description="文档唯一ID")
+    doc_id: str = Field(default_factory=lambda: f"doc_{uuid.uuid4().hex}", description="文档唯一ID")
     kb_id: str = Field(description="所属知识库ID")
     filename: str = Field(description="文件名")
     file_size: int = Field(description="文件大小(字节)")

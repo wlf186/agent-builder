@@ -32,7 +32,7 @@ class SkillLoader:
             with open(skill_path, "r", encoding="utf-8") as f:
                 return f.read()
         except Exception as e:
-            print(f"加载Skill内容失败: {e}")
+            print(f"加载Skill内容失败: error_type={type(e).__name__}")
             return f"# {skill.name}\n\n{skill.description}"
 
     @staticmethod

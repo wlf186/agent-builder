@@ -9,7 +9,7 @@
 
 import { test, expect, Page } from '@playwright/test';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const API_URL = 'http://localhost:20881';
 
 test.describe('iteration-2603121100 Bug Fixes', () => {

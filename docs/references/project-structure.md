@@ -1,123 +1,93 @@
-# 项目结构
+# Project structure
 
-本文档描述 Agent Builder 的目录结构和核心组件。
+## Repository map
 
----
-
-## 目录结构
-
-```
-├── backend.py               # FastAPI 后端入口 (82KB)
-├── start.sh / stop.sh       # 服务启停脚本
-├── requirements.txt         # Python 依赖
-├── package.json             # Node.js 依赖
-│
-├── src/                     # 核心模块 (Python)
-│   ├── agent_engine.py      # LangGraph 智能体引擎 (102KB)
-│   ├── agent_manager.py     # 智能体管理
-│   ├── mcp_manager.py       # MCP 工具管理器
-│   ├── mcp_registry.py      # MCP 服务注册
-│   ├── mcp_tool_adapter.py  # MCP 工具适配器
-│   ├── mcp_diagnostic.py    # MCP 诊断工具
-│   ├── skill_registry.py    # 技能注册与发现
-│   ├── skill_loader.py      # 技能加载器
-│   ├── skill_tool.py        # 技能工具封装
-│   ├── conversation_manager.py  # 对话管理
-│   ├── environment_manager.py   # 环境管理器
-│   ├── environment_creator.py   # 异步环境创建
-│   ├── execution_engine.py  # 执行引擎
-│   ├── file_storage_manager.py  # 文件存储管理
-│   ├── debug_logger.py      # 调试日志
-│   ├── structured_logger.py # 结构化日志
-│   ├── stream_logger.py     # 流式日志
-│   ├── trace_middleware.py  # 追踪中间件
-│   ├── cycle_detector.py    # 循环检测
-│   ├── knowledge_base_manager.py  # 知识库(RAG)管理
-│   ├── document_processor.py # 文档处理
-│   ├── embedder.py          # 向量嵌入
-│   ├── retriever.py         # 向量检索
-│   ├── secret_loader.py     # 密钥安全加载器
-│   ├── langfuse_tracer.py   # Langfuse 追踪器 (可观测性)
-│   ├── langfuse_client.py   # Langfuse 客户端封装
-│   ├── model_service_registry.py  # 模型服务注册
-│   ├── models.py            # 数据模型
-│   └── builtin_services.py  # 内置服务
-│
-├── frontend/                # Next.js 15 前端
-│   ├── src/
-│   │   ├── app/             # App Router 结构
-│   │   │   ├── api/redirect/langfuse/route.ts  # Langfuse 服务端重定向
-│   │   ├── components/      # React 组件
-│   │   ├── hooks/           # React Hooks
-│   │   ├── lib/             # 工具库
-│   │   └── types/           # TypeScript 类型
-│   ├── tests/               # Playwright UAT 测试
-│   └── next.config.ts       # Next.js 配置 (API 代理到 20881)
-│
-├── skills/                  # 技能目录
-│   ├── builtin/             # 3 个内置技能（文档处理）
-│   │   ├── AB-docx          # Word 文档处理
-│   │   ├── AB-pdf           # PDF 文档处理
-│   │   └── AB-xlsx          # Excel 表格处理
-│   └── user/                # 用户自定义技能
-│
-├── builtin_mcp_services/    # 内置 MCP 服务
-│   ├── calculator_server.py # 计算器服务
-│   ├── joke_server.py       # 笑话服务
-│   └── sse_server.py        # SSE 服务器 (端口 20882)
-│
-├── data/                    # 运行时数据
-│   ├── agents/              # 智能体配置
-│   ├── conversations/       # 对话历史
-│   ├── environments/        # 环境数据
-│   ├── knowledge_base/      # RAG 知识库数据
-│   └── models/              # 模型配置
-│
-├── docs/                    # 文档知识库
-│   ├── design-docs/         # 设计文档
-│   ├── exec-plans/          # 执行计划
-│   ├── product-specs/       # 产品规格
-│   └── references/          # 参考文档
-│
-├── environments/            # LangGraph 环境实例
-├── logs/                    # 运行日志
-└── test-results/            # 测试结果
+```text
+agent-builder/
+├── backend.py                 FastAPI/SSE boundary and orchestration
+├── bootstrap.sh               pinned checkout-local toolchain/dependency setup
+├── start.sh                   transactional complete-stack start
+├── stop.sh                    identity-checked process shutdown
+├── purge.sh                   scoped cache/data/runtime cleanup
+├── env.sh                     project-contained HOME/TMP/XDG/cache environment
+├── pyproject.toml             Python dependencies and test configuration
+├── uv.lock                    reproducible Python resolution
+├── src/
+│   ├── agent_engine.py        planning, LLM/tool execution, streaming
+│   ├── observability/         vendor-neutral API and OpenTelemetry exporter
+│   ├── security.py            auth, path, URL, upload, and execution validation
+│   ├── execution_engine.py    bounded subprocess execution
+│   ├── environment_manager.py per-agent uv environments
+│   ├── conversation_manager.py SQLite/WAL conversation persistence
+│   ├── knowledge_base_manager.py document metadata and Chroma collection cache
+│   └── *_manager.py           application registries and persistence
+├── frontend/
+│   ├── src/app/               Next.js application and server routes
+│   ├── src/app/api/           authenticated server-only backend proxy
+│   ├── src/components/        UI plus bilingual user-guide annotations
+│   └── tests/                 Playwright regression tests
+├── docs-site/                 VitePress end-user guide
+├── docs/                      design, product, reference, and plan documents
+├── scripts/                   governance and bounded log helpers
+├── tests/                     Python tests
+├── data/                      non-reproducible user/application data
+├── .runtime/                  ignored runtime state and disposable caches
+├── .tools/                    ignored downloaded toolchains
+└── .venv/                     ignored root Python environment
 ```
 
----
+## Runtime ownership
 
-## 核心组件
+| Owner | Writes | Must not write |
+| --- | --- | --- |
+| lifecycle scripts | `.runtime/pids`, `.runtime/logs`, `.runtime/secrets` | global service manager or user profile |
+| uv/bootstrap | `.tools`, `.venv`, `.runtime/python`, `.runtime/cache/uv` | system Python/site-packages |
+| frontend/docs | local `node_modules`, `.runtime/cache/npm`, build directories | global npm prefix or user npm cache |
+| backend persistence | `data/` | absolute/user-controlled paths |
+| skill execution | `.runtime/environments`, `.runtime/tmp` | user home or system temporary state |
+| observability | `.runtime/phoenix` | external databases by default |
 
-### 后端核心
+`env.sh` supplies absolute paths derived from the checkout root, so lifecycle
+commands work from any current directory. Runtime files are never tracked.
 
-| 组件 | 位置 | 说明 |
-|------|------|------|
-| AgentEngine | `src/agent_engine.py` | LangGraph 智能体引擎 (102KB) |
-| AgentManager | `src/agent_manager.py` | 智能体生命周期管理 |
-| MCPManager | `src/mcp_manager.py` | MCP 工具连接 (stdio/SSE) |
-| MCPRegistry | `src/mcp_registry.py` | MCP 服务注册中心 |
-| ModelServiceRegistry | `src/model_service_registry.py` | 模型服务注册中心 |
-| SkillRegistry | `src/skill_registry.py` | 技能注册与发现 |
-| ConversationManager | `src/conversation_manager.py` | 对话历史管理 |
-| KnowledgeBaseManager | `src/knowledge_base_manager.py` | RAG 知识库管理 |
-| DocumentProcessor | `src/document_processor.py` | 文档处理与分块 |
-| Embedder | `src/embedder.py` | 向量嵌入服务 |
-| Retriever | `src/retriever.py` | 向量检索服务 |
-| EnvironmentManager | `src/environment_manager.py` | 异步环境初始化 |
-| ExecutionEngine | `src/execution_engine.py` | 技能执行引擎 |
-| FileStorageManager | `src/file_storage_manager.py` | 文件存储管理 |
-| SecretLoader | `src/secret_loader.py` | 密钥安全加载器 |
-| LangfuseTracer | `src/langfuse_tracer.py` | Langfuse 追踪 (LLM/工具调用可观测性) |
+The managed roots `.runtime/`, `.tools/`, `.venv/`, and `data/` must be real
+directories, not symlinks. Startup refuses those roots when implemented as
+symlinks so path containment cannot be redirected outside the checkout.
 
-### 前端核心
+## Persistence formats
 
-| 组件 | 位置 | 说明 |
-|------|------|------|
-| AgentChat | `frontend/src/components/AgentChat.tsx` | 聊天界面 + 流式渲染 (67KB, 1597行) |
-| SubAgentSelector | `frontend/src/components/SubAgentSelector.tsx` | 子智能体选择器 |
-| MCPServiceDialog | `frontend/src/components/MCPServiceDialog.tsx` | MCP 服务配置 |
-| ModelServiceDialog | `frontend/src/components/ModelServiceDialog.tsx` | 模型服务配置 |
-| DocumentUploader | `frontend/src/components/DocumentUploader.tsx` | 文档上传组件 |
-| KnowledgeBaseDialog | `frontend/src/components/KnowledgeBaseDialog.tsx` | 知识库管理对话框 |
-| EnvironmentBanner | `frontend/src/components/EnvironmentBanner.tsx` | 环境初始化提示 |
-| ConversationDrawer | `frontend/src/components/ConversationDrawer.tsx` | 对话历史抽屉 |
+- Agents, model/MCP/skill registries, and knowledge-base configuration are
+  project data under `data/` and use contained, validated paths.
+- Conversations are transactional SQLite rows. The manager imports the former
+  per-conversation JSON layout once without deleting recoverable legacy data.
+- Knowledge-base documents have sidecar metadata; list/read operations do not
+  recompute and rewrite statistics. Chroma clients and collections are reused.
+- Host logs rotate by size/count. Debug logs and trace attributes are bounded
+  and retained for limited periods.
+
+## Dependency boundaries
+
+Python dependencies are declared once in `pyproject.toml` and locked in
+`uv.lock`; `requirements.txt` is a compatibility export, not a second source of
+truth. Frontend, root documentation tooling, and `docs-site` each use their own
+committed npm lockfile.
+
+The default observability stack is OpenTelemetry/OpenInference exported over
+OTLP/HTTP to local Phoenix. Application code imports only `src.observability`,
+so another compatible collector can replace the local viewer without changing
+agent execution.
+
+## Execution and network boundaries
+
+- Uploaded Skill processes can read their managed environment and required
+  system runtime files, but Landlock confines writes to their execution
+  workspace. Unsupported Linux kernels fail closed.
+- Skill network sockets are denied by seccomp unless the operator explicitly
+  selects `AGENT_BUILDER_SKILL_NETWORK=allow`.
+- `stdio` MCP is disabled until `AGENT_BUILDER_ALLOW_STDIO_MCP=1` is set for a
+  reviewed local command.
+- Remote HTTP(S) endpoints cannot contain credentials or resolve to metadata or
+  unapproved non-global addresses. Trusted private endpoints are listed
+  narrowly in `AGENT_BUILDER_SSRF_ALLOWLIST`.
+- The generated API token remains in `.runtime/secrets` and is injected only by
+  server-side processes; child processes and browser bundles do not receive it.

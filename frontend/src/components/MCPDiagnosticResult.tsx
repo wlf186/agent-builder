@@ -35,8 +35,7 @@
 import { motion, AnimatePresence } from "framer-motion";
 import { X, CheckCircle, XCircle, AlertCircle, Loader2, Activity } from "lucide-react";
 import { useLocale } from "@/lib/LocaleContext";
-
-const API_BASE = "/api";
+import { apiPath } from "@/lib/apiPath";
 
 /**
  * 单层诊断结果
@@ -46,7 +45,7 @@ export interface DiagnosticLayer {
   status: "pass" | "fail" | "skip"; // 通过/失败/跳过
   message: string;                  // 状态消息
   latency_ms?: number | null;       // 延迟（毫秒）
-  details?: Record<string, any> | null; // 详细信息
+  details?: Record<string, unknown> | null; // 详细信息
 }
 
 /**
@@ -323,7 +322,7 @@ export function MCPDiagnosticResult({
  * 调用MCP诊断API的辅助函数
  */
 export async function diagnoseMCPService(serviceName: string): Promise<MCPDiagnosticReport> {
-  const response = await fetch(`${API_BASE}/mcp-services/${serviceName}/diagnose`, {
+  const response = await fetch(apiPath('mcp-services', serviceName, 'diagnose'), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });

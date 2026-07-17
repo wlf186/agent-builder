@@ -1,10 +1,18 @@
 # API 参考文档
 
-> Agent Builder 后端 API 端点汇总。
+> Agent Builder 后端 API 端点汇总。端点实现以 `backend.py` 为准。
 
-**Base URL**: `http://localhost:20881`
+**Backend Base URL**: `http://127.0.0.1:20881`
 
----
+除 `/health` 和 CORS 预检外，所有后端 `/api/**` 请求都必须携带启动时
+生成的凭据：
+
+```http
+Authorization: Bearer <token>
+```
+
+也可使用 `X-API-Key`。凭据保存在 `.runtime/secrets/api-token`，浏览器代码
+不得读取；浏览器应请求同源的 Next.js `/api` 代理，由服务端注入凭据。
 
 ## Agents
 
@@ -64,6 +72,10 @@
 | GET | `/api/mcp-services/{name}/tools` | 获取可用工具 |
 | POST | `/api/mcp-services/{name}/diagnose` | 诊断连接问题 |
 
+远程 MCP URL 会执行出站地址校验。可信私网服务必须加入
+`AGENT_BUILDER_SSRF_ALLOWLIST`。`stdio` MCP 会启动本地命令，默认禁用；
+只有运维人员显式设置 `AGENT_BUILDER_ALLOW_STDIO_MCP=1` 后才可配置或诊断。
+
 ## Skills
 
 | 方法 | 端点 | 说明 |
@@ -91,7 +103,7 @@
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| POST | `/api/agents/{name}/environment` | 创建 Conda 环境 |
+| POST | `/api/agents/{name}/environment` | 使用项目内 uv 创建环境 |
 | GET | `/api/agents/{name}/environment` | 获取环境状态 |
 | DELETE | `/api/agents/{name}/environment` | 删除环境 |
 | POST | `/api/agents/{name}/environment/retry` | 重试环境创建 |
@@ -120,16 +132,17 @@
 | 方法 | 端点 | 说明 |
 |------|------|------|
 | GET | `/health` | 健康检查 |
-| GET | `/api/system/check-conda` | 检查 Conda 安装 |
+| GET | `/api/system/check-runtime` | 检查项目内 uv/Python 运行时 |
+| GET | `/api/system/observability` | 获取当前追踪后端状态 |
 
 ## Frontend Redirect (前端重定向)
 
-> 前端 Next.js API 路由，用于解决外部服务链接的 hostname 动态解析问题。
-> 详见 [CLAUDE.md 开发提示 - 外部服务链接](../../CLAUDE.md) 中的设计说明。
+> 这是 Next.js 服务端路由，不属于后端 Base URL。目标固定为本机追踪面板，
+> 不使用请求 `Host` 头构造出站地址。
 
 | 方法 | 端点 | 说明 |
 |------|------|------|
-| GET | `/api/redirect/langfuse` | 307 重定向到 Langfuse（根据请求 Host 头动态构造 `http://{hostname}:3000`） |
+| GET | `/api/redirect/observability` | 重定向到 `http://127.0.0.1:${PHOENIX_PORT}` |
 
 ## Debug & Logging
 
@@ -202,7 +215,8 @@ interface Document {
 - `ollama`: Ollama 本地模型
 
 ### MCPConnectionType
-- `stdio`: 标准 IO 连接（本地服务）
+
+- `stdio`: 标准 IO 连接（可信本地命令，需运维显式启用）
 - `sse`: Server-Sent Events（远程服务）
 
 ---
@@ -217,6 +231,11 @@ interface Document {
 | `tool_result` | 工具执行结果 |
 | `skill_loading` | 技能加载中 |
 | `skill_loaded` | 技能加载完成 |
+| `rag_retrieve` | 知识库检索开始 |
+| `rag_sources` | 当前请求的知识库引用来源 |
+| `sub_agent_call` | 子智能体调用开始 |
+| `sub_agent_result` | 子智能体调用成功 |
+| `sub_agent_error` | 子智能体调用失败 |
 | `metrics` | 性能指标（延迟、token 数等） |
 | `error` | 错误信息 |
 
@@ -228,13 +247,18 @@ interface Document {
 |-------|------|
 | 200 | 成功 |
 | 400 | 请求参数错误 |
+| 401 | 缺少或无效的 API 凭据 |
 | 404 | 资源不存在 |
+| 413 | 请求体或上传内容超过限制 |
+| 422 | 请求模型校验失败 |
 | 500 | 服务器内部错误 |
+| 503 | 服务端 API 鉴权未正确配置 |
 
 ---
 
 ## 更新日志
 
+- **2026-07-16**: 对齐项目内 uv、统一 API 鉴权和本地 OTLP 追踪端点
 - **2026-03-17**: 添加 RAG 知识库 API 端点
 - **2026-03-16**: 添加调试日志 API
 - **2026-03-15**: 添加子智能体验证 API

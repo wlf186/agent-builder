@@ -55,7 +55,7 @@ export default defineConfig({
             { text: 'Model Services', link: '/en/advanced/model-service-dialog' },
             { text: 'MCP Services', link: '/en/advanced/mcp-service-dialog' },
             { text: 'Skills', link: '/en/advanced/skill-detail-dialog' },
-            { text: 'Langfuse Tracing', link: '/en/advanced/langfuse' },
+            { text: 'Local Observability', link: '/en/advanced/observability' },
           ],
         },
         {
@@ -99,7 +99,7 @@ export default defineConfig({
             { text: '模型服务', link: '/zh/advanced/model-service-dialog' },
             { text: 'MCP服务', link: '/zh/advanced/mcp-service-dialog' },
             { text: '技能', link: '/zh/advanced/skill-detail-dialog' },
-            { text: 'Langfuse追踪', link: '/zh/advanced/langfuse' },
+            { text: '本地可观测性', link: '/zh/advanced/observability' },
           ],
         },
         {
@@ -122,7 +122,7 @@ export default defineConfig({
     },
 
     socialLinks: [
-      { icon: 'github', link: 'https://github.com/anthropics/claude-code' },
+      { icon: 'github', link: 'https://github.com/wlf186/agent-builder' },
     ],
   },
 })

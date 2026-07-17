@@ -1,11 +1,12 @@
 import { test, expect } from '@playwright/test';
+import { testOutputPath } from './test-paths';
 
 test('Debug Knowledge Base Page', async ({ page }) => {
-  await page.goto('http://localhost:20880/knowledge-bases');
+  await page.goto('http://localhost:20815/knowledge-bases');
   await page.waitForLoadState('networkidle');
 
   // 截图
-  await page.screenshot({ path: 'tmp-kb-page.png', fullPage: true });
+  await page.screenshot({ path: testOutputPath('debug-kb', 'page.png'), fullPage: true });
 
   // 列出所有按钮
   const buttons = page.locator('button');

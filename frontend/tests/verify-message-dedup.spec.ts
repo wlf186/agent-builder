@@ -29,7 +29,7 @@ test.describe('消息重复 Bug 修复验证', () => {
 
   test('TC-MSG-001: 发送消息后不重复显示', async ({ page }) => {
     // 导航到首页
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
 
     // 等待页面加载
     await page.waitForLoadState('networkidle');
@@ -90,7 +90,7 @@ test.describe('消息重复 Bug 修复验证', () => {
   });
 
   test('TC-MSG-002: 连续发送多条消息不重复', async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 进入调试对话
@@ -144,7 +144,7 @@ test.describe('消息重复 Bug 修复验证', () => {
   });
 
   test('TC-MSG-003: 流式输出效果正常', async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     await page.locator('text=调试对话').first().click();
@@ -202,7 +202,7 @@ test.describe('消息重复 Bug 修复验证', () => {
   });
 
   test('TC-MSG-004: 历史会话正常加载', async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     await page.locator('text=调试对话').first().click();

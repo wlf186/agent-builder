@@ -1,7 +1,8 @@
 ---
-title: 知识库详情面板
+title: "知识库详情面板"
 category: core
 component: KbDetailPanel
+generated: true
 related:
   - KnowledgeBaseDialog
 ---

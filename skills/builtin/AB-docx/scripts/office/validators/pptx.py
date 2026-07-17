@@ -82,9 +82,9 @@ class PPTXSchemaValidator(BaseSchemaValidator):
                                         f"Line {elem.sourceline}: ID '{value}' appears to be a UUID but contains invalid hex characters"
                                     )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {xml_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {xml_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -151,9 +151,9 @@ class PPTXSchemaValidator(BaseSchemaValidator):
                             f"references r:id='{r_id}' which is not found in slide layout relationships"
                         )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {slide_master.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {slide_master.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -192,9 +192,9 @@ class PPTXSchemaValidator(BaseSchemaValidator):
                         f"  {rels_file.relative_to(self.unpacked_dir)}: has {len(layout_rels)} slideLayout references"
                     )
 
-            except Exception as e:
+            except Exception:
                 errors.append(
-                    f"  {rels_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {rels_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -243,9 +243,9 @@ class PPTXSchemaValidator(BaseSchemaValidator):
                                 (slide_name, rels_file)
                             )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {rels_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {rels_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         for target, references in notes_slide_references.items():

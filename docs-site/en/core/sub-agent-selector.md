@@ -1,7 +1,8 @@
 ---
-title: Sub-Agent Selector
+title: "Sub-Agent Selector"
 category: core
 component: SubAgentSelector
+generated: true
 related:
   - AgentChat
   - KnowledgeBaseSelector

@@ -2,8 +2,53 @@
 模型供应商测试器 - 测试连通性和获取模型列表
 """
 import httpx
+import json
 from typing import Dict, List, Tuple, Optional
 from .models import ModelProvider
+from .security import SecurityValidationError, validate_outbound_url
+
+
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_MODELS = 500
+
+
+async def _get_json_limited(
+    client: httpx.AsyncClient,
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+) -> tuple[int, object]:
+    async with client.stream("GET", url, headers=headers) as response:
+        declared = response.headers.get("content-length")
+        if declared:
+            try:
+                declared_size = int(declared)
+            except ValueError as exc:
+                raise ValueError("响应 Content-Length 无效") from exc
+            if declared_size < 0 or declared_size > MAX_RESPONSE_BYTES:
+                raise ValueError("响应过大或长度无效")
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise ValueError("响应过大")
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = {}
+        return response.status_code, data
+
+
+def _bounded_models(raw: object) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    models: List[str] = []
+    for item in raw[:MAX_MODELS]:
+        if not isinstance(item, dict):
+            continue
+        value = item.get("id", item.get("name", ""))
+        if isinstance(value, str) and 0 < len(value) <= 200:
+            models.append(value)
+    return sorted(set(models))
 
 
 class ModelProviderTester:
@@ -21,6 +66,11 @@ class ModelProviderTester:
         Returns:
             Tuple[success, models, message]
         """
+        try:
+            base_url = await validate_outbound_url(base_url)
+        except SecurityValidationError:
+            return False, [], "URL被安全策略拒绝"
+
         if provider == ModelProvider.ZHIPU:
             return await ModelProviderTester._test_zhipu(base_url, api_key)
         elif provider == ModelProvider.ALIBABA_BAILIAN:
@@ -37,41 +87,30 @@ class ModelProviderTester:
             return False, [], "API Key 不能为空"
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, proxy=None) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False, follow_redirects=False) as client:
                 # 智谱AI使用OpenAI兼容接口获取模型列表
                 models_url = f"{base_url.rstrip('/')}/models"
-                response = await client.get(
+                status_code, data = await _get_json_limited(
+                    client,
                     models_url,
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json"
                     }
                 )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    models = []
-                    if "data" in data:
-                        models = [m.get("id", m.get("name", "")) for m in data["data"]]
-                    elif isinstance(data, list):
-                        models = [m.get("id", m.get("name", "")) for m in data]
-                    return True, sorted(models), "连接成功"
+                if status_code == 200:
+                    raw_models = data.get("data", []) if isinstance(data, dict) else data
+                    return True, _bounded_models(raw_models), "连接成功"
                 else:
-                    error_msg = f"请求失败: HTTP {response.status_code}"
-                    try:
-                        error_data = response.json()
-                        if "error" in error_data:
-                            error_msg = error_data["error"].get("message", error_msg)
-                    except:
-                        pass
-                    return False, [], error_msg
+                    fallback = f"请求失败: HTTP {status_code}"
+                    return False, [], fallback
 
         except httpx.TimeoutException:
             return False, [], "连接超时，请检查网络或URL是否正确"
         except httpx.ConnectError:
             return False, [], "无法连接到服务器，请检查URL是否正确"
         except Exception as e:
-            return False, [], f"连接失败: {str(e)}"
+            return False, [], f"连接失败 ({type(e).__name__})"
 
     @staticmethod
     async def _test_alibaba_bailian(base_url: str, api_key: Optional[str]) -> Tuple[bool, List[str], str]:
@@ -80,49 +119,36 @@ class ModelProviderTester:
             return False, [], "API Key 不能为空"
 
         try:
-            async with httpx.AsyncClient(timeout=30.0, proxy=None) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False, follow_redirects=False) as client:
                 # 阿里云百炼使用OpenAI兼容接口获取模型列表
                 models_url = f"{base_url.rstrip('/')}/models"
-                response = await client.get(
+                status_code, data = await _get_json_limited(
+                    client,
                     models_url,
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json"
                     }
                 )
-
-                if response.status_code == 200:
-                    data = response.json()
-                    models = []
-                    if "data" in data:
-                        models = [m.get("id", m.get("name", "")) for m in data["data"]]
-                    elif isinstance(data, list):
-                        models = [m.get("id", m.get("name", "")) for m in data]
-                    return True, sorted(models), "连接成功"
+                if status_code == 200:
+                    raw_models = data.get("data", []) if isinstance(data, dict) else data
+                    return True, _bounded_models(raw_models), "连接成功"
                 else:
-                    error_msg = f"请求失败: HTTP {response.status_code}"
-                    try:
-                        error_data = response.json()
-                        if "error" in error_data:
-                            error_msg = error_data["error"].get("message", error_msg)
-                        elif "message" in error_data:
-                            error_msg = error_data["message"]
-                    except:
-                        pass
-                    return False, [], error_msg
+                    fallback = f"请求失败: HTTP {status_code}"
+                    return False, [], fallback
 
         except httpx.TimeoutException:
             return False, [], "连接超时，请检查网络或URL是否正确"
         except httpx.ConnectError:
             return False, [], "无法连接到服务器，请检查URL是否正确"
         except Exception as e:
-            return False, [], f"连接失败: {str(e)}"
+            return False, [], f"连接失败 ({type(e).__name__})"
 
     @staticmethod
     async def _test_ollama(base_url: str) -> Tuple[bool, List[str], str]:
         """测试Ollama连接"""
         try:
-            async with httpx.AsyncClient(timeout=30.0, proxy=None) as client:
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False, follow_redirects=False) as client:
                 # Ollama获取模型列表的API
                 # 尝试两种可能的API路径
                 tags_url = f"{base_url.rstrip('/')}/api/tags"
@@ -132,23 +158,19 @@ class ModelProviderTester:
                     base = base_url.rstrip("/")[:-3]  # 移除 /v1
                     tags_url = f"{base}/api/tags"
 
-                response = await client.get(tags_url)
-
-                if response.status_code == 200:
-                    data = response.json()
-                    models = []
-                    if "models" in data:
-                        models = [m.get("name", "") for m in data["models"]]
-                    return True, sorted(models), "连接成功"
+                status_code, data = await _get_json_limited(client, tags_url)
+                if status_code == 200:
+                    raw_models = data.get("models", []) if isinstance(data, dict) else []
+                    return True, _bounded_models(raw_models), "连接成功"
                 else:
-                    return False, [], f"请求失败: HTTP {response.status_code}"
+                    return False, [], f"请求失败: HTTP {status_code}"
 
         except httpx.TimeoutException:
             return False, [], "连接超时，请检查Ollama服务是否运行"
         except httpx.ConnectError:
             return False, [], "无法连接到Ollama服务，请确认服务是否运行"
         except Exception as e:
-            return False, [], f"连接失败: {str(e)}"
+            return False, [], f"连接失败 ({type(e).__name__})"
 
 
 async def test_model_service_connection(

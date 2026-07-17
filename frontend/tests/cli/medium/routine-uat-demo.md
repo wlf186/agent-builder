@@ -5,7 +5,7 @@
 > 模式: headed（playwright-cli 默认 headed，兼容）
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - PDF 测试文件位于: `resources/Thinking Fast and Slow (Daniel Kahneman) (Z-Library).pdf`
 - MCP 工具: calculator, cold-jokes, coingecko 已配置
 - 技能: ab-docx, ab-pdf 已配置
@@ -13,7 +13,7 @@
 ## 步骤
 
 ### [1/8] 访问主页
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 
 ### [2/8] 清理已存在的 DEMO 智能体

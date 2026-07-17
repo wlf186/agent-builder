@@ -2,8 +2,7 @@
  * 知识库 API 客户端
  */
 
-// 使用相对路径通过 Next.js 代理，与其他 API 保持一致
-const API_BASE = '/api';
+import { apiPath } from '@/lib/apiPath';
 
 // ============================================================================
 // 数据模型
@@ -63,7 +62,7 @@ export const kbApi = {
    * 列出所有知识库
    */
   async listKnowledgeBases(): Promise<KnowledgeBase[]> {
-    const res = await fetch(`${API_BASE}/knowledge-bases`);
+    const res = await fetch(apiPath('knowledge-bases'));
     if (!res.ok) throw new Error('获取知识库列表失败');
     const data = await res.json();
     return data.knowledge_bases;
@@ -73,7 +72,7 @@ export const kbApi = {
    * 创建知识库
    */
   async createKnowledgeBase(req: CreateKBRequest): Promise<KnowledgeBase> {
-    const res = await fetch(`${API_BASE}/knowledge-bases`, {
+    const res = await fetch(apiPath('knowledge-bases'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
@@ -86,7 +85,7 @@ export const kbApi = {
    * 获取知识库详情
    */
   async getKnowledgeBase(kbId: string): Promise<KnowledgeBase> {
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}`);
+    const res = await fetch(apiPath('knowledge-bases', kbId));
     if (!res.ok) throw new Error('获取知识库详情失败');
     return await res.json();
   },
@@ -95,7 +94,7 @@ export const kbApi = {
    * 删除知识库
    */
   async deleteKnowledgeBase(kbId: string): Promise<void> {
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}`, {
+    const res = await fetch(apiPath('knowledge-bases', kbId), {
       method: 'DELETE',
     });
     if (!res.ok) throw new Error('删除知识库失败');
@@ -105,7 +104,7 @@ export const kbApi = {
    * 列出知识库中的文档
    */
   async listDocuments(kbId: string): Promise<Document[]> {
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}/documents`);
+    const res = await fetch(apiPath('knowledge-bases', kbId, 'documents'));
     if (!res.ok) throw new Error('获取文档列表失败');
     const data = await res.json();
     return data.documents;
@@ -118,7 +117,7 @@ export const kbApi = {
     const formData = new FormData();
     formData.append('file', file);
 
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}/documents`, {
+    const res = await fetch(apiPath('knowledge-bases', kbId, 'documents'), {
       method: 'POST',
       body: formData,
     });
@@ -134,7 +133,7 @@ export const kbApi = {
    */
   async deleteDocument(kbId: string, docId: string): Promise<void> {
     const res = await fetch(
-      `${API_BASE}/knowledge-bases/${kbId}/documents/${docId}`,
+      apiPath('knowledge-bases', kbId, 'documents', docId),
       { method: 'DELETE' }
     );
     if (!res.ok) throw new Error('删除文档失败');
@@ -144,7 +143,7 @@ export const kbApi = {
    * 检索知识库
    */
   async search(kbId: string, req: SearchRequest): Promise<RetrievalResult[]> {
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}/search`, {
+    const res = await fetch(apiPath('knowledge-bases', kbId, 'search'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req),
@@ -158,7 +157,7 @@ export const kbApi = {
    * 获取知识库统计信息
    */
   async getStats(kbId: string): Promise<{ kb_id: string; doc_count: number; chunk_count: number; total_size: number }> {
-    const res = await fetch(`${API_BASE}/knowledge-bases/${kbId}/stats`);
+    const res = await fetch(apiPath('knowledge-bases', kbId, 'stats'));
     if (!res.ok) throw new Error('获取统计信息失败');
     return await res.json();
   },

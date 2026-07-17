@@ -1,13 +1,14 @@
 import { chromium } from 'playwright';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { mkdirSync, existsSync, writeFileSync } from 'fs';
+import { dirname, join, resolve } from 'path';
+import { mkdirSync } from 'fs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const BASE_URL = 'http://localhost:20880';
-const SUCCESS_DIR = join(__dirname, 'success');
+const BASE_URL = 'http://localhost:20815';
+const PROJECT_ROOT = resolve(__dirname, '../../../..');
+const SUCCESS_DIR = join(PROJECT_ROOT, '.runtime', 'test-results', 'demo-rag');
 const KB_ID = 'kb_7116e7ed'; // 人力资源库
 
 async function sleep(ms) {

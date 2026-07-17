@@ -5,16 +5,16 @@
 > 测试目标: 验证文件上传与 Skill 执行功能、流式输出、API 接口、智能体配置
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 已存在 test001、skill-test-pdf、skill-test-doc 智能体
-- 测试文件路径: `/work/agent-builder-general/test/测试1.pdf`
+- 测试文件路径：仓库内 `.runtime/test-results/iteration-2603121000/测试1.pdf`
 
 ---
 
 ### 测试用例 UC-001: 文件上传功能验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 等待 2 秒
 3. 在页面上查找"skill-test-pdf"文本，如果不可见则刷新页面并等待 2 秒
 4. snapshot 找到"skill-test-pdf"文本，点击
@@ -31,7 +31,7 @@
 ### 测试用例 UC-005: test001 例行验证 - 3轮对话
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 等待 2 秒
 3. snapshot 找到"test001"文本，点击
 4. 等待 2 秒
@@ -58,7 +58,7 @@
 ### 测试用例 UC-006: 流式输出验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 等待 2 秒
 3. snapshot 找到"test001"文本，点击
 4. 等待 2 秒
@@ -77,14 +77,14 @@
 ### 测试用例 UC-007: 大文件上传验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 等待 2 秒
 3. snapshot 找到"skill-test-pdf"文本，点击
 4. 等待 2 秒
 5. 检查文件上传输入框（`input[type="file"]`）是否存在
 6. 如果存在：
    - 记录开始时间
-   - 上传测试 PDF 文件（`/work/agent-builder-general/test/测试1.pdf`）
+   - 上传测试 PDF 文件（`.runtime/test-results/iteration-2603121000/测试1.pdf`）
    - 等待 5 秒
    - 记录上传耗时
 7. 截图保存到 `test-results/cli/iteration-2603121000-uc007.png`

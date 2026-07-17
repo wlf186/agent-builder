@@ -86,10 +86,10 @@ def main():
         result = process_docx(args)
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(0 if result.get("status") == "success" else 1)
-    except Exception as e:
+    except Exception:
         print(json.dumps({
             "status": "error",
-            "error": str(e),
+            "error": "文档处理失败",
             "action": args.action
         }, ensure_ascii=False))
         sys.exit(1)
@@ -184,10 +184,10 @@ def extract_text(input_file: str, verbose: bool = False) -> Dict[str, Any]:
             "char_count": len(combined_text)
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"提取文本失败: {str(e)}",
+            "error": "提取文本失败",
             "action": "extract_text"
         }
 
@@ -265,15 +265,15 @@ def create_document(output_file: Optional[str], data: Dict[str, Any], verbose: b
             "output": {
                 "title": title,
                 "content_items": len(content) if isinstance(content, list) else 1,
-                "output_file": str(output_path.absolute())
+                "output_file": output_path.as_posix()
             },
-            "files": [str(output_path.absolute())]
+            "files": [output_path.as_posix()]
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"创建文档失败: {str(e)}",
+            "error": "创建文档失败",
             "action": "create_document"
         }
 
@@ -290,76 +290,11 @@ def convert_to_pdf(input_file: str, output_dir: Optional[str] = None, verbose: b
     Returns:
         包含转换结果的字典
     """
-    try:
-        # 确定输出路径
-        input_path = Path(input_file)
-        if not output_dir:
-            output_dir = str(input_path.parent)
-
-        output_path = Path(output_dir)
-        output_path.mkdir(parents=True, exist_ok=True)
-
-        output_file = str(output_path / f"{input_path.stem}.pdf")
-
-        # 尝试使用 docx2pdf（仅 Windows）或 LibreOffice
-        converted = False
-        conversion_method = None
-
-        # 方法1: 尝试使用 docx2pdf
-        try:
-            from docx2pdf import convert
-            convert(input_file, output_file)
-            converted = True
-            conversion_method = "docx2pdf"
-        except ImportError:
-            pass
-        except Exception as e:
-            if verbose:
-                print(f"[WARN] docx2pdf 转换失败: {e}", file=sys.stderr)
-
-        # 方法2: 尝试使用 LibreOffice
-        if not converted:
-            try:
-                import subprocess
-                result = subprocess.run(
-                    ['soffice', '--headless', '--convert-to', 'pdf', '--outdir', output_dir, input_file],
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
-                if result.returncode == 0:
-                    converted = True
-                    conversion_method = "LibreOffice"
-            except Exception as e:
-                if verbose:
-                    print(f"[WARN] LibreOffice 转换失败: {e}", file=sys.stderr)
-
-        if not converted:
-            return {
-                "status": "error",
-                "error": "无法转换为 PDF：请安装 docx2pdf（Windows）或 LibreOffice",
-                "action": "convert_to_pdf"
-            }
-
-        if verbose:
-            print(f"[INFO] 使用 {conversion_method} 转换成功: {output_file}", file=sys.stderr)
-
-        return {
-            "status": "success",
-            "action": "convert_to_pdf",
-            "output": {
-                "conversion_method": conversion_method,
-                "output_file": output_file
-            },
-            "files": [output_file]
-        }
-
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": f"转换为 PDF 失败: {str(e)}",
-            "action": "convert_to_pdf"
-        }
+    return {
+        "status": "error",
+        "error": "本地部署不包含外部 Office 渲染器，DOCX 转 PDF 已禁用",
+        "action": "convert_to_pdf",
+    }
 
 
 def get_info(input_file: str, verbose: bool = False) -> Dict[str, Any]:
@@ -391,7 +326,7 @@ def get_info(input_file: str, verbose: bool = False) -> Dict[str, Any]:
         char_count = sum(len(p.text) for p in doc.paragraphs)
 
         info = {
-            "file_path": str(Path(input_file).absolute()),
+            "filename": Path(input_file).name,
             "file_size": Path(input_file).stat().st_size,
             "paragraphs": paragraph_count,
             "tables": table_count,
@@ -417,10 +352,10 @@ def get_info(input_file: str, verbose: bool = False) -> Dict[str, Any]:
             "output": info
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"获取文档信息失败: {str(e)}",
+            "error": "获取文档信息失败",
             "action": "get_info"
         }
 

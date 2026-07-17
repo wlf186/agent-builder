@@ -32,7 +32,7 @@
  */
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { X } from "lucide-react";
 import { kbApi, KnowledgeBase } from "@/lib/kbApi";
 
@@ -43,19 +43,12 @@ interface KnowledgeBaseDialogProps {
 }
 
 export function KnowledgeBaseDialog({ knowledgeBase, onClose, onSave }: KnowledgeBaseDialogProps) {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
+  const [name, setName] = useState(() => knowledgeBase?.name ?? "");
+  const [description, setDescription] = useState(() => knowledgeBase?.description ?? "");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
   const isEdit = knowledgeBase !== null;
-
-  useEffect(() => {
-    if (knowledgeBase) {
-      setName(knowledgeBase.name);
-      setDescription(knowledgeBase.description);
-    }
-  }, [knowledgeBase]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

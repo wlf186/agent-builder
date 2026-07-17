@@ -1,7 +1,8 @@
 ---
-title: Knowledge Base Detail Panel
+title: "Knowledge Base Detail Panel"
 category: core
 component: KbDetailPanel
+generated: true
 related:
   - KnowledgeBaseDialog
 ---

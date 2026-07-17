@@ -1,8 +1,9 @@
 import { test, expect } from '@playwright/test';
+import { testOutputPath } from './test-paths';
 
 test('Cold Jokes MCP Tool - should return joke responses', async ({ page }) => {
     // 1. 访问主页
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 2. 选择智能体
@@ -34,7 +35,7 @@ test('Cold Jokes MCP Tool - should return joke responses', async ({ page }) => {
                           pageContent?.includes('小明');
 
     // 截图
-    await page.screenshot({ path: 'cold-jokes-test-screenshot.png' });
+    await page.screenshot({ path: testOutputPath('cold-jokes-test', 'result.png') });
 
     console.log('Has joke content:', hasJokeContent);
     expect(hasJokeContent).toBeTruthy();

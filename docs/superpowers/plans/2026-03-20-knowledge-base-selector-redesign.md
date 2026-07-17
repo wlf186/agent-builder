@@ -415,7 +415,7 @@ export function MultiSelectPanel<T>({
 
 - [ ] **Step 1.5: Verify component compiles**
 
-Run: `cd /home/wremote/claude-dev/agent-builder-general/frontend && npm run build 2>&1 | head -50`
+Run from the repository root: `cd frontend && npm run build 2>&1 | head -50`
 Expected: No errors related to MultiSelectPanel.tsx
 
 - [ ] **Step 1.6: Commit**
@@ -569,7 +569,7 @@ Remove this redundant section after KnowledgeBaseSelector in page.tsx:
 
 - [ ] **Step 2.4: Verify build succeeds**
 
-Run: `cd /home/wremote/claude-dev/agent-builder-general/frontend && npm run build 2>&1 | head -50`
+Run from the repository root: `cd frontend && npm run build 2>&1 | head -50`
 Expected: Build succeeds
 
 - [ ] **Step 2.5: Test in browser**
@@ -744,7 +744,7 @@ export function SubAgentSelector({
 
 - [ ] **Step 3.3: Verify build succeeds**
 
-Run: `cd /home/wremote/claude-dev/agent-builder-general/frontend && npm run build 2>&1 | head -50`
+Run from the repository root: `cd frontend && npm run build 2>&1 | head -50`
 Expected: Build succeeds
 
 - [ ] **Step 3.4: Test SubAgentSelector in browser**

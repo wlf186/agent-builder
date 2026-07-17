@@ -17,8 +17,9 @@
  */
 
 import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { testOutputDir, testOutputPath } from './test-paths';
 
-const BASE_URL = process.env.TEST_URL || 'http://localhost:20880';
+const BASE_URL = process.env.TEST_URL || 'http://localhost:20815';
 const API_URL = process.env.API_URL || 'http://localhost:20881';
 const TEST_AGENT = 'file-skill-tester';
 
@@ -26,7 +27,7 @@ const TEST_AGENT = 'file-skill-tester';
 test.setTimeout(180000);
 
 // 截图保存目录
-const SCREENSHOT_DIR = '/work/agent-builder-general/teams/tf141/iterations/iteration-2603121000/screenshots';
+const SCREENSHOT_DIR = testOutputDir('iteration-2603121000');
 
 // 最小有效 PDF 内容
 const MINIMAL_PDF = `%PDF-1.4
@@ -262,7 +263,7 @@ test('TC010: FileUploader component test', async ({ page }) => {
   await page.waitForTimeout(500);
 
   // 准备测试文件
-  const testPdfPath = '/tmp/test-upload.pdf';
+  const testPdfPath = testOutputPath('iteration-2603121000', 'test-upload.pdf');
   require('fs').writeFileSync(testPdfPath, MINIMAL_PDF);
 
   // 上传文件

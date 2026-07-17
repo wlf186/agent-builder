@@ -1,6 +1,6 @@
 import { test } from '@playwright/test';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 
 test('调试请求 URL', async ({ page }) => {
   console.log('\n=== 调试请求 URL ===\n');

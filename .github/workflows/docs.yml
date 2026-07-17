@@ -1,47 +1,49 @@
 # .github/workflows/docs.yml
-name: User Manual Validation
+name: Documentation Governance
 
 on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 4 * * 1'
   pull_request:
-    paths:
-      - 'frontend/src/components/**/*.tsx'
-      - 'docs-site/**'
-      - 'scripts/extract-user-guide.ts'
-      - 'scripts/validate-user-guide.ts'
   push:
     branches: [main]
-    paths:
-      - 'frontend/src/components/**/*.tsx'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
+          cache-dependency-path: |
+            package-lock.json
+            docs-site/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
       - name: Install docs-site dependencies
-        run: cd docs-site && npm ci
+        run: npm --prefix docs-site ci
 
-      - name: Extract user guides
-        run: npm run docs:extract
-
-      - name: Check for changes
+      - name: Audit documentation dependencies
         run: |
-          if git diff --exit-code docs-site/en docs-site/zh; then
-            echo "✅ Docs are up to date"
-          else
-            echo "❌ Docs are out of sync. Run 'npm run docs:extract' and commit changes."
-            exit 1
-          fi
+          npm audit --audit-level=low
+          npm --prefix docs-site audit --audit-level=low
 
-      - name: Validate bilingual content
-        run: npm run docs:validate
+      - name: Run documentation governance gates
+        run: npm run governance:check

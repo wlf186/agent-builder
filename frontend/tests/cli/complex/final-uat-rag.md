@@ -5,7 +5,7 @@
 > 测试目标: 知识库列表访问、知识库详情、文档上传、智能体创建、对话检索、隔离性测试
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 测试文档路径: `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.txt`
 - 已存在知识库 ID: `kb_7116e7ed`（人力资源库）
 
@@ -14,7 +14,7 @@
 ### 测试用例 测试1: 访问知识库列表
 
 ## 步骤
-1. 访问 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 访问 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. 截图保存到 `test-results/cli/final-uat-rag-01-kb-list.png`
 
 ## 验证
@@ -25,7 +25,7 @@
 ### 测试用例 测试2: 进入知识库详情
 
 ## 步骤
-1. 访问 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 访问 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. snapshot 找到"人力资源库"文本，点击
 3. 等待页面加载完成
 4. 截图保存到 `test-results/cli/final-uat-rag-02-kb-detail.png`
@@ -38,7 +38,7 @@
 ### 测试用例 测试3: 上传文档
 
 ## 步骤
-1. 访问 `http://localhost:20880/knowledge-bases/kb_7116e7ed`，等待页面加载完成
+1. 访问 `http://localhost:20815/knowledge-bases/kb_7116e7ed`，等待页面加载完成
 2. 截图保存到 `test-results/cli/final-uat-rag-03-before-upload.png`
 3. snapshot 找到文件上传输入框（`input[type="file"]`）
 4. 如果文件上传输入框可见：
@@ -59,7 +59,7 @@
 ### 测试用例 测试4: 创建测试智能体
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/final-uat-rag-06-homepage.png`
 3. snapshot 找到"创建智能体"或"Create"按钮，点击
 4. 等待 1 秒
@@ -83,7 +83,7 @@
 ### 测试用例 测试5: 对话检索测试
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到"UAT行政助手"文本，点击
    - 如果找不到，选择页面上第一个可用的智能体（`h3` 或 `h2` 元素）
 3. 等待 2 秒
@@ -107,7 +107,7 @@
 ### 测试用例 测试6: 隔离性测试
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到"创建智能体"或"Create"按钮，点击
 3. 等待 1 秒
 4. snapshot 找到名称输入框（`input[placeholder*="名称"]` 或 `input[name="name"]` 或 `input[type="text"]`），输入"UAT技术支持"

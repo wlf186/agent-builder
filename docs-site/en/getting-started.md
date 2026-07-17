@@ -9,12 +9,35 @@ Welcome to Agent Builder! This guide will help you create your first AI agent in
 ## What is Agent Builder?
 
 Agent Builder is a platform for creating AI assistants (agents) that can:
+
 - Chat with you in natural language
 - Use tools to perform tasks
 - Search through your documents
 - Work with other agents as a team
 
 ## Quick Start
+
+An operator starts the complete project-local stack from the repository root:
+
+```bash
+./start.sh
+```
+
+No global Python, Node, Conda, or container runtime is required. When startup
+reports that all services are healthy, open `http://127.0.0.1:20815`. Stop all
+processes owned by this checkout with `./stop.sh`.
+
+A fresh installation requires a supported glibc Linux host, Internet access,
+and sufficient disk and memory. Review the repository
+[deployment prerequisites](https://github.com/wlf186/agent-builder#supported-deployment)
+before the first bootstrap.
+
+### Step 0: Configure a Model Service
+
+Agent Builder does not bundle an LLM or install Ollama. Open **Model Service
+Configuration** and add a cloud provider with an API key, or point it at an
+independently installed local Ollama service. See the
+[model-service guide](/en/advanced/model-service-dialog) for details.
 
 ### Step 1: Create an Agent
 
@@ -41,6 +64,7 @@ Agent Builder is a platform for creating AI assistants (agents) that can:
 
 - Learn about [Chat Interface](/en/core/agent-chat) features
 - Explore [Knowledge Bases](/en/core/knowledge-base-selector)
+- Configure [Model Services](/en/advanced/model-service-dialog) before chatting
 - Configure [MCP Services](/en/advanced/mcp-service-dialog) for tools
 
 ## Need Help?

@@ -4,8 +4,10 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('rag-quick-uat');
 
 test('RAG 验收测试 - 行政助手', async ({ page }) => {
   console.log('开始 RAG 验收测试...');
@@ -44,8 +46,8 @@ test('RAG 验收测试 - 行政助手', async ({ page }) => {
   console.log(`  - 引用来源: ${hasCitation ? '✓' : '✗'}`);
 
   // 截图
-  await page.screenshot({ path: 'test-results/rag-uat-admin.png' });
-  console.log('4. 截图已保存: test-results/rag-uat-admin.png');
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/rag-uat-admin.png` });
+  console.log(`4. 截图已保存: ${SCREENSHOT_DIR}/rag-uat-admin.png`);
 
   expect(has15, '应回答15天年假').toBeTruthy();
 });
@@ -82,6 +84,6 @@ test('RAG 验收测试 - 技术支持', async ({ page }) => {
   console.log(`  - 表示不知道: ${saysDontKnow ? '✓' : '✗'}`);
 
   // 截图
-  await page.screenshot({ path: 'test-results/rag-uat-tech.png' });
-  console.log('4. 截图已保存: test-results/rag-uat-tech.png');
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/rag-uat-tech.png` });
+  console.log(`4. 截图已保存: ${SCREENSHOT_DIR}/rag-uat-tech.png`);
 });

@@ -11,7 +11,7 @@
  * 关键技术：
  * 1. ReadableStream API - 逐块读取 SSE 数据
  * 2. flushSync - 强制 React 同步渲染，确保打字机效果
- * 3. useRef 存储流式内容 - 避免频繁触发重渲染
+ * 3. useRef 累积流式内容并按帧合并渲染 - 限制高频重渲染
  *
  * ⚠️ 修改此文件可能影响：
  * - 打字机效果的流畅性
@@ -63,47 +63,52 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { flushSync } from 'react-dom';  // 【关键】flushSync 用于强制同步渲染
 import { useLocale } from '@/lib/LocaleContext';
-import { ChevronDown, ChevronRight, Wrench, Lightbulb, Loader2, Clock, Zap, Hash, Paperclip, FileText, FileSpreadsheet, Image, File, X, Database, Square } from 'lucide-react';
+import { ChevronDown, ChevronRight, Wrench, Lightbulb, Loader2, Clock, Zap, Hash, Paperclip, FileText, FileSpreadsheet, Image as ImageIcon, File, X, Database, Square } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { PendingFile, FileAttachment, DEFAULT_FILE_CONFIG, formatFileSize, FileUploadConfig, FileContext, UploadedFile, SubAgentCallRecord } from '@/types';
-import { FileUploader, UploadButton } from '@/components/FileUploader';
+import { PendingFile, FileAttachment, DEFAULT_FILE_CONFIG, formatFileSize, FileContext, SubAgentCallRecord } from '@/types';
 import { SubAgentCallCard } from '@/components/SubAgentCallCard';
 import { ContextStatusBar } from '@/components/ContextStatusBar';
 import { uploadFile } from '@/lib/fileApi';
-import { DebugLogger, generateRequestId } from '@/lib/debugLogger';
+import { DebugLogger, generateRequestId, sanitizeForLogging } from '@/lib/debugLogger';
+import { buildHistoryMessages, finalizeTurnMessages } from '@/lib/chatMessages';
+import { streamPath } from '@/lib/apiPath';
 
-const API_BASE = '/api';
-
-// 【流式输出关键】流式请求使用专用路径，绕过 rewrites 代理
-// 这样可以避免 Next.js 代理缓冲导致的流式输出失效
-const getStreamingUrl = () => {
-  return '/stream';
-};
-
-// 本地日志存储
+// 本地日志只保留最近记录，避免长会话无限占用浏览器内存。
 const localLogs: string[] = [];
+const MAX_LOCAL_LOGS = 500;
+const MAX_LOCAL_LOG_ENTRY_LENGTH = 8_000;
 
-const addLog = (type: string, message: string, details?: any) => {
+const addLog = (type: string, message: string, details?: unknown) => {
   const timestamp = new Date().toISOString();
-  const logEntry = `[${timestamp}] [${type}] ${message}${details ? '\n  ' + JSON.stringify(details, null, 2).replace(/\n/g, '\n  ') : ''}`;
+  const sanitizedDetails = details === undefined ? '' : JSON.stringify(sanitizeForLogging(details), null, 2);
+  const logEntry = `[${timestamp}] [${type}] ${message}${sanitizedDetails ? '\n  ' + sanitizedDetails.replace(/\n/g, '\n  ') : ''}`
+    .slice(0, MAX_LOCAL_LOG_ENTRY_LENGTH);
   localLogs.push(logEntry);
+  if (localLogs.length > MAX_LOCAL_LOGS) {
+    localLogs.splice(0, localLogs.length - MAX_LOCAL_LOGS);
+  }
   console.log(logEntry);
 };
 
 // 只在关键点记录日志，避免过多
-const addChunkLog = (chunkNum: number, totalBytes: number, preview: string) => {
-  // 每10个chunk记录一次，或最后一个chunk
+const addChunkLog = (chunkNum: number, totalBytes: number) => {
+  // 每 10 个 chunk 记录一次纯计数摘要。
   if (chunkNum % 10 === 0) {
-    addLog('DEBUG', `已接收 ${chunkNum} 个数据块`, { totalBytes, preview: preview.substring(0, 50) });
+    addLog('DEBUG', `已接收 ${chunkNum} 个数据块`, { totalBytes });
   }
 };
+
+interface ToolArguments extends Record<string, unknown> {
+  skill_name?: string;
+  query?: string;
+}
 
 interface ToolCall {
   name: string;
   call_id?: string;  // 唯一标识符，用于区分同名工具的多次调用
   service?: string;  // 来源服务名
-  args: Record<string, any>;
+  args: ToolArguments;
   result?: string;
 }
 
@@ -117,7 +122,7 @@ interface SkillExecutionState {
   error?: string;
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
@@ -173,7 +178,11 @@ interface AgentChatProps {
   shortTermMemory?: number;
   conversationId?: string | null;
   initialMessages?: ChatMessage[];  // 新增：用于加载历史会话消息
-  onConversationChange?: (id: string | null | undefined, messages: ChatMessage[]) => void;
+  onConversationChange?: (
+    id: string | null | undefined,
+    messages: ChatMessage[],
+    turnMessages?: ChatMessage[],
+  ) => void;
   onCreateConversation?: () => Promise<string | null | undefined>;  // 新增：创建会话的回调
 }
 
@@ -182,7 +191,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isRunning, setIsRunning] = useState(false);
   const [inputValue, setInputValue] = useState('');
-  const [hasError, setHasError] = useState(false);
+  const [, setHasError] = useState(false);
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);  // 待发送的文件
 
   // 上下文窗口状态栏
@@ -230,6 +239,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
   const pendingConversationUpdateRef = useRef<{
     conversationId: string | null | undefined;
     messages: ChatMessage[];
+    turnMessages: ChatMessage[];
   } | null>(null);
 
   // 【修复-2603131100】防止 onConversationChange 重复调用
@@ -247,20 +257,11 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
 
   // 【修复-2603141800】使用 ref 存储最新的 messages，避免 handleSend 闭包问题
   const messagesRef = useRef<ChatMessage[]>([]);
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
-
-  // ========== Debug Logger 初始化 ==========
-  // 在组件挂载时创建日志记录器
-  useEffect(() => {
-    debugLoggerRef.current = DebugLogger.create();
-    return () => {
-      // 组件卸载时清理
-      if (debugLoggerRef.current) {
-        // 这里可以添加清理逻辑
-      }
-    };
+  const updateMessages = useCallback((updater: (current: ChatMessage[]) => ChatMessage[]) => {
+    const nextMessages = updater(messagesRef.current);
+    messagesRef.current = nextMessages;
+    setMessages(nextMessages);
+    return nextMessages;
   }, []);
 
   // 自动滚动到底部
@@ -369,11 +370,8 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
     // 导致这个 useEffect 被多次触发，需要通过 conversationId 去重
     if (pendingUpdate && onConversationChange) {
       const convId = pendingUpdate.conversationId;
-      const msgCount = pendingUpdate.messages.length;
-
-      // 生成唯一标识符：conversationId + 消息数量
-      // 只有当标识符变化时才调用 onConversationChange
-      const updateKey = `${convId}-${msgCount}`;
+      const lastTurnMessage = pendingUpdate.turnMessages.at(-1);
+      const updateKey = `${convId}-${lastTurnMessage?.id ?? 'none'}-${lastTurnMessage?.content.length ?? 0}`;
       if (lastProcessedConversationRef.current !== updateKey) {
         lastProcessedConversationRef.current = updateKey;
         pendingConversationUpdateRef.current = null; // 清除待处理的更新
@@ -381,7 +379,11 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
         // 【修复-20260317】使用 setTimeout 延迟调用，确保不阻塞 UI 渲染
         // 这样 setIsRunning(false) 的效果可以立即反映到 UI
         setTimeout(() => {
-          onConversationChange(pendingUpdate.conversationId, pendingUpdate.messages);
+          onConversationChange(
+            pendingUpdate.conversationId,
+            pendingUpdate.messages,
+            pendingUpdate.turnMessages,
+          );
         }, 0);
       } else {
         pendingConversationUpdateRef.current = null; // 清除待处理的更新
@@ -430,7 +432,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
     // 使用 DebugLogger 导出日志
     try {
       // 尝试获取后端日志
-      await debugLoggerRef.current.fetchBackendLogs('/api');
+      await debugLoggerRef.current.fetchBackendLogs();
 
       // 导出为 JSON 格式
       const logData = debugLoggerRef.current.export('json');
@@ -558,8 +560,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
       }
     }
 
-    const streamingUrl = getStreamingUrl();
-    const requestUrl = `${streamingUrl}/agents/${agentName}/chat`;
+    const requestUrl = streamPath('agents', agentName, 'chat');
 
     // ========== T016: 使用 file_context 管理文件 ==========
     // 1. 先上传新的待发送文件
@@ -583,8 +584,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
 
     addLog('INFO', locale === "zh" ? '开始发送消息' : 'Start sending message', {
       agentName,
-      message: userContent,
-      streamingUrl,
+      messageLength: userContent.length,
       requestUrl,
       hostname: window.location.hostname,
       port: window.location.port,
@@ -592,6 +592,10 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
       conversationId: activeConversationId,
       fileIds: allFileIds
     });
+
+    // 只用追加本轮之前的消息构建 history，避免本轮 user 同时出现在
+    // history 和 message 中，也不把占位用的空 assistant 发给后端。
+    const messagesBeforeTurn = messagesRef.current;
 
     // 用户消息：使用所有文件信息
     const userMsg: ChatMessage = {
@@ -615,7 +619,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
       skillStates: [],
       ragRetrievals: []  // 【AC130-202603170949】初始化 RAG 检索记录
     };
-    const newMessages = [...messagesRef.current, userMsg, assistantMsg];
+    const newMessages = [...messagesBeforeTurn, userMsg, assistantMsg];
 
     // 【修复-2603141800】同时更新 state 和 ref
     messagesRef.current = newMessages;
@@ -634,27 +638,40 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
     streamingSubAgentCallsRef.current = [];  // 【AC130 新增】重置子 Agent 调用记录
     streamingRagRetrievalsRef.current = [];  // 【AC130-202603170949】重置 RAG 检索记录
 
+    // 将高频 SSE content 事件合并到每帧最多一次 React 更新，避免每个
+    // chunk 都复制整份消息数组并强制同步布局。
+    let contentRenderTimer: ReturnType<typeof setTimeout> | null = null;
+    const renderStreamingContent = () => {
+      contentRenderTimer = null;
+      const content = streamingContentRef.current;
+      updateMessages((prev) =>
+        prev.map((msg) => msg.id === assistantMsgId ? { ...msg, content } : msg)
+      );
+    };
+    const scheduleStreamingContentRender = () => {
+      if (contentRenderTimer === null) {
+        contentRenderTimer = setTimeout(renderStreamingContent, 16);
+      }
+    };
+
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
 
-    // 【修复-2603141800】使用 ref 获取最新的 messages，避免闭包中的旧值
-    // 构建历史消息（根据 shortTermMemory 截取）
-    const historyMessages = messagesRef.current.slice(-(shortTermMemory * 2)).map(msg => ({
-      role: msg.role,
-      content: msg.content
-    }));
+    const historyMessages = buildHistoryMessages(messagesBeforeTurn, shortTermMemory);
 
     // ========== Debug Logger: 生成 Trace ID 并记录请求 ==========
     const traceId = generateRequestId();
-    if (debugLoggerRef.current) {
-      debugLoggerRef.current.logRequestStart({
-        agentName,
-        message: userContent,
-        history: historyMessages,
-        file_ids: allFileIds,
-        conversation_id: activeConversationId
-      });
-    }
+    // 每次请求都使用与 X-Request-ID 完全相同的 logger ID。
+    const requestLogger = DebugLogger.create(traceId);
+    debugLoggerRef.current = requestLogger;
+    requestLogger.logRequestStart({
+      agentName,
+      messageLength: userContent.length,
+      historyCount: historyMessages.length,
+      historyCharacterCount: historyMessages.reduce((total, item) => total + item.content.length, 0),
+      fileCount: allFileIds.length,
+      conversationId: activeConversationId,
+    });
 
     try {
       addLog('INFO', locale === "zh" ? '准备发起 fetch 请求' : 'Preparing fetch request', { url: requestUrl, historyCount: historyMessages.length, fileIds: allFileIds, traceId });
@@ -708,7 +725,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
 
         // 【关键】使用 stream: true 选项，确保跨 chunk 的 UTF-8 字符能正确解码
         const chunk = decoder.decode(value, { stream: true });
-        addChunkLog(chunkCount, totalBytes, chunk);
+        addChunkLog(chunkCount, totalBytes);
 
         // ========== Debug Logger: 记录 SSE Chunks ==========
         if (debugLoggerRef.current) {
@@ -729,7 +746,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
               if (data.type === 'thinking') {
                 // 思考过程
                 streamingThinkingRef.current = data.content;
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, thinking: data.content }
@@ -758,7 +775,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   streamingSkillStatesRef.current = result.states;
                 }
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? {
@@ -850,7 +867,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   }
                   return tc;
                 });
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? {
@@ -908,22 +925,11 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                 // 【流式输出核心 - 打字机效果】
                 //
                 // 这里的实现非常关键：
-                // 1. 使用 useRef (streamingContentRef) 累积内容，避免频繁触发重渲染
-                // 2. 使用 flushSync 强制 React 同步渲染，确保每次字符都能立即显示
-                //
-                // ⚠️ 不要修改此处的 flushSync，否则打字机效果会失效！
-                // React 默认的批处理会延迟渲染，导致字符不是逐个出现
+                // 1. 使用 useRef 累积内容
+                // 2. 将高频 chunk 合并为每帧一次渲染，保留实时效果并限制 CPU
                 // ============================================================
                 streamingContentRef.current += data.content;
-                flushSync(() => {
-                  setMessages((prev) =>
-                    prev.map((msg) =>
-                      msg.id === assistantMsgId
-                        ? { ...msg, content: streamingContentRef.current }
-                        : msg
-                    )
-                  );
-                });
+                scheduleStreamingContentRender();
               } else if (data.type === 'metrics') {
                 // 更新上下文窗口状态栏
                 setContextMetrics({
@@ -932,7 +938,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   contextWindow: data.context_window ?? 0,
                 });
                 // 性能指标
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, metrics: {
@@ -956,7 +962,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                 );
                 streamingSkillStatesRef.current = result.states;
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? {
@@ -992,7 +998,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   streamingLoadedSkillsRef.current = [...streamingLoadedSkillsRef.current, skillName];
                 }
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? {
@@ -1026,7 +1032,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
 
                 streamingSubAgentCallsRef.current = [...streamingSubAgentCallsRef.current, newCall];
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, subAgentCalls: [...streamingSubAgentCallsRef.current] }
@@ -1054,7 +1060,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   return call;
                 });
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, subAgentCalls: [...streamingSubAgentCallsRef.current] }
@@ -1081,7 +1087,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   return call;
                 });
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, subAgentCalls: [...streamingSubAgentCallsRef.current] }
@@ -1106,7 +1112,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                   ? `正在检索知识库: "${query}"...`
                   : `Retrieving from knowledge base: "${query}"...`;
 
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? {
@@ -1122,7 +1128,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                 const sources = data.sources as RAGSource[];
                 if (sources && sources.length > 0) {
                   streamingRagSourcesRef.current = [...streamingRagSourcesRef.current, ...sources];
-                  setMessages((prev) =>
+                  updateMessages((prev) =>
                     prev.map((msg) =>
                       msg.id === assistantMsgId
                         ? { ...msg, ragSources: [...streamingRagSourcesRef.current] }
@@ -1133,21 +1139,13 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
               } else if (data.content) {
                 // 兼容旧格式
                 streamingContentRef.current += data.content;
-                flushSync(() => {
-                  setMessages((prev) =>
-                    prev.map((msg) =>
-                      msg.id === assistantMsgId
-                        ? { ...msg, content: streamingContentRef.current }
-                        : msg
-                    )
-                  );
-                });
+                scheduleStreamingContentRender();
               }
 
               const errorPrefix = locale === "zh" ? '错误: ' : 'Error: ';
               if (data.error) {
                 streamingContentRef.current = `${errorPrefix}${data.error}`;
-                setMessages((prev) =>
+                updateMessages((prev) =>
                   prev.map((msg) =>
                     msg.id === assistantMsgId
                       ? { ...msg, content: streamingContentRef.current }
@@ -1169,12 +1167,17 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
     } catch (error) {
       setHasError(true);
 
+      if (contentRenderTimer !== null) {
+        clearTimeout(contentRenderTimer);
+        contentRenderTimer = null;
+      }
+
       const errorDetails = error instanceof Error ? {
         name: error.name,
         message: error.message,
         stack: error.stack,
         requestUrl,
-        cause: (error as any).cause
+        cause: error.cause,
       } : { error: String(error), requestUrl };
 
       addLog('ERROR', locale === "zh" ? 'fetch 请求失败' : 'Fetch request failed', errorDetails);
@@ -1183,10 +1186,11 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
       if (error instanceof Error && error.name === 'AbortError') {
         addLog('INFO', locale === "zh" ? '请求被取消' : 'Request cancelled');
         // 移除空的 assistant 消息
-        setMessages((prev) => prev.filter(msg => msg.id !== assistantMsgId));
-        messagesRef.current = messagesRef.current.filter(msg => msg.id !== assistantMsgId);
+        streamingContentRef.current = '';
+        updateMessages((prev) => prev.filter(msg => msg.id !== assistantMsgId));
       } else {
-        setMessages((prev) =>
+        streamingContentRef.current = networkError;
+        updateMessages((prev) =>
           prev.map((msg) =>
             msg.id === assistantMsgId
               ? { ...msg, content: networkError }
@@ -1195,29 +1199,41 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
         );
       }
     } finally {
-      // 【修复-2603141800】同步重置运行状态 ref
-      // 【修复-20260317】使用 flushSync 强制同步更新 isRunning 状态
-      // 避免批处理导致输入框延迟可用
+      if (contentRenderTimer !== null) {
+        clearTimeout(contentRenderTimer);
+        renderStreamingContent();
+      }
+
+      // 最终消息必须先同步写入 ref，再触发 React 提交和父组件回调。
+      // 这样不会依赖 useEffect 的执行时机，也不会把 ref 中的旧占位内容
+      // 误当成最终结果持久化。
+      const { messages: finalMessages, turnMessages } = finalizeTurnMessages(
+        messagesRef.current,
+        userMsg.id,
+        assistantMsgId,
+        streamingContentRef.current,
+      );
+
+      messagesRef.current = finalMessages;
+      localMessageUpdateRef.current = true;
+      if (turnMessages.length > 0) {
+        pendingConversationUpdateRef.current = {
+          conversationId: activeConversationId,
+          messages: finalMessages,
+          turnMessages,
+        };
+      }
+
       isRunningRef.current = false;
       flushSync(() => {
+        setMessages(finalMessages);
         setIsRunning(false);
       });
       abortControllerRef.current = null;
-
-      // 【修复-2603141800】保存会话消息到后端
-      // 同时更新 messagesRef 确保一致性
-      const finalMessages = messagesRef.current;
-      if (finalMessages.length > 0) {
-        // 存储待处理的更新，useEffect 会在渲染完成后处理
-        pendingConversationUpdateRef.current = {
-          conversationId: activeConversationId,
-          messages: finalMessages
-        };
-      }
     }
   // 【修复-2603141800】从依赖项中移除 messages，使用 ref 获取最新值
   // 这避免了每次 messages 变化时重建 handleSend 函数
-  }, [inputValue, agentName, locale, shortTermMemory, scrollToBottom, t, conversationId, onConversationChange, onCreateConversation, pendingFiles, fileContext, uploadPendingFiles]);
+  }, [inputValue, agentName, locale, shortTermMemory, scrollToBottom, conversationId, onCreateConversation, pendingFiles, fileContext, uploadPendingFiles, updateMessages, findOrCreateSkillState, normalizeSkillName]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -1234,7 +1250,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
   }, []);
 
   const toggleThinkingExpand = (msgId: string) => {
-    setMessages((prev) =>
+    updateMessages((prev) =>
       prev.map((msg) =>
         msg.id === msgId
           ? { ...msg, isThinkingExpanded: !msg.isThinkingExpanded }
@@ -1257,7 +1273,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
     if (type === 'application/pdf') return <FileText className="w-3 h-3 text-red-400" />;
     if (type.includes('word') || type.includes('document')) return <FileText className="w-3 h-3 text-blue-400" />;
     if (type.includes('spreadsheet') || type.includes('excel')) return <FileSpreadsheet className="w-3 h-3 text-green-400" />;
-    if (type.startsWith('image/')) return <Image className="w-3 h-3 text-purple-400" />;
+    if (type.startsWith('image/')) return <ImageIcon className="w-3 h-3 text-purple-400" />;
     return <File className="w-3 h-3 text-gray-400" />;
   };
 
@@ -1478,7 +1494,7 @@ export function AgentChat({ agentName, shortTermMemory = 5, conversationId, init
                       {rag.status === 'retrieving' && <Loader2 className="w-3 h-3 text-emerald-400 animate-spin" />}
                       {rag.status === 'completed' && <span className="text-emerald-400">✓</span>}
                       {rag.status === 'failed' && <span className="text-yellow-400">⚠</span>}
-                      <span className="text-gray-300">"{rag.query}"</span>
+                      <span className="text-gray-300">“{rag.query}”</span>
                     </div>
                     {rag.results && rag.status === 'completed' && (
                       <div className="text-xs text-gray-400 mt-1 bg-black/20 px-2 py-1 rounded max-h-24 overflow-auto">

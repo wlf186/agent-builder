@@ -4,8 +4,10 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('rag-uat-official');
 
 // 测试1: 行政助手应触发 RAG 检索并正确回答
 test('RAG-UAT-01: 行政助手应检索知识库并回答年假问题', async ({ page }) => {
@@ -108,10 +110,10 @@ test('RAG-UAT-01: 行政助手应检索知识库并回答年假问题', async ({
 
   // 截图保存
   await page.screenshot({
-    path: 'test-results/rag-uat-01-admin-rag.png',
+    path: `${SCREENSHOT_DIR}/rag-uat-01-admin-rag.png`,
     fullPage: true
   });
-  console.log('  📸 截图已保存: test-results/rag-uat-01-admin-rag.png\n');
+  console.log(`  📸 截图已保存: ${SCREENSHOT_DIR}/rag-uat-01-admin-rag.png\n`);
 
   // 断言核心功能
   expect(has15, '行政助手应能回答15天年假问题').toBeTruthy();
@@ -182,10 +184,10 @@ test('RAG-UAT-02: 技术支持不触发RAG检索', async ({ page }) => {
   console.log('------------------------------------------------');
 
   await page.screenshot({
-    path: 'test-results/rag-uat-02-tech-no-rag.png',
+    path: `${SCREENSHOT_DIR}/rag-uat-02-tech-no-rag.png`,
     fullPage: true
   });
-  console.log('  📸 截图已保存: test-results/rag-uat-02-tech-no-rag.png\n');
+  console.log(`  📸 截图已保存: ${SCREENSHOT_DIR}/rag-uat-02-tech-no-rag.png\n`);
 
   expect(!hasRetrieving, '技术支持不应显示RAG检索提示').toBeTruthy();
 });
@@ -234,7 +236,7 @@ test('RAG-UAT-03: 行政助手检索代码规范', async ({ page }) => {
   console.log(`包含命名规范信息: ${hasAnswer ? '✓ 通过' : '✗ 失败'}`);
 
   await page.screenshot({
-    path: 'test-results/rag-uat-03-code-standards.png',
+    path: `${SCREENSHOT_DIR}/rag-uat-03-code-standards.png`,
     fullPage: true
   });
   console.log('📸 截图已保存\n');

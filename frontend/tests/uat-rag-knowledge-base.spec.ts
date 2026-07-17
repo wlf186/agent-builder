@@ -15,9 +15,10 @@
 import { test, expect } from '@playwright/test';
 import path from 'path';
 import fs from 'fs';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = path.join(__dirname, '../../teams/AC130/iterations/202603161542/uat_screenshots');
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('uat-rag-knowledge-base');
 
 // 确保截图目录存在
 if (!fs.existsSync(SCREENSHOT_DIR)) {
@@ -360,7 +361,10 @@ test.describe('UAT: 知识库（RAG）管理系统', () => {
     console.log(`  - 包含引用来源: ${hasCitation ? '✓' : '✗'}`);
 
     // 最终截图
-    await page.screenshot({ path: path.join(SCREENSHOT_DIR, 'TC-05-04-最终验收.png') }, { fullPage: true });
+    await page.screenshot({
+      path: path.join(SCREENSHOT_DIR, 'TC-05-04-最终验收.png'),
+      fullPage: true,
+    });
 
     // 如果有任何一项通过，则认为测试通过
     const testPassed = hasKnowledgeBaseAnswer || hasRetrievalProcess || hasCitation;

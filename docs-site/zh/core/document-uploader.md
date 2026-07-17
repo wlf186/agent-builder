@@ -1,7 +1,8 @@
 ---
-title: 文档上传器
+title: "文档上传器"
 category: core
 component: DocumentUploader
+generated: true
 related:
   - KnowledgeBaseDialog
   - KnowledgeBaseSelector

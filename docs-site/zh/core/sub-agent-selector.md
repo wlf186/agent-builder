@@ -1,7 +1,8 @@
 ---
-title: 子智能体选择器
+title: "子智能体选择器"
 category: core
 component: SubAgentSelector
+generated: true
 related:
   - AgentChat
   - KnowledgeBaseSelector

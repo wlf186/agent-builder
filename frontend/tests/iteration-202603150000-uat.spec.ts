@@ -16,9 +16,11 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import path from 'node:path';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = 'teams/AC130/iterations/iteration-202603150000/screenshots';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('iteration-202603150000-uat');
 const AGENT_NAME = '统一客服';  // PRD 中提到的智能体
 
 // Helper: 截图保存
@@ -154,7 +156,7 @@ test.describe('UAT: 流式输出与日志导出功能验收', () => {
       console.log(`  等待中... ${elapsed}ms`);
 
       // 方法1: 检查是否有"你好"以外的其他文本出现在对话区域
-      const pageContent = await page.textContent('body');
+      const pageContent = await page.textContent('body') ?? '';
       const hasOtherText = pageContent?.includes('你好') && pageContent?.length > 1000;
 
       // 方法2: 检查是否有常见的回复词汇
@@ -171,7 +173,7 @@ test.describe('UAT: 流式输出与日志导出功能验收', () => {
       }
 
       // 检查是否有足够的回复内容
-      if ((hasOtherText || hasReplyKeywords) && pageContent?.length > 2000) {
+      if ((hasOtherText || hasReplyKeywords) && pageContent.length > 2000) {
         responseCompleted = true;
         const totalTime = Date.now() - startTime;
         console.log(`  ✓ 响应完成于 ${totalTime}ms`);
@@ -232,6 +234,7 @@ test.describe('UAT: 流式输出与日志导出功能验收', () => {
     try {
       const download = await downloadPromise;
       const filename = download.suggestedFilename();
+      await download.saveAs(path.join(SCREENSHOT_DIR, path.basename(filename)));
       console.log(`  ✓ 日志文件已下载: ${filename}`);
 
       // 读取日志内容
@@ -325,7 +328,7 @@ test.describe('UAT: 流式输出与日志导出功能验收', () => {
  * 测试执行说明
  *
  * 前提条件:
- * 1. 前端服务运行在 http://localhost:20880
+ * 1. 前端服务运行在 http://localhost:20815
  * 2. 后端服务运行在 http://localhost:20881
  * 3. 至少有一个可用的智能体
  *
@@ -335,6 +338,6 @@ test.describe('UAT: 流式输出与日志导出功能验收', () => {
  * npx playwright test iteration-202603150000-uat.spec.ts
  *
  * 预期结果:
- * - 所有截图保存在 teams/AC130/iterations/iteration-202603150000/screenshots/
+ * - 所有截图保存在 .runtime/test-results/iteration-202603150000-uat/
  * - 控制台输出测试结果
  */

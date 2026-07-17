@@ -4,11 +4,11 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - test3 智能体已配置 cold-jokes MCP 工具
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 截图保存到 test-results/cli/cold-jokes-01-homepage.png
 4. 找到包含 "test3" 的 h3 标题，点击选择 test3 智能体

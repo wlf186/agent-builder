@@ -15,13 +15,13 @@ Examples:
 
 import argparse
 import sys
-import zipfile
 from pathlib import Path
 
 import defusedxml.minidom
 
 from helpers.merge_runs import merge_runs as do_merge_runs
 from helpers.simplify_redlines import simplify_redlines as do_simplify_redlines
+from safe_zip import SafeZipError, safe_extract_zip
 
 SMART_QUOTE_REPLACEMENTS = {
     "\u201c": "&#x201C;",  
@@ -50,8 +50,7 @@ def unpack(
     try:
         output_path.mkdir(parents=True, exist_ok=True)
 
-        with zipfile.ZipFile(input_path, "r") as zf:
-            zf.extractall(output_path)
+        safe_extract_zip(input_path, output_path)
 
         xml_files = list(output_path.rglob("*.xml")) + list(output_path.rglob("*.rels"))
         for xml_file in xml_files:
@@ -73,10 +72,10 @@ def unpack(
 
         return None, message
 
-    except zipfile.BadZipFile:
-        return None, f"Error: {input_file} is not a valid Office file"
-    except Exception as e:
-        return None, f"Error unpacking: {e}"
+    except SafeZipError:
+        return None, "Error: input is not a safe Office file"
+    except Exception:
+        return None, "Error unpacking Office file"
 
 
 def _pretty_print_xml(xml_file: Path) -> None:

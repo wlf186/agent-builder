@@ -1,5 +1,6 @@
-import sys
 import os
+import sys
+from importlib.metadata import distributions
 
 print("Python executable:", sys.executable)
 print("Python version:", sys.version)
@@ -12,9 +13,12 @@ try:
 except ImportError as e:
     print("PyPDF2 import failed:", e)
 
-# List installed packages
-import subprocess
-result = subprocess.run([sys.executable, "-m", "pip", "list"], capture_output=True, text=True)
+# List installed packages without relying on pip being installed in the managed
+# uv environment.
+packages = sorted(
+    (distribution.metadata.get("Name", "unknown"), distribution.version)
+    for distribution in distributions()
+)
 print("\nInstalled packages (first 10):")
-for line in result.stdout.split('\n')[:12]:
-    print(" ", line)
+for name, version in packages[:10]:
+    print(f"  {name} {version}")

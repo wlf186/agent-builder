@@ -4,7 +4,7 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (localhost:20880 / localhost:20881)
+- 服务已启动 (localhost:20815 / localhost:20881)
 - 后端 API `/api/knowledge-bases` 可用
 - 截图目录 `test-results/cli/` 已创建
 
@@ -26,7 +26,7 @@ console.log('API health check PASS');
 
 ### 测试用例 2: 创建知识库
 
-1. 打开 http://localhost:20880/knowledge-bases，等待页面加载完成
+1. 打开 http://localhost:20815/knowledge-bases，等待页面加载完成
 2. 截图保存到 test-results/cli/knowledge-base-uat-01-list.png
 3. snapshot 找到 "创建知识库" 按钮，点击
 4. 等待 1 秒，截图保存到 test-results/cli/knowledge-base-uat-02-dialog.png
@@ -42,7 +42,7 @@ console.log('API health check PASS');
 ### 测试用例 3: 上传文档到知识库
 
 1. 通过 API 获取 "人力资源库" 的 kb_id
-2. 打开 http://localhost:20880/knowledge-bases/{kb_id}，等待页面加载完成
+2. 打开 http://localhost:20815/knowledge-bases/{kb_id}，等待页面加载完成
 3. 截图保存到 test-results/cli/knowledge-base-uat-05-detail.png
 4. snapshot 找到 "上传文档" 按钮，点击
 5. 等待 1 秒，截图保存到 test-results/cli/knowledge-base-uat-06-upload-dialog.png
@@ -56,7 +56,7 @@ console.log('API health check PASS');
 
 ### 测试用例 4: Agent 配置知识库挂载
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/knowledge-base-uat-09-main.png
 3. 检查是否存在 "行政助手" 智能体
 4. 如果不存在：
@@ -77,7 +77,7 @@ console.log('API health check PASS');
 
 ### 测试用例 5: RAG 检索对话测试
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "行政助手" 智能体卡片，点击
 3. 等待 1 秒
 4. snapshot 找到调试对话输入框 `input[type="text"][placeholder]`，输入 "公司有几天年假？"
@@ -91,7 +91,7 @@ console.log('API health check PASS');
 
 ### 测试用例 6: 隔离验证（未挂载 Agent）
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "test3" 或其他未挂载知识库的智能体卡片，点击
 3. 等待 1 秒
 4. snapshot 找到调试对话输入框 `input[type="text"][placeholder]`，输入 "公司有几天年假？"

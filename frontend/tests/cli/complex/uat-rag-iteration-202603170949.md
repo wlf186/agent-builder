@@ -5,7 +5,7 @@
 > 迭代: AC130-202603170949
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 后端 API `/api/knowledge-bases` 可用
 - 测试文档 `Cyberpunk公司2026员工手册.txt` 已准备（包含公司简介、考勤制度、年假制度等内容）
 
@@ -15,7 +15,7 @@
 
 > 验收标准: 能成功创建知识库并在列表中显示
 
-1. 打开 http://localhost:20880/knowledge-bases，等待页面加载完成
+1. 打开 http://localhost:20815/knowledge-bases，等待页面加载完成
 2. 截图保存到 test-results/cli/rag-iteration-202603170949-01-list.png
 3. snapshot 找到 "创建知识库" 按钮，点击
 4. 等待 0.5 秒，截图保存到 test-results/cli/rag-iteration-202603170949-02-dialog.png
@@ -32,7 +32,7 @@
 
 > 验收标准: 文档上传成功并在列表中显示
 
-1. 打开 http://localhost:20880/knowledge-bases，等待页面加载完成
+1. 打开 http://localhost:20815/knowledge-bases，等待页面加载完成
 2. snapshot 找到 "人力资源库" 知识库卡片（h3 标签），点击进入详情页
 3. 等待页面加载完成
 4. 截图保存到 test-results/cli/rag-iteration-202603170949-05-detail.png
@@ -48,7 +48,7 @@
 
 > 验收标准: 创建智能体并成功关联知识库
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/rag-iteration-202603170949-08-home.png
 3. snapshot 找到 "创建智能体" 按钮，点击
 4. 等待 1 秒
@@ -69,7 +69,7 @@
 
 > 验收标准: 智能体能检索知识库并返回基于文档的准确回答
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "行政助手" 智能体卡片（h3 标签），点击
 3. 等待 2 秒
 4. 截图保存到 test-results/cli/rag-iteration-202603170949-12-agent-selected.png
@@ -89,7 +89,7 @@
 
 > 验收标准: 未关联知识库的智能体不触发检索
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/rag-iteration-202603170949-16-isolation-home.png
 3. snapshot 找到 "创建智能体" 按钮，点击
 4. 等待 1 秒

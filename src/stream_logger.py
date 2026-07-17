@@ -3,10 +3,35 @@
 
 与前端 DebugLogger 配合，提供结构化的后端日志系统
 """
+import logging
+import re
 import threading
 import uuid
+from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Any, Deque, Dict, List, Optional
+
+from .log_safety import content_length, summarize_arguments
+
+
+logger = logging.getLogger(__name__)
+
+_SENSITIVE_KEY = re.compile(
+    r"(^|[_-])(authorization|cookie|token|secret|password|api[_-]?key)([_-]|$)",
+    re.IGNORECASE,
+)
+_BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}")
+_URL_CREDENTIALS = re.compile(r"(?i)(https?://)[^/@\s:]+:[^/@\s]+@")
+_PRIVATE_CONTENT_KEY = re.compile(
+    r"^(?:args|arguments|content|details|error|history|input|message|messages|"
+    r"output|prompt|reasoning|result|stack|traceback|url)$",
+    re.IGNORECASE,
+)
+
+
+def _redact_text(value: str) -> str:
+    value = _BEARER_VALUE.sub("Bearer <redacted>", value)
+    return _URL_CREDENTIALS.sub(r"\1<redacted>@", value)
 
 
 class StreamLogger:
@@ -17,9 +42,11 @@ class StreamLogger:
 
     # 类级别的日志存储
     _log_store: Dict[str, 'StreamLogger'] = {}
-    _log_lock = threading.Lock()
-    _max_entries = 1000  # 最大日志条目数，防止内存泄漏
-    _cleanup_interval = 300  # 清理间隔（秒）
+    _log_lock = threading.RLock()
+    _max_loggers = 500
+    _max_events = 500
+    _max_collection_items = 50
+    _max_value_chars = 4000
     _retention_hours = 1  # 日志保留时间（小时）
 
     def __init__(self, request_id: str):
@@ -30,8 +57,43 @@ class StreamLogger:
         """
         self.request_id = request_id
         self.start_time = datetime.now()
-        self.events: List[Dict[str, Any]] = []
+        self.events: Deque[Dict[str, Any]] = deque(maxlen=self._max_events)
+        self.dropped_event_count = 0
         self._lock = threading.Lock()  # 实例级别的锁，保护 events 列表
+
+    @classmethod
+    def _sanitize(cls, value: Any, depth: int = 0) -> Any:
+        """Bound debug payloads and redact common credential fields."""
+        if depth >= 4:
+            return "<max-depth>"
+        if isinstance(value, dict):
+            result: Dict[str, Any] = {}
+            items = list(value.items())
+            for key, nested in items[: cls._max_collection_items]:
+                key_text = str(key)
+                if _SENSITIVE_KEY.search(key_text):
+                    result[key_text] = "<redacted>"
+                elif _PRIVATE_CONTENT_KEY.fullmatch(key_text):
+                    result[f"{key_text}_length"] = content_length(nested)
+                else:
+                    result[key_text] = cls._sanitize(nested, depth + 1)
+            if len(items) > cls._max_collection_items:
+                result["_truncated_items"] = len(items) - cls._max_collection_items
+            return result
+        if isinstance(value, (list, tuple, set)):
+            items = list(value)
+            result = [cls._sanitize(item, depth + 1) for item in items[: cls._max_collection_items]]
+            if len(items) > cls._max_collection_items:
+                result.append(f"<truncated {len(items) - cls._max_collection_items} items>")
+            return result
+        if isinstance(value, str):
+            value = _redact_text(value)
+            if len(value) > cls._max_value_chars:
+                return value[: cls._max_value_chars] + "<truncated>"
+            return value
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        return cls._sanitize(str(value), depth + 1)
 
     def log_event(self, category: str, data: Dict[str, Any]) -> None:
         """记录日志事件
@@ -41,10 +103,12 @@ class StreamLogger:
             data: 事件数据（字典格式）
         """
         with self._lock:
+            if len(self.events) == self._max_events:
+                self.dropped_event_count += 1
             self.events.append({
                 "timestamp": datetime.now().isoformat(),
                 "category": category,
-                "data": data
+                "data": self._sanitize(data),
             })
 
     def log_error(self, error_type: str, message: str, traceback: str = None) -> None:
@@ -57,10 +121,10 @@ class StreamLogger:
         """
         error_data = {
             "type": error_type,
-            "message": message
+            "message_length": content_length(message),
         }
         if traceback:
-            error_data["traceback"] = traceback
+            error_data["traceback_length"] = content_length(traceback)
 
         self.log_event("error", error_data)
 
@@ -87,7 +151,7 @@ class StreamLogger:
         """
         self.log_event("tool_call", {
             "name": tool_name,
-            "args": args
+            **summarize_arguments(args),
         })
 
     def log_sse_event(self, event_type: str) -> None:
@@ -110,6 +174,7 @@ class StreamLogger:
                 "start_time": self.start_time.isoformat(),
                 "end_time": datetime.now().isoformat(),
                 "event_count": len(self.events),
+                "dropped_event_count": self.dropped_event_count,
                 "events": list(self.events)  # 返回副本
             }
 
@@ -128,30 +193,33 @@ class StreamLogger:
 
         with cls._log_lock:
             if request_id not in cls._log_store:
+                cls._cleanup_old_logs()
+                while len(cls._log_store) >= cls._max_loggers:
+                    oldest_request_id = min(
+                        cls._log_store,
+                        key=lambda key: cls._log_store[key].start_time,
+                    )
+                    del cls._log_store[oldest_request_id]
                 cls._log_store[request_id] = StreamLogger(request_id)
-                # 定期清理旧日志
-                if len(cls._log_store) > cls._max_entries // 2:
-                    cls._cleanup_old_logs()
             return cls._log_store[request_id]
 
     @classmethod
     def _cleanup_old_logs(cls) -> None:
         """清理超过保留时间的日志
 
-        此方法应在持有 _log_lock 的情况下调用
+        可由任意线程安全调用。
         """
-        cutoff = datetime.now() - timedelta(hours=cls._retention_hours)
-        expired = []
-
-        for request_id, logger in cls._log_store.items():
-            if logger.start_time < cutoff:
-                expired.append(request_id)
-
-        for request_id in expired:
-            del cls._log_store[request_id]
-
+        with cls._log_lock:
+            cutoff = datetime.now() - timedelta(hours=cls._retention_hours)
+            expired = [
+                request_id
+                for request_id, request_logger in cls._log_store.items()
+                if request_logger.start_time < cutoff
+            ]
+            for request_id in expired:
+                del cls._log_store[request_id]
         if expired:
-            print(f"[StreamLogger] 清理了 {len(expired)} 条过期日志")
+            logger.debug("Removed %d expired request loggers", len(expired))
 
     @classmethod
     def get_all_request_ids(cls) -> List[str]:
@@ -162,6 +230,12 @@ class StreamLogger:
         """
         with cls._log_lock:
             return list(cls._log_store.keys())
+
+    @classmethod
+    def find_logger(cls, request_id: str) -> Optional['StreamLogger']:
+        """Return an existing logger without allocating attacker-controlled state."""
+        with cls._log_lock:
+            return cls._log_store.get(request_id)
 
     @classmethod
     def remove_logger(cls, request_id: str) -> bool:

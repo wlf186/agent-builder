@@ -48,8 +48,8 @@
  * @related AgentChat
  */
 
-import { useState, useRef, useCallback } from 'react';
-import { Paperclip, X, FileText, FileSpreadsheet, Image, File, Upload } from 'lucide-react';
+import { useState, useRef, useCallback, useMemo } from 'react';
+import { Paperclip, X, FileText, FileSpreadsheet, Image as ImageIcon, File, Upload } from 'lucide-react';
 import {
   PendingFile,
   UploadedFile,
@@ -102,7 +102,7 @@ function FileIconComponent({ type, className }: { type: string; className?: stri
     return <FileSpreadsheet className={`${className} text-green-400`} />;
   }
   if (type.startsWith('image/')) {
-    return <Image className={`${className} text-purple-400`} />;
+    return <ImageIcon className={`${className} text-purple-400`} />;
   }
   return <File className={`${className} text-gray-400`} />;
 }
@@ -196,14 +196,13 @@ export function FileUploader({
   uploadProgress,
   isUploading = false,
   uploadingFileName,
-  onUploadComplete,
 }: FileUploaderProps) {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 翻译文本 - 符合 UX 设计稿 7.1 国际化支持
-  const t = {
+  const t = useMemo(() => ({
     uploadFile: locale === 'zh' ? '上传文件' : 'Upload File',
     pendingFiles: locale === 'zh' ? '待发送文件' : 'Pending Files',
     addMoreFiles: locale === 'zh' ? '添加更多' : 'Add More',
@@ -214,7 +213,7 @@ export function FileUploader({
     maxFilesExceeded: locale === 'zh' ? `单次最多上传 ${maxFiles} 个文件` : `Maximum ${maxFiles} files per upload`,
     maxFileSizeHint: locale === 'zh' ? `最大 ${Math.round(maxFileSize / (1024 * 1024))}MB` : `Max ${Math.round(maxFileSize / (1024 * 1024))}MB`,
     uploading: locale === 'zh' ? '正在上传文件...' : 'Uploading files...',
-  };
+  }), [locale, maxFiles, maxFileSize]);
 
   /**
    * 处理文件验证和添加

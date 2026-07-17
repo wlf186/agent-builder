@@ -1,7 +1,8 @@
 ---
-title: Skill Details
+title: "Skill Details"
 category: advanced
 component: SkillDetailDialog
+generated: true
 related:
   - SkillUploadDialog
 ---

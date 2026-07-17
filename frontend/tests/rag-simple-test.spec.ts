@@ -3,8 +3,10 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('rag-simple-test');
 
 test('RAG测试1_行政助手', async ({ page }) => {
   console.log('=== RAG测试1: 行政助手 ===');
@@ -44,7 +46,7 @@ test('RAG测试1_行政助手', async ({ page }) => {
   const has15 = content.includes('15') || content.includes('十五');
   console.log(`包含15天: ${has15}`);
 
-  await page.screenshot({ path: 'test-results/rag-simple-admin.png', fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/rag-simple-admin.png`, fullPage: true });
   console.log('截图已保存');
 });
 
@@ -83,5 +85,5 @@ test('RAG测试2_技术支持', async ({ page }) => {
   const hasRetrieving = content.includes('检索') || content.includes('retriev');
   console.log(`有检索提示: ${hasRetrieving} (应该没有)`);
 
-  await page.screenshot({ path: 'test-results/rag-simple-tech.png', fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/rag-simple-tech.png`, fullPage: true });
 });

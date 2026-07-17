@@ -44,11 +44,14 @@
 │  │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌───────────────┐  │   │
 │  │  │Document Proc│ │   Embedder  │ │  Retriever  │ │   FileStorage │  │   │
 │  │  └─────────────┘ └─────────────┘ └─────────────┘ └───────────────┘  │   │
+│  │  ┌──────────────────────┐ ┌──────────────────────────────────────┐  │   │
+│  │  │ Auth / URL / Upload  │ │ OpenTelemetry/OpenInference → OTLP │  │   │
+│  │  └──────────────────────┘ └──────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                        │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                    External Services                                 │   │
-│  │  LLM Providers (Zhipu/Alibaba/Ollama) | MCP Servers | Conda          │   │
+│  │  LLM Providers (Zhipu/Alibaba/Ollama) | MCP Servers | uv runtimes    │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -60,6 +63,8 @@
 │  data/                                                                      │
 │  ├── agents/           ├── conversations/    ├── environments/             │
 │  ├── knowledge_base/   ├── files/            ├── executions/               │
+│  .runtime/                                                                  │
+│  ├── environments/     ├── logs/            ├── phoenix/                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -157,7 +162,7 @@ data/knowledge_base/
 **位置**: `src/environment_manager.py`
 
 **职责**:
-- Conda 环境创建和销毁
+- 项目本地 uv 环境创建和销毁
 - 依赖包安装
 - 隔离执行环境
 
@@ -178,6 +183,35 @@ data/knowledge_base/
 - 文件上传和存储
 - MD5 校验
 - MIME 类型检测
+
+### 11. Security boundary
+
+**位置**: `src/security.py`, `src/process_sandbox.py`
+
+**职责**:
+
+- 对所有后端 `/api/**` 请求执行统一 Token 鉴权
+- 限制 CORS 源站、请求体、上传包、路径和出站 URL
+- 要求可信私网目标进入 `AGENT_BUILDER_SSRF_ALLOWLIST`
+- 默认禁用可执行本地命令的 `stdio` MCP
+- 使用 Linux Landlock、seccomp 和资源限制隔离 Skill 子进程
+
+浏览器只能访问同源 Next.js `/api` 代理，由服务端注入后端 Token。Skill
+沙箱不可用时拒绝执行；网络默认关闭，不存在无隔离降级路径。
+
+### 12. Observability boundary
+
+**位置**: `src/observability/`
+
+**职责**:
+
+- 生成 OpenTelemetry Trace 和 OpenInference 属性
+- 在导出前执行凭据脱敏、深度/集合/字符串上限和采样
+- 使用有界队列批量导出 OTLP/HTTP，避免逐 Token 写盘
+- 默认写入 `.runtime/phoenix` 中的本地 Phoenix SQLite 数据
+
+业务代码只依赖可观测性抽象。`./start.sh --no-observability` 使用无操作
+追踪器；兼容 OTLP/HTTP 的收集器可替换本地查看器。
 
 ---
 
@@ -246,7 +280,7 @@ DocumentUploader 组件
 | MCP Services | `/api/mcp-services` | MCP 工具服务 |
 | Skills | `/api/skills` | 技能管理 |
 | Model Services | `/api/model-services` | LLM 提供商配置 |
-| Environment | `/api/agents/{name}/environment` | Conda 环境管理 |
+| Environment | `/api/agents/{name}/environment` | uv 环境管理 |
 | Files | `/api/agents/{name}/files` | 文件上传管理 |
 | Execution | `/api/agents/{name}/execute` | 脚本执行 |
 | System | `/api/system`, `/health` | 系统状态 |
@@ -261,7 +295,7 @@ DocumentUploader 组件
 - **框架**: FastAPI + Uvicorn
 - **智能体**: LangChain + LangGraph
 - **向量**: 智谱 AI Embeddings
-- **环境**: Conda
+- **环境**: 项目内 uv + 托管 Python
 - **协议**: SSE (Server-Sent Events)
 
 ### 前端

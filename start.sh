@@ -1,337 +1,318 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Start the complete Agent Builder stack using only project-managed processes.
 
-# Agent Builder 系统启动脚本
-# 用法: ./start.sh [--skip-deps] [--force] [--force-langfuse]
-#   --skip-deps       跳过依赖检查
-#   --force           强制重启占用端口的服务（不含 Langfuse）
-#   --force-langfuse  强制重启 Langfuse 服务
+set -Eeuo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck source=env.sh
+source "$ROOT/env.sh"
+cd "$ROOT"
 
-set -e
-cd "$(dirname "$0")"
+SKIP_BOOTSTRAP=false
+ENABLE_OBSERVABILITY=true
+ENABLE_DOCS=true
+STARTED_SERVICES=()
+ROLLING_BACK=false
+STARTING_PID=""
+STARTING_PGID=""
 
-BACKEND_PORT=20881
-FRONTEND_PORT=20880
+usage() {
+    cat <<'EOF'
+Usage: ./start.sh [--skip-bootstrap] [--no-observability] [--no-docs]
 
-# 参数标志
-FORCE_MODE=false
-FORCE_LANGFUSE=false
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
-
-log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-
-# 检查端口是否被占用
-check_port() {
-    local port=$1
-    if lsof -i :$port > /dev/null 2>&1; then
-        return 0  # 端口被占用
-    fi
-    return 1  # 端口空闲
+The default starts Phoenix, backend, production frontend, and documentation.
+Any failed health check rolls back every service started by this invocation.
+EOF
 }
 
-# 强制释放端口（杀掉占用进程）
-force_release_port() {
-    local port=$1
-    local pid=$(lsof -t -i :$port 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-        log_warn "强制释放端口 $port (PID: $pid)"
-        kill -9 $pid 2>/dev/null || true
-        sleep 1  # 等待端口释放
-        if check_port $port; then
-            log_error "无法释放端口 $port"
-            return 1
-        fi
-        log_info "端口 $port 已释放"
+for arg in "$@"; do
+    case "$arg" in
+        --skip-bootstrap) SKIP_BOOTSTRAP=true ;;
+        --no-observability) ENABLE_OBSERVABILITY=false ;;
+        --no-docs) ENABLE_DOCS=false ;;
+        --help|-h) usage; exit 0 ;;
+        --force)
+            echo "Unsafe port-based force start was removed; run ./stop.sh --force first." >&2
+            exit 2
+            ;;
+        *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+log() { printf '[start] %s\n' "$*"; }
+fail() { printf '[start] ERROR: %s\n' "$*" >&2; return 1; }
+
+pid_file() { printf '%s/%s.pid' "$AGENT_BUILDER_RUNTIME_DIR/pids" "$1"; }
+
+process_marker() {
+    local stat
+    if [[ -r "/proc/$1/stat" ]]; then
+        stat="$(<"/proc/$1/stat")"
+        stat="${stat##*) }"
+        printf 'linux:%s\n' "$(awk '{print $20}' <<<"$stat")"
+    else
+        printf 'ps:%s\n' "$(ps -o lstart= -p "$1" 2>/dev/null | tr -d '[:space:]')"
     fi
-    return 0
 }
 
-# 等待服务启动
-# 用法: wait_for_service <port> <name> [manifest_file]
-#   - port: 服务端口
-#   - name: 服务名称（用于日志）
-#   - manifest_file: (可选) 构建产物路径，仅前端需要
-wait_for_service() {
-    local port=$1
-    local name=$2
-    local manifest_file=$3  # 可选，仅前端需要
-    local max_wait=30
-    local count=0
-
-    while [ $count -lt $max_wait ]; do
-        # 如果指定了 manifest_file，先检查构建产物
-        if [ -n "$manifest_file" ]; then
-            if [ ! -f "$manifest_file" ]; then
-                sleep 1
-                ((count++))
-                continue
-            fi
-        fi
-        # 检查 HTTP 响应
-        if curl -s "http://localhost:$port" > /dev/null 2>&1; then
+managed_running() {
+    local name="$1" file pid pgid recorded_marker recorded_root current_marker current_pgid command_line attempt
+    file="$(pid_file "$name")"
+    [[ -r "$file" && ! -L "$file" ]] || return 1
+    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
+    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
+    recorded_marker="$(awk -F= '$1 == "marker" {print $2}' "$file")"
+    recorded_root="$(awk -F= '$1 == "root" {sub(/^root=/, ""); print}' "$file")"
+    [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ && -n "$recorded_marker" ]] || return 1
+    [[ "$recorded_root" == "$ROOT" ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    for ((attempt = 0; attempt < 3; attempt++)); do
+        current_marker="$(process_marker "$pid")"
+        current_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        command_line="$(ps -o command= -p "$pid" 2>/dev/null)"
+        if [[ "$current_marker" == "$recorded_marker" && "$current_pgid" == "$pgid" \
+            && "$command_line" == *"$ROOT/scripts/run_with_rotating_log.py"* ]]; then
             return 0
         fi
-        sleep 1
-        ((count++))
+        sleep 0.1
     done
     return 1
 }
 
-# 启动后端
-start_backend() {
-    log_info "启动后端服务..."
-
-    # 检查虚拟环境
-    if [ ! -d ".venv" ]; then
-        log_error "虚拟环境不存在，请先运行: python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt"
-        exit 1
-    fi
-
-    # 检查端口
-    if check_port $BACKEND_PORT; then
-        if [ "$FORCE_MODE" = true ]; then
-            force_release_port $BACKEND_PORT || exit 1
-        else
-            log_warn "后端端口 $BACKEND_PORT 已被占用 (使用 --force 强制重启)"
-            return 0
-        fi
-    fi
-
-    # 启动后端
-    source .venv/bin/activate
-    nohup python backend.py > backend.log 2>&1 &
-    echo $! > backend.pid
-    log_info "后端 PID: $(cat backend.pid)"
-
-    # 等待启动
-    if wait_for_service $BACKEND_PORT "后端"; then
-        log_info "后端启动成功 (http://localhost:$BACKEND_PORT)"
-    else
-        log_error "后端启动超时，请检查 backend.log"
-        exit 1
-    fi
+tcp_open() {
+    local host="$1" port="$2"
+    (exec 9<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
 }
 
-# 启动 Langfuse 可观测性服务
-start_langfuse() {
-    log_info "启动 Langfuse 可观测性服务..."
-
-    LANGFUSE_PORT=3000
-
-    # 检查容器编排工具是否可用 (优先级: podman-compose > docker compose > docker-compose)
-    local compose_cmd=""
-    if command -v podman-compose &> /dev/null; then
-        compose_cmd="podman-compose"
-    elif docker compose version &> /dev/null 2>&1; then
-        compose_cmd="docker compose"
-    elif command -v docker-compose &> /dev/null; then
-        compose_cmd="docker-compose"
-    fi
-
-    if [ -z "$compose_cmd" ]; then
-        log_warn "容器编排工具不可用 (podman-compose/docker-compose)，跳过 Langfuse 启动"
-        log_warn "如需启用可观测性，请先安装 podman-compose 或 docker-compose"
-        return 0
-    fi
-
-    # 检查端口
-    if check_port $LANGFUSE_PORT; then
-        if [ "$FORCE_LANGFUSE" = true ]; then
-            # Langfuse 是容器服务，需要用 compose 停止
-            log_warn "Langfuse 端口 $LANGFUSE_PORT 已被占用，尝试停止容器..."
-            $compose_cmd -f docker-compose.langfuse.yml down 2>/dev/null || true
-            sleep 2
-        else
-            log_warn "Langfuse 端口 $LANGFUSE_PORT 已被占用 (使用 --force-langfuse 强制重启)"
-            return 0
-        fi
-    fi
-
-    # 检查 docker-compose.langfuse.yml 是否存在
-    if [ ! -f "docker-compose.langfuse.yml" ]; then
-        log_warn "docker-compose.langfuse.yml 不存在，跳过 Langfuse 启动"
-        return 0
-    fi
-
-    # 启动 Langfuse 服务
-    log_info "使用 $compose_cmd 启动 Langfuse..."
-    $compose_cmd -f docker-compose.langfuse.yml up -d
-
-    log_info "Langfuse 服务启动中..."
-    sleep 5  # 等待服务初始化
-
-    # 检查服务是否启动
-    if check_port $LANGFUSE_PORT; then
-        log_info "Langfuse 启动成功 (http://localhost:$LANGFUSE_PORT)"
-    else
-        log_warn "Langfuse 启动可能需要更长时间，请稍后访问 http://localhost:$LANGFUSE_PORT"
-    fi
+health_ok() {
+    local url="$1"
+    curl --noproxy '*' --fail --silent --show-error --max-time 2 "$url" >/dev/null 2>&1
 }
 
-# 启动文档站点 (VitePress)
-start_docs_site() {
-    log_info "启动文档站点..."
-
-    DOCS_SITE_PORT=4173
-
-    # 检查端口
-    if check_port $DOCS_SITE_PORT; then
-        if [ "$FORCE_MODE" = true ]; then
-            force_release_port $DOCS_SITE_PORT || return 1
-        else
-            log_warn "文档站点端口 $DOCS_SITE_PORT 已被占用 (使用 --force 强制重启)"
+wait_for_health() {
+    local name="$1" url="$2" timeout="$3" waited=0
+    while (( waited < timeout )); do
+        if health_ok "$url"; then
             return 0
         fi
-    fi
-
-    # 检查 docs-site 目录是否存在
-    if [ ! -d "docs-site" ]; then
-        log_warn "docs-site 目录不存在，跳过文档站点启动"
-        return 0
-    fi
-
-    cd docs-site
-
-    # 检查依赖
-    if [ ! -d "node_modules" ]; then
-        if [ "$1" == "--skip-deps" ]; then
-            log_warn "docs-site node_modules 不存在且指定了 --skip-deps，跳过文档站点启动"
-            cd ..
-            return 0
+        if ! managed_running "$name"; then
+            fail "$name exited before becoming healthy; see .runtime/logs/$name.log"
+            return 1
         fi
-        log_info "安装文档站点依赖..."
-        npm install --silent
-    fi
-
-    # 构建检查
-    if [ ! -d ".vitepress/dist" ]; then
-        log_info "构建文档站点..."
-        npm run build
-    fi
-
-    # 启动文档站点
-    nohup npm run preview -- --port $DOCS_SITE_PORT > ../docs-site.log 2>&1 &
-    echo $! > ../docs-site.pid
-    log_info "文档站点 PID: $(cat ../docs-site.pid)"
-
-    cd ..
-
-    # 等待启动
-    if wait_for_service $DOCS_SITE_PORT "文档站点"; then
-        log_info "文档站点启动成功 (http://localhost:$DOCS_SITE_PORT)"
-    else
-        log_warn "文档站点启动超时，请检查 docs-site.log"
-    fi
-}
-
-# 清除前端缓存
-clear_frontend_cache() {
-    if [ -d "frontend/.next" ]; then
-        log_info "清除前端缓存 (frontend/.next)..."
-        rm -rf frontend/.next
-    fi
-}
-
-# 启动前端
-start_frontend() {
-    log_info "启动前端服务..."
-
-    cd frontend
-
-    # 检查依赖
-    if [ ! -d "node_modules" ]; then
-        if [ "$1" == "--skip-deps" ]; then
-            log_error "node_modules 不存在且指定了 --skip-deps，请手动运行: cd frontend && npm install"
-            exit 1
-        fi
-        log_info "安装前端依赖..."
-        npm install --silent
-    fi
-
-    # 检查端口
-    if check_port $FRONTEND_PORT; then
-        if [ "$FORCE_MODE" = true ]; then
-            force_release_port $FRONTEND_PORT || { cd ..; return 1; }
-        else
-            log_warn "前端端口 $FRONTEND_PORT 已被占用 (使用 --force 强制重启)"
-            cd ..
-            return 0
-        fi
-    fi
-
-    # 启动前端
-    nohup npm run dev > ../frontend.log 2>&1 &
-    echo $! > ../frontend.pid
-    log_info "前端 PID: $(cat ../frontend.pid)"
-
-    cd ..
-
-    # 等待启动（前端需要等待 Next.js 构建完成）
-    if wait_for_service $FRONTEND_PORT "前端" "frontend/.next/server/pages-manifest.json"; then
-        log_info "前端启动成功 (http://localhost:$FRONTEND_PORT)"
-    else
-        log_error "前端启动超时，请检查 frontend.log"
-        exit 1
-    fi
-}
-
-# 主流程
-main() {
-    # 解析参数
-    SKIP_DEPS=false
-    for arg in "$@"; do
-        case $arg in
-            --skip-deps) SKIP_DEPS=true ;;
-            --force) FORCE_MODE=true ;;
-            --force-langfuse) FORCE_LANGFUSE=true ;;
-        esac
+        sleep 1
+        ((waited += 1))
     done
-
-    echo ""
-    echo "========================================"
-    echo "   Agent Builder 系统启动"
-    if [ "$FORCE_MODE" = true ] || [ "$FORCE_LANGFUSE" = true ]; then
-        echo "   [强制模式: --force=$FORCE_MODE, --force-langfuse=$FORCE_LANGFUSE]"
-    fi
-    echo "========================================"
-    echo ""
-
-    start_langfuse
-    echo ""
-    start_backend
-    echo ""
-    if [ "$SKIP_DEPS" = true ]; then
-        start_docs_site --skip-deps
-    else
-        start_docs_site
-    fi
-    echo ""
-    clear_frontend_cache
-    echo ""
-    if [ "$SKIP_DEPS" = true ]; then
-        start_frontend --skip-deps
-    else
-        start_frontend
-    fi
-
-    echo ""
-    echo "========================================"
-    log_info "系统启动完成!"
-    echo ""
-    echo "  前端: http://localhost:$FRONTEND_PORT"
-    echo "  后端: http://localhost:$BACKEND_PORT"
-    echo "  文档站点: http://localhost:4173"
-    echo "  Langfuse (可观测性): http://localhost:3000"
-    echo ""
-    echo "  停止服务: ./stop.sh"
-    echo "  查看日志: tail -f backend.log | frontend.log | docs-site.log"
-    echo "========================================"
+    fail "$name did not become healthy within ${timeout}s; see .runtime/logs/$name.log"
 }
 
-main "$@"
+check_observability_storage() {
+    local total=0 file size threshold="$OBSERVABILITY_STORAGE_WARN_BYTES"
+    local maximum="$OBSERVABILITY_STORAGE_MAX_BYTES"
+    [[ "$threshold" =~ ^[0-9]+$ ]] || fail "OBSERVABILITY_STORAGE_WARN_BYTES must be an integer"
+    [[ "$maximum" =~ ^[0-9]+$ && "$maximum" -gt 0 ]] || fail "OBSERVABILITY_STORAGE_MAX_BYTES must be a positive integer"
+    if [[ -n "$(find "$PHOENIX_WORKING_DIR" -type l -print -quit 2>/dev/null)" ]]; then
+        fail "Phoenix storage contains a symlink; refusing an unsafe working directory"
+        return 1
+    fi
+    while IFS= read -r -d '' file; do
+        size="$(wc -c < "$file")"
+        total=$((total + size))
+    done < <(find "$PHOENIX_WORKING_DIR" -type f -print0 2>/dev/null)
+    if ((total >= threshold)); then
+        log "WARNING: Phoenix storage is ${total} bytes (threshold ${threshold}); run ./purge.sh observability when retention data is no longer needed"
+    fi
+    if ((total >= maximum)); then
+        fail "Phoenix storage is ${total} bytes, at or above the hard startup limit ${maximum}; run ./purge.sh observability --yes"
+    fi
+}
+
+stop_started_service() {
+    local name="$1" file pid pgid i
+    file="$(pid_file "$name")"
+    if ! managed_running "$name"; then
+        rm -f -- "$file"
+        return 0
+    fi
+    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
+    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    for ((i = 0; i < 30; i++)); do
+        kill -0 -- "-$pgid" 2>/dev/null || break
+        sleep 0.2
+    done
+    if kill -0 -- "-$pgid" 2>/dev/null; then
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+        for ((i = 0; i < 25; i++)); do
+            kill -0 -- "-$pgid" 2>/dev/null || break
+            sleep 0.2
+        done
+    fi
+    wait "$pid" 2>/dev/null || true
+    if kill -0 -- "-$pgid" 2>/dev/null; then
+        log "WARNING: rollback could not stop $name process group $pgid; retaining its PID record"
+        return 1
+    fi
+    rm -f -- "$file"
+}
+
+rollback() {
+    local status="$1" index attempt
+    [[ "$ROLLING_BACK" == false ]] || exit "$status"
+    ROLLING_BACK=true
+    trap - ERR INT TERM
+    if [[ "$STARTING_PID" =~ ^[0-9]+$ ]]; then
+        if [[ ! "$STARTING_PGID" =~ ^[0-9]+$ ]]; then
+            STARTING_PGID="$(ps -o pgid= -p "$STARTING_PID" 2>/dev/null | tr -d '[:space:]')"
+        fi
+        if [[ "$STARTING_PGID" =~ ^[0-9]+$ && "$STARTING_PGID" == "$STARTING_PID" ]]; then
+            kill -TERM -- "-$STARTING_PGID" 2>/dev/null || true
+            for ((attempt = 0; attempt < 30; attempt++)); do
+                kill -0 -- "-$STARTING_PGID" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 -- "-$STARTING_PGID" 2>/dev/null; then
+                kill -KILL -- "-$STARTING_PGID" 2>/dev/null || true
+            fi
+        else
+            kill -TERM "$STARTING_PID" 2>/dev/null || true
+            for ((attempt = 0; attempt < 30; attempt++)); do
+                kill -0 "$STARTING_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$STARTING_PID" 2>/dev/null; then
+                kill -KILL "$STARTING_PID" 2>/dev/null || true
+            fi
+        fi
+        wait "$STARTING_PID" 2>/dev/null || true
+        STARTING_PID=""
+        STARTING_PGID=""
+    fi
+    if ((${#STARTED_SERVICES[@]} > 0)); then
+        log "startup failed; rolling back managed services"
+        for ((index=${#STARTED_SERVICES[@]} - 1; index >= 0; index--)); do
+            stop_started_service "${STARTED_SERVICES[$index]}" || true
+        done
+    fi
+    exit "$status"
+}
+trap 'rollback $?' ERR
+trap 'rollback 130' INT TERM
+
+start_managed() {
+    local name="$1" host="$2" port="$3" health_url="$4" timeout="$5"
+    shift 5
+    local file pid pgid marker log_file temporary_file
+    file="$(pid_file "$name")"
+    log_file="$AGENT_BUILDER_RUNTIME_DIR/logs/$name.log"
+
+    if managed_running "$name"; then
+        health_ok "$health_url" || fail "$name is running but unhealthy"
+        log "$name is already running"
+        return 0
+    fi
+    rm -f -- "$file"
+    if tcp_open "$host" "$port"; then
+        fail "port $host:$port is occupied by a process not managed by this checkout"
+        return 1
+    fi
+
+    "$ROOT/.venv/bin/python" "$ROOT/scripts/run_with_rotating_log.py" \
+        --new-session --clean-env "$log_file" -- "$@" </dev/null >/dev/null 2>&1 &
+    pid=$!
+    STARTING_PID="$pid"
+    sleep 0.2
+    kill -0 "$pid" 2>/dev/null || fail "$name failed to launch; see $log_file"
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    STARTING_PGID="$pgid"
+    marker="$(process_marker "$pid")"
+    [[ "$pgid" == "$pid" && -n "$marker" ]] || {
+        kill -TERM "$pid" 2>/dev/null || true
+        fail "$name did not enter its own process group"
+    }
+    temporary_file="${file}.new.$$"
+    rm -f -- "$temporary_file"
+    {
+        printf 'pid=%s\n' "$pid"
+        printf 'pgid=%s\n' "$pgid"
+        printf 'marker=%s\n' "$marker"
+        printf 'root=%s\n' "$ROOT"
+    } > "$temporary_file"
+    chmod 0600 "$temporary_file"
+    mv -f -- "$temporary_file" "$file"
+    STARTED_SERVICES+=("$name")
+    STARTING_PID=""
+    STARTING_PGID=""
+    wait_for_health "$name" "$health_url" "$timeout"
+    log "$name is healthy (pid $pid)"
+}
+
+if [[ "$SKIP_BOOTSTRAP" == false ]]; then
+    "$ROOT/bootstrap.sh"
+fi
+# bootstrap may have generated the token after this script's first source.
+source "$ROOT/env.sh"
+[[ -x "$ROOT/.venv/bin/python" ]] || fail ".venv is missing; run ./bootstrap.sh"
+[[ -s "$AGENT_BUILDER_TOKEN_FILE" ]] || fail "local API token is missing; run ./bootstrap.sh"
+API_TOKEN="$(<"$AGENT_BUILDER_TOKEN_FILE")"
+[[ ${#API_TOKEN} -ge 32 ]] || fail "local API token is invalid; run ./purge.sh dependencies --yes and bootstrap again"
+
+# Complete preflight before creating the first long-running process.
+command -v curl >/dev/null 2>&1 || fail "curl is required for health checks"
+for managed_path in \
+    "$ROOT/frontend/node_modules" "$ROOT/frontend/.next" \
+    "$ROOT/docs-site/node_modules" "$ROOT/docs-site/.vitepress/dist"; do
+    agent_builder_reject_symlink_path "$managed_path" \
+        || fail "managed dependency/build path contains a symlink"
+done
+unset managed_path
+[[ -x "$ROOT/frontend/node_modules/.bin/next" ]] || fail "frontend dependencies are missing"
+[[ -f "$ROOT/frontend/.next/BUILD_ID" ]] || fail "production frontend build is missing"
+if [[ "$ENABLE_DOCS" == true ]]; then
+    [[ -x "$ROOT/docs-site/node_modules/.bin/vitepress" ]] || fail "docs dependencies are missing"
+    [[ -f "$ROOT/docs-site/.vitepress/dist/index.html" ]] || fail "docs build is missing"
+fi
+if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
+    [[ -x "$ROOT/.venv/bin/phoenix" ]] || fail "Phoenix CLI is missing from .venv"
+    check_observability_storage
+fi
+
+if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
+    export OBSERVABILITY_ENABLED=true
+    export OBSERVABILITY_BACKEND=otlp
+    start_managed phoenix "$PHOENIX_HOST" "$PHOENIX_PORT" \
+        "http://${PHOENIX_HOST}:${PHOENIX_PORT}/healthz" 120 \
+        "$ROOT/.venv/bin/phoenix" serve
+else
+    export OBSERVABILITY_ENABLED=false
+    export OBSERVABILITY_BACKEND=noop
+    if managed_running phoenix; then
+        fail "Phoenix is already running; stop the existing stack before using --no-observability"
+    fi
+    log "observability explicitly disabled"
+fi
+
+start_managed backend "$BACKEND_HOST" "$BACKEND_PORT" \
+    "http://${BACKEND_HOST}:${BACKEND_PORT}/health" 180 \
+    "$ROOT/start_backend.sh"
+
+start_managed frontend "$FRONTEND_HOST" "$FRONTEND_PORT" \
+    "http://${FRONTEND_HOST}:${FRONTEND_PORT}/" 120 \
+    "$ROOT/scripts/start_frontend.sh"
+
+if [[ "$ENABLE_DOCS" == true ]]; then
+    start_managed docs "$DOCS_HOST" "$DOCS_PORT" \
+        "http://${DOCS_HOST}:${DOCS_PORT}/docs/" 60 \
+        "$ROOT/docs-site/node_modules/.bin/vitepress" preview "$ROOT/docs-site" \
+        --host "$DOCS_HOST" --port "$DOCS_PORT"
+fi
+
+trap - ERR INT TERM
+printf '\nAgent Builder started successfully:\n'
+printf '  frontend:      http://%s:%s\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
+printf '  backend:       http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
+if [[ "$ENABLE_DOCS" == true ]]; then
+    printf '  documentation: http://%s:%s/docs/\n' "$DOCS_HOST" "$DOCS_PORT"
+fi
+if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
+    printf '  observability: http://%s:%s\n' "$PHOENIX_HOST" "$PHOENIX_PORT"
+fi
+printf '  logs:          %s/logs\n' "$AGENT_BUILDER_RUNTIME_DIR"

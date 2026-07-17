@@ -1,9 +1,9 @@
 ---
-title: 环境状态横幅
+title: "环境状态横幅"
 category: reference
 component: EnvironmentBanner
-related:
-
+generated: true
+related: []
 ---
 # 环境状态横幅
 

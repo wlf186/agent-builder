@@ -1,7 +1,8 @@
 ---
-title: Initialization Guide Card
+title: "Initialization Guide Card"
 category: core
 component: InitializationGuideCard
+generated: true
 related:
   - EnvironmentBanner
 ---

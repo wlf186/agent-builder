@@ -1,7 +1,8 @@
 ---
-title: 聊天界面
+title: "聊天界面"
 category: core
 component: AgentChat
+generated: true
 related:
   - KnowledgeBaseSelector
   - FileUploader

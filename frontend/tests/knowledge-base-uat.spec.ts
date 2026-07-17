@@ -11,10 +11,11 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:20880';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:20815';
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:20881';
-const SCREENSHOT_DIR = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603161918/screenshots';
+const SCREENSHOT_DIR = testOutputDir('knowledge-base-uat');
 
 // 辅助函数：保存截图
 async function saveScreenshot(page: Page, name: string) {

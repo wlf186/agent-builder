@@ -27,8 +27,9 @@
  * ============================================================================
  */
 import { NextRequest } from 'next/server';
+import { rejectUntrustedFrontendRequest } from '@/lib/serverOrigin';
 
-const BACKEND_URL = 'http://localhost:20881';
+const BACKEND_URL = process.env.AGENT_BUILDER_BACKEND_URL || 'http://127.0.0.1:20881';
 
 // 【关键】使用 nodejs 运行时，确保流式响应能正确处理
 export const runtime = 'nodejs';
@@ -39,32 +40,55 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ name: string }> }
 ) {
-  const { name } = await params;
-  const body = await request.json();
+  const originRejection = rejectUntrustedFrontendRequest(request);
+  if (originRejection) return originRejection;
 
-  console.log(`[STREAM] 请求: ${name}`);
+  const token = process.env.AGENT_BUILDER_API_TOKEN?.trim();
+  if (!token) {
+    return Response.json(
+      { detail: 'Backend API token is not configured' },
+      { status: 503 },
+    );
+  }
+
+  const { name } = await params;
+  const requestId = request.headers.get('x-request-id');
 
   // 转发请求到后端 SSE 端点
-  const res = await fetch(`${BACKEND_URL}/api/agents/${encodeURIComponent(name)}/chat/stream`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    cache: 'no-store',  // 【关键】禁用 fetch 缓存
-  });
+  let res: Response;
+  try {
+    res = await fetch(`${BACKEND_URL}/api/agents/${encodeURIComponent(name)}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': request.headers.get('content-type') || 'application/json',
+        'Authorization': `Bearer ${token}`,
+        ...(requestId ? { 'X-Request-ID': requestId } : {}),
+      },
+      body: request.body,
+      cache: 'no-store',  // 【关键】禁用 fetch 缓存
+      duplex: 'half',
+    } as RequestInit & { duplex: 'half' });
+  } catch {
+    console.error('[stream proxy] backend request failed');
+    return Response.json({ detail: 'Backend unavailable' }, { status: 502 });
+  }
 
   if (!res.ok) {
-    return new Response(JSON.stringify({ error: 'Backend error' }), {
+    return new Response(res.body, {
       status: res.status,
+      headers: { 'Content-Type': res.headers.get('content-type') || 'application/json' },
     });
   }
 
   // 【流式输出核心】直接透传流式响应，不做任何缓冲或处理
   // res.body 是 ReadableStream，直接透传确保流式特性
   return new Response(res.body, {
+    status: res.status,
     headers: {
       'Content-Type': 'text/event-stream',  // 【关键】SSE MIME 类型
       'Cache-Control': 'no-cache, no-store, must-revalidate',  // 【关键】禁用所有缓存
       'X-Accel-Buffering': 'no',  // 【关键】禁用 nginx 缓冲
+      ...(res.headers.get('x-request-id') ? { 'X-Request-ID': res.headers.get('x-request-id')! } : {}),
     },
   });
 }

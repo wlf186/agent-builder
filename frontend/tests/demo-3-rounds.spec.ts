@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
 /**
  * 演示脚本：3 轮对话演示（暂停模式）
@@ -16,10 +17,10 @@ test.use({ headless: false }); // 关键：使用 headed 模式
 test.setTimeout(120000); // 设置超时为 120 秒
 
 test('演示: 3 轮对话（CoinGecko + cold-jokes + Calculator）', async ({ page }) => {
-  const screenshotDir = 'teams/AC130/iterations/iteration-202603151910/demo';
+  const screenshotDir = testOutputDir('demo-3-rounds');
 
   // ========== 初始化 ==========
-  await page.goto('http://localhost:20880');
+  await page.goto('http://localhost:20815');
   await page.waitForLoadState('networkidle');
 
   // 修复 X11 远程投屏渲染问题：触发浏览器重绘

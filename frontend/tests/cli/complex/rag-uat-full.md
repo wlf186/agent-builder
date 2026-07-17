@@ -5,7 +5,7 @@
 > 测试目标: 验证知识库创建/文档上传、智能体挂载知识库、RAG 检索功能、无知识库时不触发检索、前端 UI 元素
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 测试文档路径: `data/knowledge_base/documents/cyberpunk_employee_handbook.txt` 和 `cyberpunk_code_standards.txt`
 
 ---
@@ -13,7 +13,7 @@
 ### 测试用例 步骤1: 检查知识库并上传文档
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到知识库管理按钮（`[data-testid="knowledge-base-button"]` 或包含"知识库"文本的按钮），点击
 3. 等待 500 毫秒
 4. 检查页面上是否存在"人力资源库"文本
@@ -40,7 +40,7 @@
 ### 测试用例 步骤2: 配置行政助手智能体挂载知识库
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到智能体管理按钮（`[data-testid="agents-button"]` 或包含"智能体"文本的按钮），点击
 3. 等待 500 毫秒
 4. snapshot 找到包含"UAT行政助手"文本的卡片（`.agent-card` 或 `[data-testid="agent-card"]`），点击
@@ -60,7 +60,7 @@
 ### 测试用例 步骤3: 测试行政助手 RAG 检索
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到智能体选择器（`[data-testid="agent-selector"]` 或 `.agent-selector`），点击
 3. snapshot 找到"UAT行政助手"文本，点击
 4. 等待 500 毫秒
@@ -81,7 +81,7 @@
 ### 测试用例 步骤4: 测试技术支持不触发RAG
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到智能体选择器（`[data-testid="agent-selector"]` 或 `.agent-selector`），点击
 3. snapshot 找到"UAT技术支持"文本，点击
 4. 等待 500 毫秒
@@ -99,7 +99,7 @@
 ### 测试用例 步骤5: 测试代码规范检索
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到智能体选择器（`[data-testid="agent-selector"]` 或 `.agent-selector`），点击
 3. snapshot 找到"UAT行政助手"文本，点击
 4. 等待 500 毫秒
@@ -116,7 +116,7 @@
 ### 测试用例 前端 RAG 相关 UI 元素验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. snapshot 找到智能体选择器（`[data-testid="agent-selector"]` 或 `.agent-selector`），点击
 3. snapshot 找到"UAT行政助手"文本，点击
 4. 等待 500 毫秒

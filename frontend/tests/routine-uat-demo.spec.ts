@@ -6,10 +6,12 @@
 
 import { test, expect, Page, Locator } from '@playwright/test';
 import * as fs from 'fs';
+import path from 'node:path';
+import { AC130_PDF_FIXTURE, testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const PROJECT_ROOT = '/home/wremote/claude-dev/agent-builder-general';
-const PDF_FILE = `${PROJECT_ROOT}/resources/Thinking Fast and Slow (Daniel Kahneman) (Z-Library).pdf`;
+const BASE_URL = 'http://localhost:20815';
+const OUTPUT_DIR = testOutputDir('routine-uat-demo');
+const PDF_FILE = AC130_PDF_FIXTURE;
 const AGENT_NAME = 'DEMO';
 const QUICK = 5000;   // 普通操作 5s
 const LLM = 60000;    // LLM响应 60s
@@ -21,7 +23,7 @@ function ts(): string {
 }
 
 async function saveBug(page: Page, step: string, err: string): Promise<string> {
-  const dir = `${PROJECT_ROOT}/routine-uat-demo/bugs/${ts()}`;
+  const dir = path.join(OUTPUT_DIR, 'bugs', ts());
   fs.mkdirSync(dir, { recursive: true });
   await page.screenshot({ path: `${dir}/screenshot.png`, fullPage: true });
   fs.writeFileSync(`${dir}/error.txt`, `步骤: ${step}\n错误: ${err}`);
@@ -29,7 +31,7 @@ async function saveBug(page: Page, step: string, err: string): Promise<string> {
 }
 
 async function saveOk(page: Page): Promise<string> {
-  const dir = `${PROJECT_ROOT}/routine-uat-demo/success/${ts()}`;
+  const dir = path.join(OUTPUT_DIR, 'success', ts());
   fs.mkdirSync(dir, { recursive: true });
   await page.screenshot({ path: `${dir}/screenshot.png`, fullPage: true });
   return dir;

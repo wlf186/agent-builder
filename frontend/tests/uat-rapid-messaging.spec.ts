@@ -18,7 +18,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('快速连续消息 UAT', () => {
   test('智能体回复后立即发送第二条消息应该正常显示', async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 选择 test3 智能体
@@ -68,7 +68,7 @@ test.describe('快速连续消息 UAT', () => {
   });
 
   test('发送消息后输入框应该被清空', async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 选择 test3 智能体

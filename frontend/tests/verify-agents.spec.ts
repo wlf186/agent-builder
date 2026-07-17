@@ -1,10 +1,11 @@
 import { test, expect } from '@playwright/test';
+import { testOutputPath } from './test-paths';
 
 test('验证智能体列表 - 只显示已配置模型服务的智能体', async ({ page }) => {
   test.setTimeout(60000);
 
   // 访问主页
-  await page.goto('http://localhost:20880');
+  await page.goto('http://localhost:20815');
   await page.waitForLoadState('networkidle');
 
   // 等待智能体卡片加载
@@ -32,7 +33,7 @@ test('验证智能体列表 - 只显示已配置模型服务的智能体', async
 
   // 截图
   await page.screenshot({
-    path: 'teams/AC130/iterations/AC130-202603151517/uat_screenshots/verify-agents-list.png',
+    path: testOutputPath('verify-agents', 'list.png'),
     fullPage: true
   });
 

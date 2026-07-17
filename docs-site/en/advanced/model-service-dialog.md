@@ -1,7 +1,8 @@
 ---
-title: Model Service Configuration
+title: "Model Service Configuration"
 category: advanced
 component: ModelServiceDialog
+generated: true
 related:
   - AgentChat
 ---
@@ -22,7 +23,7 @@ Configure LLM model services for AI agents. Supports multiple providers includin
 
 ## Tips
 
-- Use environment variables for API keys: {SERVICE_NAME}_API_KEY format is recommended
+- API keys submitted through this password field are stored server-side and are never returned in plaintext
 - Test connection before saving to ensure the service is accessible
 - Ollama does not require an API key for local installations
 

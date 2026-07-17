@@ -2,7 +2,9 @@
 # Manual UAT Verification Script
 # Uses curl and basic API checks instead of Playwright
 
-UAT_DIR="/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/AC130-202603151423"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../../../.." && pwd -P)"
+UAT_DIR="$PROJECT_ROOT/.runtime/test-results/manual-uat-AC130-202603151423"
 SCREENSHOT_DIR="$UAT_DIR/screenshots"
 REPORT_FILE="$UAT_DIR/uat_report.md"
 
@@ -15,7 +17,7 @@ echo "**Tester**: User Rep (AC130)" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"
 
 echo "## Test Environment" >> "$REPORT_FILE"
-echo "- Frontend URL: http://localhost:20880" >> "$REPORT_FILE"
+echo "- Frontend URL: http://localhost:20815" >> "$REPORT_FILE"
 echo "- Backend URL: http://localhost:20881" >> "$REPORT_FILE"
 echo "- Version: v1.0.3 (f6a9a1b)" >> "$REPORT_FILE"
 echo "" >> "$REPORT_FILE"

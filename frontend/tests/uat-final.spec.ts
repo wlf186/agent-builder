@@ -8,9 +8,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import path from 'node:path';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = '../teams/AC130/iterations/AC130-202603151423/screenshots-retry';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('uat-final');
 
 test.describe('UAT 最终验收: 调试日志导出', () => {
 
@@ -133,6 +135,7 @@ test.describe('UAT 最终验收: 调试日志导出', () => {
       // 等待下载
       try {
         const download = await downloadPromise;
+        await download.saveAs(path.join(SCREENSHOT_DIR, path.basename(download.suggestedFilename())));
         console.log(`✅ 日志文件已下载: ${download.suggestedFilename()}`);
 
         // 读取下载内容

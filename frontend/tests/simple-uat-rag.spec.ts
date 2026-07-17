@@ -10,10 +10,11 @@
 import { test, expect } from '@playwright/test';
 import path from 'path';
 import fs from 'fs';
+import { AC130_FIXTURE_DIR, testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/screenshots';
-const TEST_DOC_PATH = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.txt';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('simple-uat-rag');
+const TEST_DOC_PATH = path.join(AC130_FIXTURE_DIR, 'Cyberpunk公司2026员工手册.txt');
 
 // 确保截图目录存在
 if (!fs.existsSync(SCREENSHOT_DIR)) {

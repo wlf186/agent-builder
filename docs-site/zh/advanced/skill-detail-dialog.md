@@ -1,7 +1,8 @@
 ---
-title: 技能详情
+title: "技能详情"
 category: advanced
 component: SkillDetailDialog
+generated: true
 related:
   - SkillUploadDialog
 ---

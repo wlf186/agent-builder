@@ -9,10 +9,14 @@
  */
 
 import { test, expect } from '@playwright/test';
+import path from 'node:path';
+import { AC130_FIXTURE_DIR, testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const SCREENSHOT_DIR = testOutputDir('rag-uat-full');
+
+const BASE_URL = 'http://localhost:20815';
 const KB_NAME = '人力资源库';
-const DOC_NAMES = ['cyberpunk_employee_handbook.txt', 'cyberpunk_code_standards.txt'];
+const DOC_NAMES = ['Cyberpunk公司2026员工手册.txt', 'Cyberpunk公司代码规范.txt'];
 
 test.describe('RAG 知识库验收测试', () => {
   test.beforeEach(async ({ page }) => {
@@ -53,8 +57,8 @@ test.describe('RAG 知识库验收测试', () => {
 
     // 上传测试文档
     const fileInput = page.locator('input[type="file"]');
-    const docPath1 = `/home/wremote/claude-dev/agent-builder-general/data/knowledge_base/documents/${DOC_NAMES[0]}`;
-    const docPath2 = `/home/wremote/claude-dev/agent-builder-general/data/knowledge_base/documents/${DOC_NAMES[1]}`;
+    const docPath1 = path.join(AC130_FIXTURE_DIR, DOC_NAMES[0]);
+    const docPath2 = path.join(AC130_FIXTURE_DIR, DOC_NAMES[1]);
 
     await fileInput.setInputFiles([docPath1, docPath2]);
     await page.waitForTimeout(2000);
@@ -132,8 +136,8 @@ test.describe('RAG 知识库验收测试', () => {
     console.log(`显示引用来源: ${hasCitation ? '是' : '否'}`);
 
     // 截图
-    await page.screenshot({ path: 'test-results/uat-admin-assistant-rag.png' });
-    console.log('✓ 截图已保存: test-results/uat-admin-assistant-rag.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uat-admin-assistant-rag.png` });
+    console.log(`✓ 截图已保存: ${SCREENSHOT_DIR}/uat-admin-assistant-rag.png`);
 
     expect(hasAnswer, '行政助手应回答年假信息').toBeTruthy();
   });
@@ -168,8 +172,8 @@ test.describe('RAG 知识库验收测试', () => {
     console.log(`技术支持表示不知道: ${saysDontKnow ? '是' : '否'}`);
 
     // 截图
-    await page.screenshot({ path: 'test-results/uat-tech-support-no-rag.png' });
-    console.log('✓ 截图已保存: test-results/uat-tech-support-no-rag.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uat-tech-support-no-rag.png` });
+    console.log(`✓ 截图已保存: ${SCREENSHOT_DIR}/uat-tech-support-no-rag.png`);
 
     expect(!hasRetrievalMsg, '技术支持不应显示RAG检索提示').toBeTruthy();
   });
@@ -198,8 +202,8 @@ test.describe('RAG 知识库验收测试', () => {
     console.log(`回答包含命名规范信息: ${hasAnswer ? '是' : '否'}`);
 
     // 截图
-    await page.screenshot({ path: 'test-results/uat-code-standards-rag.png' });
-    console.log('✓ 截图已保存: test-results/uat-code-standards-rag.png');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/uat-code-standards-rag.png` });
+    console.log(`✓ 截图已保存: ${SCREENSHOT_DIR}/uat-code-standards-rag.png`);
 
     expect(hasAnswer, '应能检索到代码规范信息').toBeTruthy();
   });
@@ -247,7 +251,7 @@ test.describe('RAG 前端显示验证', () => {
 
     // 最终截图
     await page.screenshot({
-      path: 'test-results/uat-frontend-ui-check.png',
+      path: `${SCREENSHOT_DIR}/uat-frontend-ui-check.png`,
       fullPage: true
     });
     console.log('✓ 完整页面截图已保存');

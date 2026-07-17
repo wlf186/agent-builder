@@ -41,6 +41,15 @@ function validateUserGuide(source: string, componentName: string): ValidationRes
     }
   }
 
+  const requiredValues = ['title.en', 'title.zh', 'description.en', 'description.zh'];
+  for (const tag of requiredValues) {
+    const valueMatch = block.match(new RegExp(`@${tag}\\s+(.+?)(?=@\\w+|\\*\\/)`, 's'));
+    const value = valueMatch?.[1].replace(/\s*\*\s*/g, ' ').trim() || '';
+    if (hasTag(tag) && !value) {
+      errors.push(`Empty required tag: @${tag}`);
+    }
+  }
+
   // Validate category value
   const categoryMatch = block.match(/@category\s+(core|advanced|reference)/);
   if (!categoryMatch) {
@@ -73,7 +82,7 @@ function validateUserGuide(source: string, componentName: string): ValidationRes
 async function validateAllUserGuides() {
   const componentsDir = path.resolve(__dirname, '../frontend/src/components');
 
-  const files = await glob('**/*.tsx', { cwd: componentsDir });
+  const files = (await glob('**/*.tsx', { cwd: componentsDir })).sort();
   console.log(`Validating ${files.length} component files...\n`);
 
   const results: ValidationResult[] = [];
@@ -107,4 +116,7 @@ async function validateAllUserGuides() {
   }
 }
 
-validateAllUserGuides().catch(console.error);
+validateAllUserGuides().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});

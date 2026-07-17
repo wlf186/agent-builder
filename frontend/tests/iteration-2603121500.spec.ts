@@ -13,8 +13,13 @@
  */
 
 import { test, expect } from '@playwright/test';
+import fs from 'node:fs';
+import { AC130_PDF_FIXTURE, testOutputDir, testOutputPath } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const SCREENSHOT_DIR = testOutputDir('iteration-2603121500');
+const MINIMAL_DOCX_BASE64 = 'UEsDBBQAAAAIAK2F8Fx5bjPX6AAAAK0BAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbH1QyU7DMBD9FWuuKHHggBCK0wPLETiUDxjZk8SqN3nc0v49Tlt6QIXjzFv1+tXeO7GjzDYGBbdtB4KCjsaGScHn+rV5AMEFg0EXAyk4EMNq6NeHRCyqNrCCuZT0KCXrmTxyGxOFiowxeyz1zJNMqDc4kbzrunupYygUSlMWDxj6Zxpx64p42df3qUcmxyCeTsQlSwGm5KzGUnG5C+ZXSnNOaKvyyOHZJr6pBJBXExbk74Cz7r0Ok60h8YG5vKGvLPkVs5Em6q2vyvZ/mys94zhaTRf94pZy1MRcF/euvSAebfjpL49zD99QSwMEFAAAAAgArYXwXJv9N+qtAAAAKQEAAAsAAABfcmVscy8ucmVsc43POw7CMAwG4KtE3mlaBoRQ0y4IqSsqB7ASN61oHkrCo7cnAwNFDIy2f3+W6/ZpZnanECdnBVRFCYysdGqyWsClP232wGJCq3B2lgQsFKFt6jPNmPJKHCcfWTZsFDCm5A+cRzmSwVg4TzZPBhcMplwGzT3KK2ri27Lc8fBpwNpknRIQOlUB6xdP/9huGCZJRydvhmz6ceIrkWUMmpKAhwuKq3e7yCzwpuarF5sXUEsDBBQAAAAIAK2F8FyjjN/6uAAAAPUAAAARAAAAd29yZC9kb2N1bWVudC54bWxFjrluwzAMQH9F0F7LzRAUhu0gB7q2Qwt0VSTGESKRBinXyd/Xcocsj+D1yHZ3T1H9Aksg7PRrVWsF6MgHHDr9/fX+8qaVZIveRkLo9ANE7/p2bjy5KQFmtQhQmrnT15zHxhhxV0hWKhoBl96FONm8pDyYmdiPTA5EFn+KZlPXW5NsQF2UZ/KPEscCLsj9fig3DlOIHlidPo4/Sm4hRnUJ9zwxVK0pY4W8cl0WcPmTzVr4t5rnx/0fUEsBAhQDFAAAAAgArYXwXHluM9foAAAArQEAABMAAAAAAAAAAAAAAIABAAAAAFtDb250ZW50X1R5cGVzXS54bWxQSwECFAMUAAAACACthfBcm/036q0AAAApAQAACwAAAAAAAAAAAAAAgAEZAQAAX3JlbHMvLnJlbHNQSwECFAMUAAAACACthfBco4zf+rgAAAD1AAAAEQAAAAAAAAAAAAAAgAHvAQAAd29yZC9kb2N1bWVudC54bWxQSwUGAAAAAAMAAwC5AAAA1gIAAAAA';
+
+const BASE_URL = 'http://localhost:20815';
 const AGENT_PDF = 'skill-test-pdf';
 const AGENT_DOCX = 'skill-test-doc';
 const AGENT_DOC = 'test001'; // 备用智能体，配置了ab-docx技能
@@ -64,7 +69,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
 
     // 2. 上传PDF文件
     const fileInput = page.locator('input[type="file"]').first();
-    const filePath = '/work/agent-builder-general/test/测试1.pdf';
+    const filePath = AC130_PDF_FIXTURE;
     await fileInput.setInputFiles(filePath);
     await page.waitForTimeout(1000);
 
@@ -100,7 +105,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
       console.log(`找到 ${skillLabels.length} 个PDF skill相关标签`);
 
       // 截图保存
-      await page.screenshot({ path: 'test-results/tc001-pdf-skill-states.png' });
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/tc001-pdf-skill-states.png` });
 
       // 断言: PDF相关标签不应过多（正常应该是1-2个）
       expect(skillLabels.length).toBeLessThanOrEqual(3);
@@ -121,7 +126,8 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
 
     // 2. 上传DOCX文件
     const fileInput = page.locator('input[type="file"]').first();
-    const filePath = '/work/agent-builder-general/test/测试2.docx';
+    const filePath = testOutputPath('iteration-2603121500', '测试2.docx');
+    fs.writeFileSync(filePath, Buffer.from(MINIMAL_DOCX_BASE64, 'base64'));
     await fileInput.setInputFiles(filePath);
     await page.waitForTimeout(1000);
 
@@ -145,7 +151,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
       const skillLabels = await page.locator('text=ab-docx').or(page.locator('text=docx')).all();
       console.log(`找到 ${skillLabels.length} 个DOCX skill相关标签`);
 
-      await page.screenshot({ path: 'test-results/tc002-docx-skill-states.png' });
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/tc002-docx-skill-states.png` });
 
       expect(skillLabels.length).toBeLessThanOrEqual(3);
     }
@@ -181,7 +187,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
     const firstTokenLatency = firstTokenTime - startTime;
     console.log(`首字延迟: ${firstTokenLatency}ms`);
 
-    await page.screenshot({ path: 'test-results/tc004-streaming-output.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc004-streaming-output.png` });
 
     // 验证有响应（通过检查页面文本内容）
     const pageText = await page.textContent('body');
@@ -216,13 +222,13 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
       await toggleButton.click();
       await page.waitForTimeout(500);
 
-      await page.screenshot({ path: 'test-results/tc005-thinking-collapsed.png' });
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/tc005-thinking-collapsed.png` });
 
       // 点击展开
       await toggleButton.click();
       await page.waitForTimeout(500);
 
-      await page.screenshot({ path: 'test-results/tc005-thinking-expanded.png' });
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/tc005-thinking-expanded.png` });
 
       console.log('思考区域展开/收起功能正常');
     }
@@ -241,7 +247,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
 
     // 上传文件并发送消息
     const fileInput = page.locator('input[type="file"]').first();
-    await fileInput.setInputFiles('/work/agent-builder-general/test/测试1.pdf');
+    await fileInput.setInputFiles(AC130_PDF_FIXTURE);
     await page.waitForTimeout(1000);
 
     const messageBox = page.locator('textarea').first();
@@ -252,7 +258,7 @@ test.describe('Iteration 2603121500: Skill执行状态显示修复', () => {
     await page.waitForTimeout(12000);
 
     // 截图
-    await page.screenshot({ path: 'test-results/tc006-core-verification.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc006-core-verification.png`, fullPage: true });
 
     // 检查页面上的所有skill状态容器
     const skillContainers = page.locator('[class*="border"], [class*="skill"]').or(

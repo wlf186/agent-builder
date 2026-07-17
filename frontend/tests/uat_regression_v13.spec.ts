@@ -10,9 +10,12 @@
  */
 
 import { test, expect } from '@playwright/test';
+import path from 'node:path';
+import { PROJECT_ROOT, testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const AGENT_NAME = 'test001'; // UAT专用智能体
+const SCREENSHOT_DIR = testOutputDir('uat-regression-v13');
 
 test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
   test.beforeEach(async ({ page }) => {
@@ -20,7 +23,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
     await page.waitForLoadState('networkidle');
     // 首页加载截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/01-homepage.png',
+      path: `${SCREENSHOT_DIR}/01-homepage.png`,
       fullPage: true
     });
   });
@@ -32,17 +35,17 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 2. 进入调试对话页面截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/02-chat-page-before.png',
+      path: `${SCREENSHOT_DIR}/02-chat-page-before.png`,
       fullPage: true
     });
 
     // 3. 输入测试消息触发 PDF skill
-    const testMessage = '请使用 pdf 技能读取 /home/wremote/claude-dev/agent-builder-general/README.md 文件';
+    const testMessage = `请使用 pdf 技能读取 ${path.join(PROJECT_ROOT, 'README.md')} 文件`;
     await page.fill('textarea[placeholder*="输入消息"]', testMessage);
 
     // 4. 截图：输入后
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/03-message-input.png',
+      path: `${SCREENSHOT_DIR}/03-message-input.png`,
       fullPage: true
     });
 
@@ -54,7 +57,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 7. 技能执行完成后的截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/04-skill-execution-complete.png',
+      path: `${SCREENSHOT_DIR}/04-skill-execution-complete.png`,
       fullPage: true
     });
 
@@ -67,7 +70,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 9. 最终完整对话截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/05-tc005-final.png',
+      path: `${SCREENSHOT_DIR}/05-tc005-final.png`,
       fullPage: true
     });
   });
@@ -83,7 +86,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 3. 截图：输入后
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/06-tc004-input.png',
+      path: `${SCREENSHOT_DIR}/06-tc004-input.png`,
       fullPage: true
     });
 
@@ -95,7 +98,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 6. 多轮工具调用完成后的截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/07-tc004-response.png',
+      path: `${SCREENSHOT_DIR}/07-tc004-response.png`,
       fullPage: true
     });
 
@@ -108,7 +111,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 8. 最终截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/08-tc004-final.png',
+      path: `${SCREENSHOT_DIR}/08-tc004-final.png`,
       fullPage: true
     });
   });
@@ -128,7 +131,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
     // 4. 截图：发送后立即捕获
     await page.waitForTimeout(2000);
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/09-streaming-during.png',
+      path: `${SCREENSHOT_DIR}/09-streaming-during.png`,
       fullPage: true
     });
 
@@ -137,7 +140,7 @@ test.describe('UAT Regression Test - v1.3 Bug Fixes', () => {
 
     // 6. 最终截图
     await page.screenshot({
-      path: '../teams/AC130/iterations/AC130-202603151423/screenshots/10-streaming-final.png',
+      path: `${SCREENSHOT_DIR}/10-streaming-final.png`,
       fullPage: true
     });
 

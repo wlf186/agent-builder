@@ -4,7 +4,7 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 后端服务运行在 localhost:20881
 
 ---
@@ -12,7 +12,7 @@
 ### 测试用例 1: UAT-001 - 首页加载验证
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 
 ## 验证
@@ -25,7 +25,7 @@
 ### 测试用例 2: UAT-002 - 查找智能体卡片
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 等待 2 秒
 
@@ -38,7 +38,7 @@
 ### 测试用例 3: UAT-003 - 检查 X-Request-ID 功能
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 等待 1 秒
 
@@ -66,7 +66,7 @@
 ### 测试用例 5: UAT-005 - 检查 DebugLogger 文件存在
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 
 ## 验证
 - 页面加载了至少 1 个 script 标签

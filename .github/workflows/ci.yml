@@ -1,0 +1,109 @@
+name: Code Validation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '41 4 * * 1'
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: code-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Validate lifecycle shell syntax
+        run: bash -n bootstrap.sh env.sh start.sh stop.sh purge.sh start_backend.sh
+      - name: Bootstrap project-local Python
+        run: ./bootstrap.sh --skip-node --no-build
+      - name: Run backend tests
+        run: |
+          source ./env.sh
+          ./.venv/bin/python -m pytest
+      - name: Audit Python dependencies
+        run: |
+          source ./env.sh
+          ./.tools/uv tool run --from pip-audit==2.10.1 pip-audit \
+            --path .venv/lib/python3.11/site-packages \
+            --progress-spinner off
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install frontend dependencies
+        run: npm --prefix frontend ci
+      - name: Audit frontend dependencies
+        run: npm --prefix frontend audit --audit-level=low
+      - name: Lint frontend
+        run: npm --prefix frontend run lint
+      - name: Build frontend
+        run: npm --prefix frontend run build
+
+  clean-clone-smoke:
+    needs: [backend, frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          clean: true
+          persist-credentials: false
+      - name: Assert cold checkout
+        run: |
+          test ! -e .tools
+          test ! -e .venv
+          test ! -e .runtime
+          test ! -e node_modules
+          test ! -e frontend/node_modules
+          test ! -e docs-site/node_modules
+          test ! -e frontend/.next
+          test ! -e docs-site/.vitepress/dist
+      - name: Bootstrap, start, verify, and stop the complete stack
+        run: |
+          set -Eeuo pipefail
+          cleanup() {
+            status=$?
+            trap - EXIT
+            if ! ./stop.sh --force; then
+              echo "::error::Failed to stop every checkout-managed service"
+              exit 1
+            fi
+            exit "$status"
+          }
+          trap cleanup EXIT
+          ./bootstrap.sh
+          ./start.sh --skip-bootstrap
+          ./.venv/bin/python scripts/clean_clone_smoke.py running
+          ./stop.sh
+          ./.venv/bin/python scripts/clean_clone_smoke.py stopped
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          trap - EXIT
+      - name: Ensure cleanup
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          ./stop.sh --force
+          if [[ -x .venv/bin/python && -s .runtime/secrets/api-token ]]; then
+            source ./env.sh
+            ./.venv/bin/python scripts/clean_clone_smoke.py stopped
+          fi

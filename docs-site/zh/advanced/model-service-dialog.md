@@ -1,7 +1,8 @@
 ---
-title: 模型服务配置
+title: "模型服务配置"
 category: advanced
 component: ModelServiceDialog
+generated: true
 related:
   - AgentChat
 ---
@@ -22,7 +23,7 @@ related:
 
 ## 提示
 
-- 推荐使用环境变量存储 API Key：格式为 {SERVICE_NAME}_API_KEY
+- 通过密码输入框提交的 API Key 仅保存在服务端，后续不会以明文返回
 - 保存前先测试连接以确保服务可访问
 - 本地 Ollama 不需要 API Key
 

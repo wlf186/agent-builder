@@ -14,7 +14,7 @@
  *   - 点击重试按钮可以重新尝试环境初始化
  *   - 初始化期间（10-30秒）技能功能暂时不可用
  */
-import { Loader2, AlertCircle, RefreshCw, CheckCircle } from 'lucide-react';
+import { Loader2, AlertCircle, RefreshCw } from 'lucide-react';
 import { useEnvironmentStatus } from '@/hooks/useEnvironmentStatus';
 import { cn } from '@/lib/utils';
 

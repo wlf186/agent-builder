@@ -1,9 +1,9 @@
 ---
-title: 子智能体调用卡片
+title: "子智能体调用卡片"
 category: reference
 component: SubAgentCallCard
-related:
-
+generated: true
+related: []
 ---
 # 子智能体调用卡片
 

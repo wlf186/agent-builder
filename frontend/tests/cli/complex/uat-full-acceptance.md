@@ -4,7 +4,7 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 存在 "调试" 按钮可进入调试对话界面
 
 ## 步骤
@@ -13,7 +13,7 @@
 
 > 验收标准: 请求发送时的 X-Request-ID 与响应返回的 X-Request-ID 一致
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/uat-full-acceptance-01-home.png
 3. 在后续操作中注意观察：每个 API 请求的 X-Request-ID 头与对应响应的 X-Request-ID 头是否匹配
 4. snapshot 找到 "调试" 按钮，点击进入调试对话
@@ -33,7 +33,7 @@
 
 > 验收标准: [Request] 包含用户输入和 Agent 名称；[Execution] 包含 SSE chunks 和 tool calls；[Response] 包含模型输出
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "调试" 按钮，点击进入调试对话
 3. 等待 2 秒
 4. 在后续操作中注意观察：检测到 text/event-stream 类型的响应时记录 SSE 事件
@@ -53,7 +53,7 @@
 
 > 验收标准: 点击"下载调试日志"按钮，导出 JSON 格式文件，敏感信息已脱敏
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "调试" 按钮，点击进入调试对话
 3. 等待 2 秒
 4. snapshot 找到 textarea 输入框，输入 "请介绍一下这个平台的功能"
@@ -78,7 +78,7 @@
 
 > 验收标准: 打字机效果正常，思考过程实时显示，工具调用正确展示
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. snapshot 找到 "调试" 按钮，点击进入调试对话
 3. 等待 2 秒
 4. snapshot 找到 textarea 输入框，输入 "请详细介绍人工智能的发展历史，包括图灵测试、专家系统、深度学习等关键里程碑"
@@ -97,7 +97,7 @@
 
 > 验收标准: 端到端流程正常
 
-1. 打开 http://localhost:20880，等待页面加载完成
+1. 打开 http://localhost:20815，等待页面加载完成
 2. 截图保存到 test-results/cli/uat-full-acceptance-14-flow-home.png
 3. snapshot 找到 "调试" 按钮，点击进入调试对话
 4. 等待 2 秒，截图保存到 test-results/cli/uat-full-acceptance-15-flow-chat.png

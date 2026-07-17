@@ -9,10 +9,12 @@
  */
 
 import { test, expect } from '@playwright/test';
+import path from 'node:path';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const AGENT_NAME = 'test001';
-const SCREENSHOT_DIR = '../teams/AC130/iterations/AC130-202603151423/screenshots';
+const SCREENSHOT_DIR = testOutputDir('uat-real');
 
 test.describe('真实 UAT 验收: 调试日志导出', () => {
 
@@ -68,7 +70,7 @@ test.describe('真实 UAT 验收: 调试日志导出', () => {
         const btn = page.locator(selector).first();
         if (await btn.isVisible({ timeout: 3000 })) {
           downloadButton = btn;
-          buttonText = await btn.textContent();
+          buttonText = await btn.textContent() ?? '';
           console.log(`✅ 步骤 5: 找到下载按钮 - "${buttonText}"`);
           break;
         }
@@ -91,7 +93,12 @@ test.describe('真实 UAT 验收: 调试日志导出', () => {
     // ========== 步骤 6: 点击下载按钮 ==========
     if (downloadButton) {
       // 点击按钮
+      const downloadPromise = page.waitForEvent('download', { timeout: 10000 }).catch(() => null);
       await downloadButton.click();
+      const download = await downloadPromise;
+      if (download) {
+        await download.saveAs(path.join(SCREENSHOT_DIR, path.basename(download.suggestedFilename())));
+      }
       await page.waitForTimeout(3000);
       console.log('✅ 步骤 6: 已点击下载按钮');
 

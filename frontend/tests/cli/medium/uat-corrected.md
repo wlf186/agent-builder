@@ -4,14 +4,14 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 
 ## 步骤
 
 ### 测试用例 1: 完整验收流程
 
 #### 步骤 1: 访问首页
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 截图保存到 test-results/cli/uat-corrected-01-homepage.png
 
@@ -47,7 +47,7 @@
 
 > 在后续操作中注意观察网络请求中的 `X-Request-ID` 请求头。
 
-18. 打开 http://localhost:20880
+18. 打开 http://localhost:20815
 19. 等待页面加载完成
 20. 点击 "调试" 按钮
 21. 等待 2 秒

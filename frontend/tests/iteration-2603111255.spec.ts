@@ -10,8 +10,9 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import { AC130_PDF_FIXTURE, testOutputDir } from './test-paths';
 
-const BASE_URL = process.env.TEST_URL || 'http://localhost:20880';
+const BASE_URL = process.env.TEST_URL || 'http://localhost:20815';
 const API_URL = process.env.API_URL || 'http://localhost:20881';
 const TEST_AGENT = 'test-iteration-2603111255';
 
@@ -19,7 +20,7 @@ const TEST_AGENT = 'test-iteration-2603111255';
 test.setTimeout(180000);
 
 // 截图保存目录
-const SCREENSHOT_DIR = '/work/agent-builder-general/teams/tf141/iterations/iteration-2603111255/screenshots';
+const SCREENSHOT_DIR = testOutputDir('iteration-2603111255');
 
 /**
  * TC0: 环境准备 - 确保测试 Agent 存在
@@ -98,21 +99,7 @@ test('TC1: FileUploader component test', async ({ page }) => {
   await page.waitForTimeout(500);
 
   // 准备测试文件
-  const testPdfPath = '/work/agent-builder-general/test/test.pdf';
-
-  // 检查测试文件是否存在，如果不存在则创建一个简单的 PDF
-  const fs = require('fs');
-  if (!fs.existsSync(testPdfPath)) {
-    // 创建测试目录
-    const testDir = '/work/agent-builder-general/test';
-    if (!fs.existsSync(testDir)) {
-      fs.mkdirSync(testDir, { recursive: true });
-    }
-    // 创建一个简单的 PDF 文件 (最小有效 PDF)
-    const minimalPdf = '%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\nxref\n0 4\n0000000000 65535 f\n0000000009 00000 n\n0000000058 00000 n\n0000000115 00000 n\ntrailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n196\n%%EOF';
-    fs.writeFileSync(testPdfPath, minimalPdf);
-    console.log('Created minimal test PDF');
-  }
+  const testPdfPath = AC130_PDF_FIXTURE;
 
   // 上传文件
   const fileInput = page.locator('input[type="file"]');

@@ -21,7 +21,19 @@ except ImportError:
     MCP_AVAILABLE = False
 
 from .models import MCPServiceConfig, MCPConnectionType, MCPAuthType
-from .mcp_manager import SSEServerConnection, MCPServerConnection
+from .mcp_manager import (
+    SSEServerConnection,
+    MCPServerConnection,
+    create_hardened_mcp_http_client,
+)
+from .security import (
+    SecurityValidationError,
+    resolve_outbound_target,
+    validate_headers,
+    validate_outbound_url,
+    validate_outbound_url_syntax,
+    validate_stdio_configuration,
+)
 
 
 class DiagnosticResult(BaseModel):
@@ -77,13 +89,10 @@ class MCPDiagnostic:
             # 验证URL格式
             if self.config.url:
                 try:
-                    parsed = urlparse(self.config.url)
-                    if not parsed.scheme or not parsed.netloc:
-                        errors.append("URL格式无效")
-                    elif parsed.scheme not in ["http", "https"]:
-                        errors.append(f"不支持的协议: {parsed.scheme}")
-                except Exception as e:
-                    errors.append(f"URL解析失败: {e}")
+                    validate_outbound_url_syntax(self.config.url)
+                    validate_headers(self.config.headers)
+                except (SecurityValidationError, ValueError) as e:
+                    errors.append(f"URL配置无效 ({type(e).__name__})")
 
             # 检查认证配置
             if self.config.auth_type and self.config.auth_type != MCPAuthType.NONE:
@@ -91,8 +100,14 @@ class MCPDiagnostic:
                     errors.append(f"认证类型为{self.config.auth_type.value}但缺少auth_value")
 
         else:  # stdio
-            if not self.config.command:
-                errors.append("缺少command配置")
+            try:
+                validate_stdio_configuration(
+                    self.config.command,
+                    self.config.args or [],
+                    self.config.env or {},
+                )
+            except SecurityValidationError as e:
+                errors.append(f"stdio配置无效 ({type(e).__name__})")
 
         if errors:
             return DiagnosticResult(
@@ -171,6 +186,16 @@ class MCPDiagnostic:
             parsed = urlparse(self.config.url)
             host = parsed.hostname
 
+            try:
+                await validate_outbound_url(self.config.url)
+            except SecurityValidationError as exc:
+                return DiagnosticResult(
+                    layer="dns",
+                    status="fail",
+                    message="目标被SSRF安全策略拒绝",
+                    latency_ms=int((time.time() - start) * 1000),
+                )
+
             # 异步DNS解析
             loop = asyncio.get_event_loop()
             try:
@@ -207,7 +232,7 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="dns",
                 status="fail",
-                message=f"DNS解析失败: {e}",
+                message=f"DNS解析失败 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
 
@@ -224,6 +249,7 @@ class MCPDiagnostic:
             )
 
         try:
+            target = await resolve_outbound_target(self.config.url)
             parsed = urlparse(self.config.url)
             host = parsed.hostname
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -236,32 +262,25 @@ class MCPDiagnostic:
             if parsed.port:
                 base_url += f":{parsed.port}"
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with create_hardened_mcp_http_client(
+                timeout=10.0,
+                pinned_target=target,
+            ) as client:
                 # 发送HEAD请求测试连通性
-                response = await client.head(base_url, follow_redirects=True)
+                response = await client.head(base_url)
 
                 latency = int((time.time() - start) * 1000)
-
-                # 获取实际连接的远程地址（如果可用）
-                # httpx会自动使用系统代理，所以这里显示代理模式
-                proxy_info = ""
-                if client._transport_for_url(httpx.URL(base_url)):
-                    # 检查是否使用了代理
-                    import os
-                    https_proxy = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
-                    if https_proxy:
-                        proxy_info = f" (via proxy: {https_proxy})"
 
                 return DiagnosticResult(
                     layer="network",
                     status="pass",
-                    message=f"网络连接成功: HTTP {response.status_code}{proxy_info}",
+                    message=f"网络连接成功: HTTP {response.status_code}",
                     latency_ms=latency,
                     details={
                         "host": host,
                         "port": port,
                         "http_status": response.status_code,
-                        "proxy_used": https_proxy if https_proxy else None
+                        "proxy_used": None,
                     }
                 )
 
@@ -283,7 +302,7 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="network",
                 status="fail",
-                message=f"网络连接失败: {e}",
+                message=f"网络连接失败 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
 
@@ -308,13 +327,17 @@ class MCPDiagnostic:
             )
 
         try:
+            target = await resolve_outbound_target(self.config.url)
             parsed = urlparse(self.config.url)
             host = parsed.hostname
 
             # 使用httpx进行TLS连接测试（自动支持代理环境变量）
             import httpx
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with create_hardened_mcp_http_client(
+                timeout=10.0,
+                pinned_target=target,
+            ) as client:
                 # 使用HEAD请求避免SSE流式响应导致超时
                 response = await client.head(self.config.url, follow_redirects=False)
 
@@ -324,19 +347,14 @@ class MCPDiagnostic:
                 # httpx的底层连接会自动处理TLS
                 tls_info = "TLS 1.2+"  # httpx默认使用安全TLS配置
 
-                # 检查是否使用了代理
-                import os
-                https_proxy = os.environ.get('https_proxy') or os.environ.get('HTTPS_PROXY')
-                proxy_info = f" (via proxy)" if https_proxy else ""
-
                 return DiagnosticResult(
                     layer="tls",
                     status="pass",
-                    message=f"TLS连接成功{proxy_info}",
+                    message="TLS连接成功",
                     latency_ms=latency,
                     details={
                         "tls_version": tls_info,
-                        "proxy_used": https_proxy if https_proxy else None,
+                        "proxy_used": None,
                         "http_status": response.status_code
                     }
                 )
@@ -344,7 +362,7 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="tls",
                 status="fail",
-                message=f"证书验证失败: {e}",
+                message=f"证书验证失败 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
         except asyncio.TimeoutError:
@@ -358,7 +376,7 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="tls",
                 status="fail",
-                message=f"TLS连接失败: {e}",
+                message=f"TLS连接失败 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
 
@@ -374,6 +392,7 @@ class MCPDiagnostic:
                 latency_ms=None
             )
 
+        connection = None
         try:
             # 使用现有的连接类
             connection = SSEServerConnection(self.config)
@@ -382,8 +401,6 @@ class MCPDiagnostic:
             if success:
                 tool_count = len(connection.tools)
                 tool_names = [t.name for t in connection.tools[:5]]  # 前5个
-
-                await connection.disconnect()
 
                 latency = int((time.time() - start) * 1000)
 
@@ -408,9 +425,12 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="mcp",
                 status="fail",
-                message=f"MCP协议错误: {e}",
+                message=f"MCP协议错误 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
+        finally:
+            if connection is not None:
+                await connection.disconnect()
 
     async def _check_stdio_command(self) -> DiagnosticResult:
         """检查stdio命令有效性"""
@@ -462,7 +482,7 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="command",
                 status="fail",
-                message=f"命令检查失败: {e}",
+                message=f"命令检查失败 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
 
@@ -478,6 +498,7 @@ class MCPDiagnostic:
                 latency_ms=None
             )
 
+        connection = None
         try:
             # 使用现有的连接类
             from .models import MCPConfig
@@ -493,8 +514,6 @@ class MCPDiagnostic:
             if success:
                 tool_count = len(connection.tools)
                 tool_names = [t.name for t in connection.tools[:5]]
-
-                await connection.disconnect()
 
                 latency = int((time.time() - start) * 1000)
 
@@ -519,9 +538,12 @@ class MCPDiagnostic:
             return DiagnosticResult(
                 layer="mcp",
                 status="fail",
-                message=f"MCP协议错误: {e}",
+                message=f"MCP协议错误 ({type(e).__name__})",
                 latency_ms=int((time.time() - start) * 1000)
             )
+        finally:
+            if connection is not None:
+                await connection.disconnect()
 
     def _generate_report(self) -> MCPDiagnosticReport:
         """生成诊断报告"""

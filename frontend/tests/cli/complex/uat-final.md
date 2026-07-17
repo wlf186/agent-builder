@@ -8,7 +8,7 @@
 > - 5.3 安全验收: 敏感信息脱敏
 
 ## 前置条件
-- 前端服务已启动 (localhost:20880)
+- 前端服务已启动 (localhost:20815)
 - 后端服务已启动 (localhost:20881)
 
 ---
@@ -16,9 +16,9 @@
 ### 测试用例 UAT-FINAL-001: 完整流程 - 发送消息并导出日志
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/uat-final-01-homepage.png`
-3. 在 snapshot 中找到调试对话入口（尝试以下元素: 包含 "调试" 文本的链接或按钮、包含 "chat" 的 href 链接）。如果都找不到，直接导航到 `http://localhost:20880/?chat=test001`
+3. 在 snapshot 中找到调试对话入口（尝试以下元素: 包含 "调试" 文本的链接或按钮、包含 "chat" 的 href 链接）。如果都找不到，直接导航到 `http://localhost:20815/?chat=test001`
 4. 等待 2 秒
 5. 截图保存到 `test-results/cli/uat-final-02-chat-page.png`
 6. 在 snapshot 中找到聊天输入框（尝试 `textarea`, `input[type="text"]`, `input[placeholder*="输入"]`, `textarea[placeholder*="输入"]`），输入 "请介绍一下你自己"
@@ -44,7 +44,7 @@
 
 ## 步骤
 1. 在后续操作中注意观察网络请求头中的 `X-Request-ID` 字段（`page.on('request')` 监听所有请求的 headers）
-2. 访问 `http://localhost:20880`，等待页面加载完成
+2. 访问 `http://localhost:20815`，等待页面加载完成
 3. 等待 2 秒
 4. 截图保存到 `test-results/cli/uat-final-traceid-check.png`
 

@@ -1,7 +1,8 @@
 ---
-title: MCP 服务配置
+title: "MCP 服务配置"
 category: advanced
 component: MCPServiceDialog
+generated: true
 related:
   - MCPDiagnosticResult
 ---

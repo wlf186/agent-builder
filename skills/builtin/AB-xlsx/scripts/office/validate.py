@@ -14,15 +14,17 @@ Auto-repair fixes:
 """
 
 import argparse
+import shutil
 import sys
 import tempfile
-import zipfile
 from pathlib import Path
 
+from safe_zip import SafeZipError, safe_extract_zip
+from secure_temp import secure_temp_root
 from validators import DOCXSchemaValidator, PPTXSchemaValidator, RedliningValidator
 
 
-def main():
+def _main() -> int:
     parser = argparse.ArgumentParser(description="Validate Office document XML files")
     parser.add_argument(
         "path",
@@ -68,43 +70,64 @@ def main():
         f"Error: Cannot determine file type from {path}. Use --original or provide a .docx/.pptx/.xlsx file."
     )
 
-    if path.is_file() and path.suffix.lower() in [".docx", ".pptx", ".xlsx"]:
-        temp_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(path, "r") as zf:
-            zf.extractall(temp_dir)
-        unpacked_dir = Path(temp_dir)
-    else:
-        assert path.is_dir(), f"Error: {path} is not a directory or Office file"
-        unpacked_dir = path
+    temp_dir = None
+    try:
+        if path.is_file() and path.suffix.lower() in [".docx", ".pptx", ".xlsx"]:
+            temp_dir = tempfile.mkdtemp(dir=secure_temp_root())
+            try:
+                safe_extract_zip(path, temp_dir)
+            except SafeZipError:
+                print("Error: unsafe Office archive")
+                return 1
+            unpacked_dir = Path(temp_dir)
+        else:
+            assert path.is_dir(), f"Error: {path} is not a directory or Office file"
+            unpacked_dir = path
 
-    match file_extension:
-        case ".docx":
-            validators = [
-                DOCXSchemaValidator(unpacked_dir, original_file, verbose=args.verbose),
-            ]
-            if original_file:
-                validators.append(
-                    RedliningValidator(unpacked_dir, original_file, verbose=args.verbose, author=args.author)  
-                )
-        case ".pptx":
-            validators = [
-                PPTXSchemaValidator(unpacked_dir, original_file, verbose=args.verbose),
-            ]
-        case _:
-            print(f"Error: Validation not supported for file type {file_extension}")
-            sys.exit(1)
+        match file_extension:
+            case ".docx":
+                validators = [
+                    DOCXSchemaValidator(
+                        unpacked_dir, original_file, verbose=args.verbose
+                    ),
+                ]
+                if original_file:
+                    validators.append(
+                        RedliningValidator(
+                            unpacked_dir,
+                            original_file,
+                            verbose=args.verbose,
+                            author=args.author,
+                        )
+                    )
+            case ".pptx":
+                validators = [
+                    PPTXSchemaValidator(
+                        unpacked_dir, original_file, verbose=args.verbose
+                    ),
+                ]
+            case _:
+                print(f"Error: Validation not supported for file type {file_extension}")
+                return 1
 
-    if args.auto_repair:
-        total_repairs = sum(v.repair() for v in validators)
-        if total_repairs:
-            print(f"Auto-repaired {total_repairs} issue(s)")
+        if args.auto_repair:
+            total_repairs = sum(v.repair() for v in validators)
+            if total_repairs:
+                print(f"Auto-repaired {total_repairs} issue(s)")
 
-    success = all(v.validate() for v in validators)
+        success = all(v.validate() for v in validators)
 
-    if success:
-        print("All validations PASSED!")
+        if success:
+            print("All validations PASSED!")
 
-    sys.exit(0 if success else 1)
+        return 0 if success else 1
+    finally:
+        if temp_dir is not None:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def main() -> None:
+    sys.exit(_main())
 
 
 if __name__ == "__main__":

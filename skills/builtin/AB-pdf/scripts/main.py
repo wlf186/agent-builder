@@ -40,11 +40,10 @@ except ImportError:
     HAS_PDFPLUMBER = False
 
 try:
-    from PIL import Image
-    from pdf2image import convert_from_path
-    HAS_PIL = True
+    import pypdfium2 as pdfium
+    HAS_PDFIUM = True
 except ImportError:
-    HAS_PIL = False
+    HAS_PDFIUM = False
 
 try:
     from reportlab.pdfgen import canvas
@@ -103,10 +102,10 @@ def main():
         result = process_pdf(args)
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(0 if result.get("status") == "success" else 1)
-    except Exception as e:
+    except Exception:
         print(json.dumps({
             "status": "error",
-            "error": str(e),
+            "error": "PDF 处理失败",
             "action": args.action
         }, ensure_ascii=False))
         sys.exit(1)
@@ -213,10 +212,10 @@ def extract_text(input_file: str, verbose: bool = False, limit: int = 0) -> Dict
             "truncated": truncated
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"提取文本失败: {str(e)}",
+            "error": "提取文本失败",
             "action": "extract_text"
         }
 
@@ -268,10 +267,10 @@ def extract_forms(input_file: str, verbose: bool = False) -> Dict[str, Any]:
             "has_forms": len(fields) > 0
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"提取表单失败: {str(e)}",
+            "error": "提取表单失败",
             "action": "extract_forms"
         }
 
@@ -320,7 +319,10 @@ def fill_form(input_file: str, data: Dict[str, Any], output_file: Optional[str] 
                     print(f"[INFO] 填充字段 '{field_name}': {value}", file=sys.stderr)
             except Exception as e:
                 if verbose:
-                    print(f"[WARN] 填充字段 '{field_name}' 失败: {e}", file=sys.stderr)
+                    print(
+                        f"[WARN] 填充字段失败: error_type={type(e).__name__}",
+                        file=sys.stderr,
+                    )
 
         # 确定输出路径
         if not output_file:
@@ -341,10 +343,10 @@ def fill_form(input_file: str, data: Dict[str, Any], output_file: Optional[str] 
             "files": [output_file]
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"填充表单失败: {str(e)}",
+            "error": "填充表单失败",
             "action": "fill_form"
         }
 
@@ -361,10 +363,10 @@ def convert_images(input_file: str, output_dir: Optional[str] = None, verbose: b
     Returns:
         包含转换结果的字典
     """
-    if not HAS_PIL:
+    if not HAS_PDFIUM:
         return {
             "status": "error",
-            "error": "缺少必要的库：请安装 Pillow 和 pdf2image",
+            "error": "缺少必要的库：请安装 pypdfium2 和 Pillow",
             "action": "convert_images"
         }
 
@@ -381,31 +383,34 @@ def convert_images(input_file: str, output_dir: Optional[str] = None, verbose: b
         if verbose:
             print(f"[INFO] 将 PDF 转换为图片，输出目录: {output_dir}", file=sys.stderr)
 
-        # 转换 PDF 为图片
-        images = convert_from_path(input_file, dpi=200)
-
+        document = pdfium.PdfDocument(input_file)
+        if len(document) > 500:
+            document.close()
+            raise ValueError("PDF页数超过限制（最多 500 页）")
         output_files = []
-        for i, image in enumerate(images):
+        for i, page in enumerate(document):
+            image = page.render(scale=200 / 72).to_pil()
             output_file = str(output_path / f"page_{i+1:03d}.png")
             image.save(output_file, 'PNG')
             output_files.append(output_file)
             if verbose:
                 print(f"[INFO] 保存图片: {output_file}", file=sys.stderr)
+        document.close()
 
         return {
             "status": "success",
             "action": "convert_images",
             "output": {
-                "page_count": len(images),
+                "page_count": len(output_files),
                 "output_dir": output_dir
             },
             "files": output_files
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "status": "error",
-            "error": f"转换为图片失败: {str(e)}",
+            "error": "转换为图片失败",
             "action": "convert_images"
         }
 

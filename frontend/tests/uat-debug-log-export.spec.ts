@@ -13,10 +13,12 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import path from 'node:path';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const AGENT_NAME = 'test001';
-const SCREENSHOT_DIR = 'teams/AC130/iterations/AC130-202603151423/screenshots';
+const SCREENSHOT_DIR = testOutputDir('uat-debug-log-export');
 
 // Helper: 等待并点击
 async function clickButton(page: Page, text: string, timeout = 5000) {
@@ -339,6 +341,7 @@ test.describe('UAT: 调试日志导出功能验收', () => {
           new Promise((_, reject) => setTimeout(() => reject(new Error('Download timeout')), 5000))
         ]) as any;
 
+        await download.saveAs(path.join(SCREENSHOT_DIR, path.basename(download.suggestedFilename())));
         console.log(`✓ 日志文件已下载: ${download.suggestedFilename()}`);
         await saveScreenshot(page, '012-export-success');
       } catch (e) {
@@ -356,7 +359,7 @@ test.describe('UAT: 调试日志导出功能验收', () => {
  * 测试执行说明
  *
  * 前提条件:
- * 1. 前端服务运行在 http://localhost:20880
+ * 1. 前端服务运行在 http://localhost:20815
  * 2. 后端服务运行在 http://localhost:20881
  * 3. 至少有一个可用的测试 Agent (如 test001)
  *
@@ -364,7 +367,7 @@ test.describe('UAT: 调试日志导出功能验收', () => {
  * npx playwright test uat-debug-log-export.spec.ts --headed
  *
  * 预期结果:
- * - 所有截图保存在 teams/AC130/iterations/AC130-202603151423/screenshots/
+ * - 所有截图保存在 .runtime/test-results/uat-debug-log-export/
  * - 控制台输出测试结果
  * - 失败的测试会保存失败截图
  */

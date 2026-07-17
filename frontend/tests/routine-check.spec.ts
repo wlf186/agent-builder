@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('例行功能验证', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
   });
 
@@ -39,7 +39,7 @@ test.describe('例行功能验证', () => {
   });
 
   test('知识库页面可访问', async ({ page }) => {
-    await page.goto('http://localhost:20880/knowledge-bases');
+    await page.goto('http://localhost:20815/knowledge-bases');
     await page.waitForLoadState('networkidle');
     await page.waitForTimeout(2000);
 

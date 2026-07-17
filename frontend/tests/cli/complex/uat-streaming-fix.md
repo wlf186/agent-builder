@@ -6,7 +6,7 @@
 > 修复内容: ChatRequest 添加 conversation_id 字段, AgentConfig 属性访问错误修复
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - 存在名为 "test3" 的智能体
 
 ---
@@ -14,7 +14,7 @@
 ### 测试用例 TC-001: test3 agent 基本响应验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/uat-streaming-fix-01-homepage.png`
 3. 在 snapshot 中找到 "test3" 智能体卡片（h3 标签），点击选择
 4. 等待 3 秒
@@ -35,7 +35,7 @@
 ### 测试用例 TC-002: 流式输出打字机效果验证
 
 ## 步骤
-1. 访问 `http://localhost:20880`，等待页面加载完成
+1. 访问 `http://localhost:20815`，等待页面加载完成
 2. 在 snapshot 中找到 "test3" 智能体卡片（h3 标签），点击选择
 3. 等待 2 秒
 4. 在 snapshot 中找到输入框，输入 "1+1等于几？"

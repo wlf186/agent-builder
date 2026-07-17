@@ -9,8 +9,24 @@
  */
 
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
+import fs from 'node:fs';
+import path from 'node:path';
 
-const BASE_URL = 'http://localhost:20880';
+function findProjectRoot(start: string): string {
+  let current = path.resolve(start);
+  while (true) {
+    if (fs.existsSync(path.join(current, 'CLAUDE.md'))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) throw new Error(`Unable to locate project root from ${start}`);
+    current = parent;
+  }
+}
+
+const PROJECT_ROOT = findProjectRoot(process.cwd());
+const OUTPUT_DIR = path.join(PROJECT_ROOT, '.runtime', 'test-results', 'uat-mcp-tool-priority');
+fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+const BASE_URL = 'http://localhost:20815';
 const AGENT_NAME = 'test3';
 
 interface ToolCall {
@@ -50,7 +66,7 @@ class UATTester {
   private browser: Browser | null = null;
   private context: BrowserContext | null = null;
   private page: Page | null = null;
-  private results: Array<{
+  readonly results: Array<{
     testCase: TestCase;
     passed: boolean;
     actualTool?: string;
@@ -159,7 +175,7 @@ class UATTester {
 
     try {
       // 截图：测试前状态
-      const beforeScreenshot = `/tmp/uat_${testCase.id}_before.png`;
+      const beforeScreenshot = path.join(OUTPUT_DIR, `uat_${testCase.id}_before.png`);
       await this.page.screenshot({ path: beforeScreenshot });
       console.log(`   📸 截图保存: ${beforeScreenshot}`);
 
@@ -192,7 +208,7 @@ class UATTester {
       await this.page.waitForTimeout(500);
 
       // 截图：输入后状态
-      const afterInputScreenshot = `/tmp/uat_${testCase.id}_after_input.png`;
+      const afterInputScreenshot = path.join(OUTPUT_DIR, `uat_${testCase.id}_after_input.png`);
       await this.page.screenshot({ path: afterInputScreenshot });
       console.log(`   📸 截图保存: ${afterInputScreenshot}`);
 
@@ -228,7 +244,7 @@ class UATTester {
       await this.page.waitForTimeout(8000); // 等待足够时间让流式响应完成
 
       // 截图：响应后状态
-      const afterResponseScreenshot = `/tmp/uat_${testCase.id}_after_response.png`;
+      const afterResponseScreenshot = path.join(OUTPUT_DIR, `uat_${testCase.id}_after_response.png`);
       await this.page.screenshot({ path: afterResponseScreenshot });
       console.log(`   📸 截图保存: ${afterResponseScreenshot}`);
 
@@ -362,9 +378,7 @@ async function main() {
     console.log(report);
 
     // 保存报告
-    const reportPath = '/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/iteration-2603141808/uat_report.md';
-    const fs = await import('fs');
-    await fs.promises.mkdir('/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/iteration-2603141808', { recursive: true });
+    const reportPath = path.join(OUTPUT_DIR, 'uat-report.md');
     await fs.promises.writeFile(reportPath, report, 'utf-8');
     console.log(`\n📄 报告已保存: ${reportPath}`);
 

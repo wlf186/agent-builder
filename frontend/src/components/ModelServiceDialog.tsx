@@ -26,23 +26,24 @@
  *   7. 从下拉列表中选择一个模型
  *   8. 切换启用开关并点击"保存"
  * @tips.en
- *   - Use environment variables for API keys: {SERVICE_NAME}_API_KEY format is recommended
+ *   - API keys submitted through this password field are stored server-side and are never returned in plaintext
  *   - Test connection before saving to ensure the service is accessible
  *   - Ollama does not require an API key for local installations
  * @tips.zh
- *   - 推荐使用环境变量存储 API Key：格式为 {SERVICE_NAME}_API_KEY
+ *   - 通过密码输入框提交的 API Key 仅保存在服务端，后续不会以明文返回
  *   - 保存前先测试连接以确保服务可访问
  *   - 本地 Ollama 不需要 API Key
  * @related AgentChat
  */
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { X, Loader2, CheckCircle, XCircle, Plus, Info, AlertTriangle } from "lucide-react";
+import { X, Loader2, CheckCircle, XCircle, Info } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useLocale } from "@/lib/LocaleContext";
 import { t } from "@/lib/i18n";
+import { apiPath } from "@/lib/apiPath";
 
 const API_BASE = "/api";
 
@@ -76,53 +77,22 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
   const { locale } = useLocale();
   const isEdit = !!service;
 
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [provider, setProvider] = useState("zhipu");
-  const [baseUrl, setBaseUrl] = useState("");
+  const [name, setName] = useState(() => service?.name ?? "");
+  const [description, setDescription] = useState(() => service?.description ?? "");
+  const [provider, setProvider] = useState(() => service?.provider ?? "zhipu");
+  const [baseUrl, setBaseUrl] = useState(
+    () => service?.base_url ?? PROVIDER_DEFAULT_URLS.zhipu,
+  );
   const [apiKey, setApiKey] = useState("");
-  const [selectedModel, setSelectedModel] = useState("");
-  const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [enabled, setEnabled] = useState(true);
+  const [selectedModel, setSelectedModel] = useState(() => service?.selected_model ?? "");
+  const [availableModels, setAvailableModels] = useState<string[]>(
+    () => service?.available_models ?? [],
+  );
+  const [enabled, setEnabled] = useState(() => service?.enabled ?? true);
 
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [saving, setSaving] = useState(false);
-
-  // 初始化表单
-  useEffect(() => {
-    if (service) {
-      setName(service.name);
-      setDescription(service.description);
-      setProvider(service.provider);
-      setBaseUrl(service.base_url);
-      setApiKey(""); // API key不回显
-      setSelectedModel(service.selected_model);
-      setAvailableModels(service.available_models || []);
-      setEnabled(service.enabled);
-    } else {
-      resetForm();
-    }
-  }, [service, open]);
-
-  // 供应商变化时设置默认URL
-  useEffect(() => {
-    if (!isEdit && PROVIDER_DEFAULT_URLS[provider]) {
-      setBaseUrl(PROVIDER_DEFAULT_URLS[provider]);
-    }
-  }, [provider, isEdit]);
-
-  const resetForm = () => {
-    setName("");
-    setDescription("");
-    setProvider("zhipu");
-    setBaseUrl(PROVIDER_DEFAULT_URLS["zhipu"]);
-    setApiKey("");
-    setSelectedModel("");
-    setAvailableModels([]);
-    setEnabled(true);
-    setTestResult(null);
-  };
 
   const handleTestConnection = async () => {
     if (!baseUrl) {
@@ -162,7 +132,7 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
         setTestResult({ success: false, message: data.message || (locale === "zh" ? "连接失败" : "Connection failed") });
         setAvailableModels([]);
       }
-    } catch (error) {
+    } catch {
       setTestResult({ success: false, message: locale === "zh" ? "请求失败，请检查网络" : "Request failed, please check network" });
     } finally {
       setTesting(false);
@@ -183,10 +153,10 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
     setSaving(true);
 
     try {
-      const url = isEdit ? `${API_BASE}/model-services/${service.name}` : `${API_BASE}/model-services`;
+      const url = isEdit ? apiPath('model-services', service.name) : apiPath('model-services');
       const method = isEdit ? "PUT" : "POST";
 
-      const body: Record<string, any> = {
+      const body: Record<string, unknown> = {
         description,
         provider,
         base_url: baseUrl,
@@ -217,7 +187,7 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
         const data = await response.json();
         alert(data.detail || (locale === "zh" ? "保存失败" : "Save failed"));
       }
-    } catch (error) {
+    } catch {
       alert(locale === "zh" ? "保存失败，请检查网络" : "Save failed, please check network");
     } finally {
       setSaving(false);
@@ -305,7 +275,13 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
               </label>
               <select
                 value={provider}
-                onChange={(e) => setProvider(e.target.value)}
+                onChange={(e) => {
+                  const nextProvider = e.target.value;
+                  setProvider(nextProvider);
+                  if (!isEdit && PROVIDER_DEFAULT_URLS[nextProvider]) {
+                    setBaseUrl(PROVIDER_DEFAULT_URLS[nextProvider]);
+                  }
+                }}
                 className="w-full h-10 rounded-xl border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-4 text-sm text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
               >
                 <option value="zhipu">{getProviderLabel("zhipu")}</option>
@@ -344,15 +320,12 @@ export function ModelServiceDialog({ open, onClose, onSave, service }: ModelServ
                     <Info className="w-4 h-4 text-blue-500 dark:text-blue-400 flex-shrink-0 mt-0.5" />
                     <div className="flex-1 text-xs text-gray-600 dark:text-gray-400">
                       <p className="font-medium text-blue-700 dark:text-blue-300 mb-1">
-                        {locale === "zh" ? "推荐使用环境变量存储 API Key" : "Environment Variable Recommended"}
+                        {locale === "zh" ? "API Key 仅保存在服务端" : "API Key stays server-side"}
                       </p>
                       <p className="text-gray-500 dark:text-gray-400">
                         {locale === "zh"
-                          ? "格式: {SERVICE_NAME}_API_KEY，例如: "
-                          : "Format: {SERVICE_NAME}_API_KEY, e.g.: "}
-                        <code className="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 text-blue-600 dark:text-blue-400 font-mono">
-                          {name?.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_API_KEY
-                        </code>
+                          ? "密码字段经鉴权的同源代理提交；已保存的值不会以明文返回。"
+                          : "The password field uses the authenticated same-origin proxy; saved values are never returned in plaintext."}
                       </p>
                     </div>
                   </div>

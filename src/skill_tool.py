@@ -376,7 +376,7 @@ Example call format:
             return f"=== Skill Loaded: {skill.name} ===\n\n{content}\n\n=== End of Skill ==="
 
         except Exception as e:
-            return f"Error loading skill '{skill_name}': {str(e)}"
+            return f"Error loading skill '{skill_name}' ({type(e).__name__})"
 
     async def execute_script(
         self,
@@ -402,9 +402,8 @@ Example call format:
         if not self.execution_engine:
             return "Error: Execution engine not available"
 
-        # 尝试匹配skill名称（支持模糊匹配）
-        # 调试：打印enabled_skills的值
-        print(f"[DEBUG] execute_script: skill_name='{skill_name}', enabled_skills={self.enabled_skills}")
+        # 技能名和启用列表可由用户配置，日志只记录基数。
+        print(f"[DEBUG] execute_script: enabled_skill_count={len(self.enabled_skills)}")
 
         actual_skill_name = self._match_skill_name(skill_name)
         if not actual_skill_name:
@@ -463,7 +462,7 @@ Example call format:
             return "\n".join(result_lines)
 
         except Exception as e:
-            return f"Error executing script: {str(e)}"
+            return f"Error executing script ({type(e).__name__})"
 
     def _detect_executable_skills(self) -> List[Dict[str, Any]]:
         """检测哪些Skill有可执行脚本"""

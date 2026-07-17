@@ -15,8 +15,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const SCREENSHOT_DIR = testOutputDir('iteration-2603131500');
+
+const BASE_URL = 'http://localhost:20815';
 const API_BASE_URL = 'http://localhost:20881';
 
 /**
@@ -234,7 +237,7 @@ test.describe('Iteration 2603131500: CoinGecko MCP诊断功能回归测试', () 
     }
 
     // 截图保存当前状态
-    await page.screenshot({ path: 'test-results/tc-mcp006-after-click.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc-mcp006-after-click.png` });
 
     if (!coingeckoClicked) {
       console.log('⚠ 未找到coingecko服务，尝试直接验证MCP服务列表API');
@@ -278,7 +281,7 @@ test.describe('Iteration 2603131500: CoinGecko MCP诊断功能回归测试', () 
     }
 
     // 截图保存最终状态
-    await page.screenshot({ path: 'test-results/tc-mcp006-dialog-state.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc-mcp006-dialog-state.png`, fullPage: true });
 
     if (!diagnoseButtonFound) {
       console.log('⚠ 未找到诊断按钮，检查对话框是否打开');
@@ -367,7 +370,7 @@ test.describe('Iteration 2603131500: CoinGecko MCP诊断功能回归测试', () 
     }
 
     // 截图保存
-    await page.screenshot({ path: 'test-results/tc-mcp007-diagnose-result.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc-mcp007-diagnose-result.png`, fullPage: true });
 
     if (!diagnoseButtonFound) {
       console.log('⚠ 未找到诊断按钮');
@@ -443,7 +446,7 @@ test.describe('Iteration 2603131500: CoinGecko MCP诊断功能回归测试', () 
     expect(hasResponse).toBeTruthy();
 
     // 5. 截图保存
-    await page.screenshot({ path: 'test-results/tc-mcp008-streaming-output.png' });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc-mcp008-streaming-output.png` });
 
     console.log('=== TC-MCP-008 完成 ===');
   });
@@ -492,7 +495,7 @@ test.describe('Iteration 2603131500: CoinGecko MCP诊断功能回归测试', () 
                               pageText?.includes('价格');
 
     // 5. 截图保存
-    await page.screenshot({ path: 'test-results/tc-mcp009-coingecko-call.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/tc-mcp009-coingecko-call.png`, fullPage: true });
 
     if (hasCryptoResponse) {
       console.log('✓ 智能体可能调用了CoinGecko工具');

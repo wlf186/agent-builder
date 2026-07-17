@@ -3,6 +3,8 @@
 支持 PDF/DOCX/TXT/MD 文档解析与分块
 """
 import logging
+import stat
+import zipfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -21,6 +23,13 @@ class DocumentProcessor:
     """
 
     SUPPORTED_FORMATS = {".pdf", ".txt", ".md", ".docx"}
+    MAX_PDF_PAGES = 500
+    MAX_TEXT_CHARACTERS = 2_000_000
+    MAX_CHUNKS = 5_000
+    MAX_DOCX_MEMBERS = 2_048
+    MAX_DOCX_UNCOMPRESSED_SIZE = 50 * 1024 * 1024
+    MAX_DOCX_MEMBER_SIZE = 20 * 1024 * 1024
+    MAX_DOCX_COMPRESSION_RATIO = 100
 
     def __init__(
         self,
@@ -77,7 +86,7 @@ class DocumentProcessor:
                 f"支持的格式: {', '.join(self.SUPPORTED_FORMATS)}"
             )
 
-        logger.info(f"正在解析文档: {file_path.name}")
+        logger.info("正在解析文档: suffix=%s", suffix)
 
         try:
             if suffix == ".pdf":
@@ -87,7 +96,7 @@ class DocumentProcessor:
             elif suffix in {".txt", ".md"}:
                 return self._parse_text(file_path)
         except Exception as e:
-            logger.error(f"文档解析失败: {e}")
+            logger.error("文档解析失败: error_type=%s", type(e).__name__)
             raise
 
         return ""
@@ -98,16 +107,30 @@ class DocumentProcessor:
             import pypdfium2
 
             pdf = pypdfium2.PdfDocument(file_path)
+            if len(pdf) > self.MAX_PDF_PAGES:
+                pdf.close()
+                raise ValueError(f"PDF页数超过限制（最多 {self.MAX_PDF_PAGES} 页）")
             text_parts = []
+            character_count = 0
 
             for page_num, page in enumerate(pdf):
                 try:
                     text_page = page.get_textpage()
                     text = text_page.get_text_range()
                     if text.strip():
+                        character_count += len(text)
+                        if character_count > self.MAX_TEXT_CHARACTERS:
+                            raise ValueError("文档提取文本超过字符限制")
                         text_parts.append(text)
+                except ValueError:
+                    pdf.close()
+                    raise
                 except Exception as e:
-                    logger.warning(f"PDF 第 {page_num + 1} 页解析失败: {e}")
+                    logger.warning(
+                        "PDF 页面解析失败: page=%d error_type=%s",
+                        page_num + 1,
+                        type(e).__name__,
+                    )
 
             pdf.close()
 
@@ -120,7 +143,7 @@ class DocumentProcessor:
                 "pypdfium2 未安装。请运行: pip install pypdfium2"
             ) from e
         except Exception as e:
-            logger.error(f"PDF 解析错误: {e}")
+            logger.error("PDF 解析错误: error_type=%s", type(e).__name__)
             raise
 
     def _parse_docx(self, file_path: Path) -> str:
@@ -128,8 +151,39 @@ class DocumentProcessor:
         try:
             from docx import Document
 
+            with zipfile.ZipFile(file_path) as archive:
+                members = archive.infolist()
+                if len(members) > self.MAX_DOCX_MEMBERS:
+                    raise ValueError("DOCX内部文件数量超过限制")
+                total_size = 0
+                for member in members:
+                    unix_mode = (member.external_attr >> 16) & 0o170000
+                    if unix_mode and not (stat.S_ISREG(unix_mode) or stat.S_ISDIR(unix_mode)):
+                        raise ValueError("DOCX包含不支持的特殊文件")
+                    if member.flag_bits & 0x1:
+                        raise ValueError("DOCX不允许包含加密成员")
+                    if member.file_size > self.MAX_DOCX_MEMBER_SIZE:
+                        raise ValueError("DOCX内部单个文件过大")
+                    total_size += member.file_size
+                    if total_size > self.MAX_DOCX_UNCOMPRESSED_SIZE:
+                        raise ValueError("DOCX展开后大小超过限制")
+                    if (
+                        member.file_size > 0
+                        and member.file_size / max(member.compress_size, 1)
+                        > self.MAX_DOCX_COMPRESSION_RATIO
+                    ):
+                        raise ValueError("DOCX压缩比异常")
+
             doc = Document(file_path)
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            paragraphs = []
+            character_count = 0
+            for paragraph in doc.paragraphs:
+                if not paragraph.text.strip():
+                    continue
+                character_count += len(paragraph.text)
+                if character_count > self.MAX_TEXT_CHARACTERS:
+                    raise ValueError("DOCX提取文本超过字符限制")
+                paragraphs.append(paragraph.text)
 
             full_text = "\n".join(paragraphs)
             logger.info(f"DOCX 解析完成，共 {len(paragraphs)} 段，{len(full_text)} 字符")
@@ -140,13 +194,15 @@ class DocumentProcessor:
                 "python-docx 未安装。请运行: pip install python-docx"
             ) from e
         except Exception as e:
-            logger.error(f"DOCX 解析错误: {e}")
+            logger.error("DOCX 解析错误: error_type=%s", type(e).__name__)
             raise
 
     def _parse_text(self, file_path: Path) -> str:
         """解析纯文本文件"""
         try:
             text = file_path.read_text(encoding="utf-8")
+            if len(text) > self.MAX_TEXT_CHARACTERS:
+                raise ValueError("文本文档超过字符限制")
             logger.info(f"文本文件解析完成，{len(text)} 字符")
             return text
         except UnicodeDecodeError:
@@ -154,6 +210,8 @@ class DocumentProcessor:
             for encoding in ["gbk", "gb2312", "latin1"]:
                 try:
                     text = file_path.read_text(encoding=encoding)
+                    if len(text) > self.MAX_TEXT_CHARACTERS:
+                        raise ValueError("文本文档超过字符限制")
                     logger.info(f"文本文件解析完成（编码: {encoding}），{len(text)} 字符")
                     return text
                 except UnicodeDecodeError:
@@ -175,6 +233,8 @@ class DocumentProcessor:
 
         splitter = self._get_splitter()
         chunks_text = splitter.split_text(text)
+        if len(chunks_text) > self.MAX_CHUNKS:
+            raise ValueError(f"文档分块数超过限制（最多 {self.MAX_CHUNKS} 块）")
 
         chunks = []
         position = 0

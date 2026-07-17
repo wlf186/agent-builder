@@ -4,8 +4,10 @@
  */
 
 import { test, expect, Page } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('rag-demo');
 
 test.describe('RAG 知识库系统完整演示', () => {
   test.setTimeout(300000); // 5分钟总超时
@@ -26,9 +28,9 @@ test.describe('RAG 知识库系统完整演示', () => {
     await page.waitForTimeout(2000);
 
     // 截图：主页
-    await page.screenshot({ path: 'test-results/demo/01-homepage.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/01-homepage.png`, fullPage: true });
     console.log('   ✅ 主页加载完成');
-    console.log('   📸 截图: test-results/demo/01-homepage.png\n');
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/01-homepage.png\n`);
 
     // ============================================================
     // 步骤 2: 进入知识库管理页面
@@ -48,8 +50,8 @@ test.describe('RAG 知识库系统完整演示', () => {
       console.log('   ✅ 通过URL进入知识库管理页面');
     }
 
-    await page.screenshot({ path: 'test-results/demo/02-kb-page.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/02-kb-page.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/02-kb-page.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/02-kb-page.png\n`);
 
     // ============================================================
     // 步骤 3: 检查已有知识库
@@ -65,8 +67,8 @@ test.describe('RAG 知识库系统完整演示', () => {
       console.log('   ℹ️ 未发现"人力资源"知识库，将使用现有知识库演示');
     }
 
-    await page.screenshot({ path: 'test-results/demo/03-kb-list.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/03-kb-list.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/03-kb-list.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/03-kb-list.png\n`);
 
     // ============================================================
     // 步骤 4: 返回主页并选择智能体
@@ -109,8 +111,8 @@ test.describe('RAG 知识库系统完整演示', () => {
       }
     }
 
-    await page.screenshot({ path: 'test-results/demo/04-agent-selected.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/04-agent-selected.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/04-agent-selected.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/04-agent-selected.png\n`);
 
     // ============================================================
     // 步骤 5: 检查智能体知识库配置
@@ -129,8 +131,8 @@ test.describe('RAG 知识库系统完整演示', () => {
       console.log('   ℹ️ 未检测到知识库配置信息');
     }
 
-    await page.screenshot({ path: 'test-results/demo/05-kb-config.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/05-kb-config.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/05-kb-config.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/05-kb-config.png\n`);
 
     // ============================================================
     // 步骤 6: 进行 RAG 对话测试
@@ -180,8 +182,8 @@ test.describe('RAG 知识库系统完整演示', () => {
 
     console.log('   ╚═══════════════════════════════════════════════════════════╝\n');
 
-    await page.screenshot({ path: 'test-results/demo/06-rag-response.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/06-rag-response.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/06-rag-response.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/06-rag-response.png\n`);
 
     // ============================================================
     // 步骤 7: 第二轮对话（代码规范）
@@ -203,8 +205,8 @@ test.describe('RAG 知识库系统完整演示', () => {
                             response2.includes('命名');
     console.log(`   ${hasCodeStandard ? '✅' : '⚠️'} 代码规范回答: ${hasCodeStandard ? '正确' : '未能确认'}`);
 
-    await page.screenshot({ path: 'test-results/demo/07-code-standard.png', fullPage: true });
-    console.log('   📸 截图: test-results/demo/07-code-standard.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/07-code-standard.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/07-code-standard.png\n`);
 
     // ============================================================
     // 演示完成
@@ -218,7 +220,7 @@ test.describe('RAG 知识库系统完整演示', () => {
     console.log(`║  • RAG 检索:   ${hasRetrieving ? '✅' : '⚠️'} ${hasRetrieving ? '正常' : '需检查'}                                           ║`);
     console.log(`║  • 引用来源:   ${hasCitation ? '✅' : '⚠️'} ${hasCitation ? '正常' : '需检查'}                                           ║`);
     console.log('╠══════════════════════════════════════════════════════════════╣');
-    console.log('║  截图保存在: test-results/demo/                              ║');
+    console.log(`║  截图保存在: ${SCREENSHOT_DIR}`);
     console.log('╚══════════════════════════════════════════════════════════════╝\n');
 
     // 保持浏览器打开供查看

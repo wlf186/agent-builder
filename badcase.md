@@ -28,7 +28,7 @@ from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True)
     page = browser.new_page()
-    page.goto('http://localhost:20880')
+    page.goto('http://localhost:20815')
     # ... 点击智能体，发送消息，截图观察
 ```
 

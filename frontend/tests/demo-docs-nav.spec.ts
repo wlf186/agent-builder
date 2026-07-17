@@ -1,4 +1,7 @@
 import { test } from '@playwright/test';
+import { testOutputDir } from './test-paths';
+
+const SCREENSHOT_DIR = testOutputDir('demo-docs-nav');
 
 test('Navigate docs site and click hero buttons', async ({ page }) => {
   // Go directly to /en/ page
@@ -8,7 +11,7 @@ test('Navigate docs site and click hero buttons', async ({ page }) => {
   await page.waitForTimeout(2000);
 
   // Take screenshot of home page with hero section
-  await page.screenshot({ path: '/tmp/hero-01-home.png', fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/hero-01-home.png`, fullPage: true });
   console.log('Screenshot 1: Home page with hero section');
 
   // Click the first hero button "Get Started"
@@ -16,7 +19,7 @@ test('Navigate docs site and click hero buttons', async ({ page }) => {
   console.log('Clicking "Get Started" button...');
   await getStartedBtn.click();
   await page.waitForTimeout(2000);
-  await page.screenshot({ path: '/tmp/hero-02-get-started.png', fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/hero-02-get-started.png`, fullPage: true });
   console.log('Screenshot 2: After clicking Get Started');
   console.log('Current URL:', page.url());
 
@@ -29,7 +32,7 @@ test('Navigate docs site and click hero buttons', async ({ page }) => {
   console.log('Clicking "Core Features" button...');
   await coreFeaturesBtn.click();
   await page.waitForTimeout(2000);
-  await page.screenshot({ path: '/tmp/hero-03-core-features.png', fullPage: true });
+  await page.screenshot({ path: `${SCREENSHOT_DIR}/hero-03-core-features.png`, fullPage: true });
   console.log('Screenshot 3: After clicking Core Features');
   console.log('Current URL:', page.url());
 

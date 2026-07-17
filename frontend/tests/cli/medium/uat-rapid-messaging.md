@@ -4,7 +4,7 @@
 > 复杂度: medium
 
 ## 前置条件
-- 服务已启动 (localhost:20880)
+- 服务已启动 (localhost:20815)
 - test3 智能体可用
 
 ---
@@ -14,7 +14,7 @@
 > 背景: 之前存在循环依赖问题导致第二条消息被 initialMessages useEffect 覆盖。修复方案使用 localMessageUpdateRef 标志跳过覆盖。
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 找到并点击 "test3" 智能体卡片
 4. 等待 0.5 秒
@@ -38,7 +38,7 @@
 ### 测试用例 2: 发送消息后输入框应该被清空
 
 ## 步骤
-1. 打开 http://localhost:20880
+1. 打开 http://localhost:20815
 2. 等待页面加载完成
 3. 找到并点击 "test3" 智能体卡片
 4. 等待 0.5 秒

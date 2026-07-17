@@ -134,8 +134,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         else:
             return [types.TextContent(type="text", text=f"未知工具: {name}")]
 
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"计算错误: {str(e)}")]
+    except Exception:
+        return [types.TextContent(type="text", text="计算错误: 参数无效或超出安全范围")]
 
 
 async def main():

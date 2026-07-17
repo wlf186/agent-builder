@@ -14,10 +14,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const AGENT_NAME = 'test3';
-const SCREENSHOT_DIR = 'teams/AC130/iterations/AC130-202603151517/uat_screenshots';
+const SCREENSHOT_DIR = testOutputDir('uat-test3-empty-response');
 
 /**
  * 点击智能体卡片 - 支持多种选择器

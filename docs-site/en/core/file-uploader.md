@@ -1,7 +1,8 @@
 ---
-title: File Uploader
+title: "File Uploader"
 category: core
 component: FileUploader
+generated: true
 related:
   - AgentChat
 ---

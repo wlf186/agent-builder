@@ -1,7 +1,8 @@
 ---
-title: Conversation List
+title: "Conversation List"
 category: core
 component: ConversationList
+generated: true
 related:
   - ConversationCard
 ---

@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
 /**
  * UAT测试用例: test3 Agent空响应问题修复验证
@@ -9,7 +10,7 @@ import { test, expect } from '@playwright/test';
  * 2. AgentConfig属性访问错误修复
  */
 
-const SCREENSHOT_DIR = 'teams/AC130/iterations/AC130-202603151517/uat_screenshots';
+const SCREENSHOT_DIR = testOutputDir('uat-streaming-fix');
 
 test.describe('UAT: 流式输出修复验证', () => {
   test('TC-001: test3 agent 基本响应验证', async ({ page }) => {
@@ -17,7 +18,7 @@ test.describe('UAT: 流式输出修复验证', () => {
 
     // 步骤1: 访问主页
     console.log('\n=== 步骤1: 访问主页 ===');
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 截图: 主页加载
@@ -110,7 +111,7 @@ test.describe('UAT: 流式输出修复验证', () => {
 
     console.log('\n=== 流式输出打字机效果验证 ===');
 
-    await page.goto('http://localhost:20880');
+    await page.goto('http://localhost:20815');
     await page.waitForLoadState('networkidle');
 
     // 选择test3 agent

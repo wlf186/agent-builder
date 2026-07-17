@@ -4,7 +4,7 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (前端 localhost:20880, 后端 localhost:20881)
+- 服务已启动 (前端 localhost:20815, 后端 localhost:20881)
 - test001 智能体已配置
 
 ---
@@ -13,12 +13,12 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880`，等待页面加载完成
+1. 导航到 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/uat-regression-v13/01-homepage.png`
 3. 在 snapshot 中找到 "调试对话" 按钮，点击
 4. 等待 1 秒
 5. 截图保存到 `test-results/cli/uat-regression-v13/02-chat-page-before.png`
-6. 找到消息输入框 (`textarea[placeholder*="输入消息"]`)，输入 "请使用 pdf 技能读取 /home/wremote/claude-dev/agent-builder-general/README.md 文件"
+6. 找到消息输入框 (`textarea[placeholder*="输入消息"]`)，输入“请使用 pdf 技能读取仓库根目录 README.md 文件”
 7. 截图保存到 `test-results/cli/uat-regression-v13/03-message-input.png`
 8. 在 snapshot 中找到 "发送" 按钮，点击
 9. 等待 30 秒 (技能执行)

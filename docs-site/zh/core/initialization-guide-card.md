@@ -1,7 +1,8 @@
 ---
-title: 初始化引导卡片
+title: "初始化引导卡片"
 category: core
 component: InitializationGuideCard
+generated: true
 related:
   - EnvironmentBanner
 ---

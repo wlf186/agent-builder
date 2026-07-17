@@ -9,9 +9,11 @@
  */
 
 import { test, expect, Page, BrowserContext } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const DISPLAY = process.env.DISPLAY || ':0';
+const SCREENSHOT_DIR = testOutputDir('rag-acceptance-demo');
 
 test.describe('RAG 知识库验收标准演示', () => {
   test.setTimeout(600000); // 10分钟
@@ -43,9 +45,9 @@ test.describe('RAG 知识库验收标准演示', () => {
     await page.setViewportSize({ width: 1920, height: 1080 });
     await page.waitForTimeout(500);
 
-    await page.screenshot({ path: 'test-results/acceptance/01-kb-page.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/01-kb-page.png`, fullPage: true });
     console.log('   ✅ 已进入知识库管理页面');
-    console.log('   📸 截图: test-results/acceptance/01-kb-page.png\n');
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/01-kb-page.png\n`);
 
     // 检查是否已有"人力资源库"
     console.log('📍 步骤 1.2: 检查是否存在"人力资源库"...');
@@ -61,8 +63,8 @@ test.describe('RAG 知识库验收标准演示', () => {
       await page.waitForTimeout(60000);
     }
 
-    await page.screenshot({ path: 'test-results/acceptance/02-kb-list.png', fullPage: true });
-    console.log('   📸 截图: test-results/acceptance/02-kb-list.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/02-kb-list.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/02-kb-list.png\n`);
 
     // ============================================================
     // 验收标准 2: 在"行政助手"Agent中挂载知识库
@@ -77,9 +79,9 @@ test.describe('RAG 知识库验收标准演示', () => {
     await page.setViewportSize({ width: 1920, height: 1080 });
     await page.waitForTimeout(2000);
 
-    await page.screenshot({ path: 'test-results/acceptance/03-homepage.png', fullPage: true });
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/03-homepage.png`, fullPage: true });
     console.log('   ✅ 已返回主页');
-    console.log('   📸 截图: test-results/acceptance/03-homepage.png\n');
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/03-homepage.png\n`);
 
     // 查找"行政助手"或"UAT行政助手"
     console.log('📍 步骤 2.2: 查找并选择"行政助手"智能体...');
@@ -114,8 +116,8 @@ test.describe('RAG 知识库验收标准演示', () => {
       }
     }
 
-    await page.screenshot({ path: 'test-results/acceptance/04-agent-selected.png', fullPage: true });
-    console.log('   📸 截图: test-results/acceptance/04-agent-selected.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/04-agent-selected.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/04-agent-selected.png\n`);
 
     // 检查知识库配置
     console.log('📍 步骤 2.3: 检查知识库挂载状态...');
@@ -125,8 +127,8 @@ test.describe('RAG 知识库验收标准演示', () => {
 
     console.log(`   ${hasKbMounted ? '✅' : '⚠️'} 知识库挂载状态: ${hasKbMounted ? '已挂载' : '未检测到'}`);
 
-    await page.screenshot({ path: 'test-results/acceptance/05-kb-mounted.png', fullPage: true });
-    console.log('   📸 截图: test-results/acceptance/05-kb-mounted.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/05-kb-mounted.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/05-kb-mounted.png\n`);
 
     // ============================================================
     // 验收标准 3: 对话测试 - 行政助手
@@ -184,8 +186,8 @@ test.describe('RAG 知识库验收标准演示', () => {
 
     console.log('   ╚═══════════════════════════════════════════════════════════╝\n');
 
-    await page.screenshot({ path: 'test-results/acceptance/06-rag-answer.png', fullPage: true });
-    console.log('   📸 截图: test-results/acceptance/06-rag-answer.png\n');
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/06-rag-answer.png`, fullPage: true });
+    console.log(`   📸 截图: ${SCREENSHOT_DIR}/06-rag-answer.png\n`);
 
     // ============================================================
     // 验收标准 4: 技术支持不触发检索
@@ -217,8 +219,8 @@ test.describe('RAG 知识库验收标准演示', () => {
     if (!techAgentFound) {
       console.log('   ⚠️ 未找到"技术支持"智能体，跳过此验证');
     } else {
-      await page.screenshot({ path: 'test-results/acceptance/07-tech-agent.png', fullPage: true });
-      console.log('   📸 截图: test-results/acceptance/07-tech-agent.png\n');
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/07-tech-agent.png`, fullPage: true });
+      console.log(`   📸 截图: ${SCREENSHOT_DIR}/07-tech-agent.png\n`);
 
       // 发送相同问题
       console.log('📍 步骤 4.2: 发送相同问题测试...');
@@ -253,8 +255,8 @@ test.describe('RAG 知识库验收标准演示', () => {
 
       console.log('   ╚═══════════════════════════════════════════════════════════╝\n');
 
-      await page.screenshot({ path: 'test-results/acceptance/08-tech-answer.png', fullPage: true });
-      console.log('   📸 截图: test-results/acceptance/08-tech-answer.png\n');
+      await page.screenshot({ path: `${SCREENSHOT_DIR}/08-tech-answer.png`, fullPage: true });
+      console.log(`   📸 截图: ${SCREENSHOT_DIR}/08-tech-answer.png\n`);
     }
 
     // ============================================================
@@ -269,7 +271,7 @@ test.describe('RAG 知识库验收标准演示', () => {
     console.log(`║  3. 行政助手RAG检索:      ${hasRetrievingHint && hasCorrectAnswer ? '✅ 通过' : '❌ 失败'}                            ║`);
     console.log(`║  4. 技术支持不触发检索:   ✅ 通过                              ║`);
     console.log('╠════════════════════════════════════════════════════════════════╣');
-    console.log('║  截图保存在: test-results/acceptance/                          ║');
+    console.log(`║  截图保存在: ${SCREENSHOT_DIR}`);
     console.log('║  浏览器将保持打开 60 秒供查看...                                ║');
     console.log('╚════════════════════════════════════════════════════════════════╝\n');
 

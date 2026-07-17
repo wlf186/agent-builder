@@ -6,9 +6,9 @@
 > 注意: 此脚本需要实际 PDF 文件， headed 模式兼容 playwright-cli
 
 ## 前置条件
-- 服务已启动 (前端 localhost:20880, 后端 localhost:20881)
+- 服务已启动 (前端 localhost:20815, 后端 localhost:20881)
 - test3 智能体已配置
-- PDF 文件可用 (如 `/home/wremote/claude-dev/agent-builder-general/resources/Thinking Fast and Slow (Daniel Kahneman) (Z-Library).pdf`)
+- PDF 文件可用（例如仓库内 `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.pdf`）
 
 ---
 
@@ -17,7 +17,7 @@
 ## 步骤
 
 1. **初始化**:
-   - 导航到 `http://localhost:20880`，等待页面加载完成
+   - 导航到 `http://localhost:20815`，等待页面加载完成
    - 触发浏览器重绘: 执行 `window.scrollTo(0, 0)`
    - 等待 0.1 秒
 

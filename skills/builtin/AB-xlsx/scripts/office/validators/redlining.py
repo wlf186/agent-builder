@@ -2,10 +2,16 @@
 Validator for tracked changes in Word documents.
 """
 
-import subprocess
+from difflib import unified_diff
 import tempfile
-import zipfile
 from pathlib import Path
+
+from safe_zip import safe_extract_zip
+from secure_temp import secure_temp_root
+
+
+MAX_DIFF_INPUT_CHARS = 200_000
+MAX_DIFF_OUTPUT_CHARS = 16_384
 
 
 class RedliningValidator:
@@ -56,14 +62,13 @@ class RedliningValidator:
         except Exception:
             pass
 
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory(dir=secure_temp_root()) as temp_dir:
             temp_path = Path(temp_dir)
 
             try:
-                with zipfile.ZipFile(self.original_docx, "r") as zip_ref:
-                    zip_ref.extractall(temp_path)
-            except Exception as e:
-                print(f"FAILED - Error unpacking original docx: {e}")
+                safe_extract_zip(self.original_docx, temp_path)
+            except Exception:
+                print("FAILED - Error unpacking original docx")
                 return False
 
             original_file = temp_path / "word" / "document.xml"
@@ -80,8 +85,8 @@ class RedliningValidator:
                 modified_root = modified_tree.getroot()
                 original_tree = ET.parse(original_file)
                 original_root = original_tree.getroot()
-            except ET.ParseError as e:
-                print(f"FAILED - Error parsing XML files: {e}")
+            except ET.ParseError:
+                print("FAILED - Error parsing XML files")
                 return False
 
             self._remove_author_tracked_changes(original_root)
@@ -116,84 +121,38 @@ class RedliningValidator:
             "",
         ]
 
-        git_diff = self._get_git_word_diff(original_text, modified_text)
-        if git_diff:
-            error_parts.extend(["Differences:", "============", git_diff])
+        text_diff = self._get_text_diff(original_text, modified_text)
+        if text_diff:
+            error_parts.extend(["Differences:", "============", text_diff])
         else:
-            error_parts.append("Unable to generate word diff (git not available)")
+            error_parts.append("Unable to generate a bounded text diff")
 
         return "\n".join(error_parts)
 
-    def _get_git_word_diff(self, original_text, modified_text):
-        try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-
-                original_file = temp_path / "original.txt"
-                modified_file = temp_path / "modified.txt"
-
-                original_file.write_text(original_text, encoding="utf-8")
-                modified_file.write_text(modified_text, encoding="utf-8")
-
-                result = subprocess.run(
-                    [
-                        "git",
-                        "diff",
-                        "--word-diff=plain",
-                        "--word-diff-regex=.",  
-                        "-U0",  
-                        "--no-index",
-                        str(original_file),
-                        str(modified_file),
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if result.stdout.strip():
-                    lines = result.stdout.split("\n")
-                    content_lines = []
-                    in_content = False
-                    for line in lines:
-                        if line.startswith("@@"):
-                            in_content = True
-                            continue
-                        if in_content and line.strip():
-                            content_lines.append(line)
-
-                    if content_lines:
-                        return "\n".join(content_lines)
-
-                result = subprocess.run(
-                    [
-                        "git",
-                        "diff",
-                        "--word-diff=plain",
-                        "-U0",  
-                        "--no-index",
-                        str(original_file),
-                        str(modified_file),
-                    ],
-                    capture_output=True,
-                    text=True,
-                )
-
-                if result.stdout.strip():
-                    lines = result.stdout.split("\n")
-                    content_lines = []
-                    in_content = False
-                    for line in lines:
-                        if line.startswith("@@"):
-                            in_content = True
-                            continue
-                        if in_content and line.strip():
-                            content_lines.append(line)
-                    return "\n".join(content_lines)
-
-        except (subprocess.CalledProcessError, FileNotFoundError, Exception):
-            pass
-
-        return None
+    def _get_text_diff(self, original_text, modified_text):
+        truncated_input = (
+            len(original_text) > MAX_DIFF_INPUT_CHARS
+            or len(modified_text) > MAX_DIFF_INPUT_CHARS
+        )
+        original_preview = original_text[:MAX_DIFF_INPUT_CHARS]
+        modified_preview = modified_text[:MAX_DIFF_INPUT_CHARS]
+        diff = "\n".join(
+            unified_diff(
+                original_preview.splitlines(),
+                modified_preview.splitlines(),
+                fromfile="original",
+                tofile="modified",
+                n=1,
+                lineterm="",
+            )
+        )
+        if not diff and truncated_input:
+            return "[difference occurs outside the bounded diff preview]"
+        if len(diff) > MAX_DIFF_OUTPUT_CHARS:
+            diff = diff[:MAX_DIFF_OUTPUT_CHARS] + "\n[diff output truncated]"
+        elif truncated_input and diff:
+            diff += "\n[diff input truncated]"
+        return diff or None
 
     def _remove_author_tracked_changes(self, root):
         ins_tag = f"{{{self.namespaces['w']}}}ins"

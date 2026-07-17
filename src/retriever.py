@@ -71,12 +71,20 @@ class Retriever:
                 top_k
             )
 
-            logger.debug(f"检索查询: '{query}', 结果数: {len(formatted_results)}/{top_k}")
+            logger.debug(
+                "检索完成: query_chars=%d results=%d requested=%d",
+                len(query),
+                len(formatted_results),
+                top_k,
+            )
             return formatted_results
 
-        except Exception as e:
-            logger.error(f"检索失败: {e}")
-            return []
+        except Exception as exc:
+            # Empty results and a failed vector store are materially different:
+            # callers must be able to report an outage instead of hallucinating
+            # that the knowledge base contained no matching information.
+            logger.error("向量检索失败: error_type=%s", type(exc).__name__)
+            raise
 
     def _format_results(
         self,
@@ -108,9 +116,9 @@ class Retriever:
         for i, (doc_id, distance, content, metadata) in enumerate(
             zip(ids, distances, documents, metadatas)
         ):
-            # ChromaDB 返回的是 L2 距离，转换为相似度
-            # 余弦相似度: similarity = 1 / (1 + distance)
-            score = 1 / (1 + distance)
+            # collection 使用 hnsw:space=cosine，Chroma 返回 cosine distance。
+            # 对应相似度为 1 - distance，并限制到 API 声明的 0..1 范围。
+            score = max(0.0, min(1.0, 1.0 - float(distance)))
 
             if score < score_threshold:
                 continue
@@ -162,9 +170,9 @@ class Retriever:
 
             return self._format_results(results, score_threshold, top_k)
 
-        except Exception as e:
-            logger.error(f"向量检索失败: {e}")
-            return []
+        except Exception as exc:
+            logger.error("预编码向量检索失败: error_type=%s", type(exc).__name__)
+            raise
 
     def get_collection_size(self) -> int:
         """获取集合中的文档块数量
@@ -174,9 +182,9 @@ class Retriever:
         """
         try:
             return self.collection.count()
-        except Exception as e:
-            logger.error(f"获取集合大小失败: {e}")
-            return 0
+        except Exception as exc:
+            logger.error("获取集合大小失败: error_type=%s", type(exc).__name__)
+            raise
 
 
 class HybridRetriever(Retriever):

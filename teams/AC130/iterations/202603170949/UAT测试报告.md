@@ -17,12 +17,12 @@
 
 **测试方法**: Playwright 自动化测试（headless 模式）
 **测试脚本**:
-- `/home/wremote/claude-dev/agent-builder-general/frontend/tests/uat-rag-iteration-202603170949.spec.ts`
-- `/home/wremote/claude-dev/agent-builder-general/frontend/tests/simple-uat-rag.spec.ts`
-- `/home/wremote/claude-dev/agent-builder-general/frontend/tests/final-uat-rag.spec.ts`
-- `/home/wremote/claude-dev/agent-builder-general/frontend/tests/chat-uat-rag.spec.ts`
+- `frontend/tests/uat-rag-iteration-202603170949.spec.ts`
+- `frontend/tests/simple-uat-rag.spec.ts`
+- `frontend/tests/final-uat-rag.spec.ts`
+- `frontend/tests/chat-uat-rag.spec.ts`
 
-**截图目录**: `/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/screenshots/`
+**截图目录**：`.runtime/test-results/202603170949/screenshots/`
 
 ---
 
@@ -261,9 +261,9 @@ curl -X POST http://localhost:20881/api/agents \
 
 ### 测试文档位置
 
-- `/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.txt`
-- `/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.pdf`
-- `/home/wremote/claude-dev/agent-builder-general/teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司代码规范.txt`
+- `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.txt`
+- `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司2026员工手册.pdf`
+- `teams/AC130/iterations/202603170949/test_documents/Cyberpunk公司代码规范.txt`
 
 ### 已生成的截图列表
 

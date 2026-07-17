@@ -1,103 +1,210 @@
-# CLAUDE.md
+# Agent Builder repository guide
 
-Agent Builder - 通用 AI 智能体构建平台。支持多 LLM、MCP 工具集成、技能系统、流式对话、RAG 知识库。
+Agent Builder is a local-first platform for composing and running AI agents. It
+includes a FastAPI backend, a Next.js frontend, MCP and skill execution, RAG,
+conversation persistence, and vendor-neutral local tracing.
 
----
+This file is the concise source of truth for coding agents. `AGENTS.md` is a
+symbolic link to this file so all supported agent tools receive identical rules.
 
-## 快速启动
+## Quick commands
 
 ```bash
-./start.sh          # 启动前后端服务
-./stop.sh           # 停止服务
-./start.sh --skip-deps  # 跳过依赖检查
+./bootstrap.sh                         # install pinned, project-local toolchains
+./start.sh                             # bootstrap if needed, then start all services
+./stop.sh                              # stop every process started by this checkout
+./purge.sh cache --yes                 # remove only reproducible caches
+./purge.sh all --yes                   # remove all local runtime state (destructive)
 ```
 
-**端口**: 前端 20880 | 后端 20881 | MCP SSE 20882
+Lifecycle options:
 
----
+- `bootstrap.sh`: `--skip-node`, `--no-build`, `--rebuild`, `--offline`
+- `start.sh`: `--skip-bootstrap`, `--no-observability`, `--no-docs`
+- `stop.sh`: `--force`, `--service <backend|frontend|docs|phoenix>`
+- `purge.sh`: `--yes`; scopes are `cache`, `logs`, `observability`,
+  `environments`, `data`, `build`, `dependencies`, or `all`
 
-## 核心约束（必须遵守）
+Default listeners are loopback-only:
 
-> ⚠️ **流式输出不可破坏** - 打字机效果、thinking/tool_call 实时展示是核心体验，任何修改都不能破坏。
+| Component | Address |
+| --- | --- |
+| Frontend | `http://127.0.0.1:20815` |
+| Backend API | `http://127.0.0.1:20881` |
+| Built-in MCP SSE | `http://127.0.0.1:20882` |
+| User guide | `http://127.0.0.1:4173` |
+| Local traces | `http://127.0.0.1:6006` |
 
-> ⚠️ **Python 虚拟环境强制使用** - 运行任何 Python 脚本或 pip 安装时，必须使用项目根目录的 `.venv` 虚拟环境，禁止使用系统级 Python/pip。
+## Non-negotiable engineering rules
 
-**正确用法**:
+1. Preserve streaming semantics. Thinking, tool calls, content chunks,
+   cancellation, and terminal events must remain incremental and ordered.
+2. Do not install project dependencies globally. Source `env.sh` and use the
+   checkout-local uv, Python, Node, npm caches, and virtual environments.
+3. Do not write runtime state outside this checkout. Persistent application
+   data belongs in `data/`; disposable state and managed Python belong in
+   `.runtime/`; uv and Node belong in `.tools/`; the root Python environment is
+   `.venv/`.
+4. Never commit credentials or put them in URLs, client-visible variables,
+   command arguments, logs, traces, or error responses.
+5. The backend remains loopback-bound and authenticated by default. New API
+   routes are protected unless they are explicitly documented health checks.
+6. Treat filenames, archive entries, agent names, MCP URLs, and model endpoints
+   as untrusted input. Preserve containment, upload limits, SSRF checks, and
+   subprocess resource limits.
+7. Do not add per-token disk writes or unbounded in-memory logs. Batch streaming
+   updates and telemetry; enforce rotation, retention, sampling, and size caps.
+8. Uploaded Skill execution is fail-closed. Preserve Linux Landlock filesystem
+   confinement, resource limits, and default seccomp network denial; never add
+   an unconfined fallback when the kernel cannot provide the sandbox.
+9. Treat local-process MCP as code execution. It remains disabled unless the
+   operator explicitly sets `AGENT_BUILDER_ALLOW_STDIO_MCP=1`; never enable it
+   from request data or pass the control-plane API token to a child process.
+
+## Local environment and isolation
+
+Run development commands after loading the same containment environment used by
+the lifecycle scripts:
+
 ```bash
-.venv/bin/python script.py        # 运行 Python 脚本
-.venv/bin/pip install package     # 安装 Python 包
+source ./env.sh
+./.tools/uv sync --frozen
+./.venv/bin/python -m pytest
+npm --prefix frontend run lint
+npm --prefix frontend run build
+npm run governance:check
 ```
 
-> ⚠️ **重启服务前清除前端缓存** - 每次执行 `./stop.sh && ./start.sh` 前，必须先清除 Next.js 缓存，否则可能加载旧代码：
-> ```bash
-> rm -rf frontend/.next && ./stop.sh && ./start.sh --skip-deps
-> ```
+`env.sh` redirects `HOME`, `TMPDIR`/`TEMP`/`TMP`, every XDG directory,
+uv/pip/npm/model/compiler caches, Playwright browsers, and Python bytecode into
+`.runtime/`. It clears inherited Conda/venv and package-install destinations and
+must not modify a user's shell profile. Per-skill Python environments live
+under `.runtime/environments` and are created by uv.
 
-> ⛔ **Playwright 一律使用 playwright-cli，禁止 Test Runner** - 自 2026-03-27 起，所有新增/修改的 Playwright 脚本（headed 和 headless 均适用）必须使用项目内置的 `playwright-cli` 技能编写和执行。禁止使用 `npx playwright test` 及 Test Runner 框架（`@playwright/test` 的 `test()`/`expect()` API）。详见 [testing-guide.md](docs/references/testing-guide.md)。
+The supported deployment baseline is glibc 2.28+ GNU/Linux on `x86_64` or
+`aarch64`; [README.md](README.md) is authoritative for host packages, network
+access, capacity, platform qualification, first-use model setup, and operator
+troubleshooting. Do not claim another platform is supported without an
+equivalent cold-checkout lifecycle validation.
 
----
+Do not bypass these paths with system `pip`, global npm installs, Conda,
+containers, `/tmp`-based application state, or user-home caches.
+Per-agent package changes use uv with `--only-binary :all:` and the package
+allowlist; do not enable source distributions or PEP 517 build hooks.
 
-## 凭证安全
+## Architecture boundaries
 
-> ⚠️ **禁止明文存储凭证** - 所有 Token/密钥必须使用环境变量，绝不写入代码或 git config。
+- `backend.py`: HTTP/SSE boundary, request validation, authentication, and
+  orchestration only. Move reusable behavior into `src/`.
+- `src/agent_engine.py`: agent planning and streaming execution.
+- `src/observability/`: backend-neutral tracing API and OpenTelemetry exporter.
+- `src/execution_engine.py`: bounded subprocess execution and cancellation.
+- `src/*_manager.py`: project-local persistence and registries.
+- `frontend/src/app/api/`: server-only authenticated proxy to the backend. The
+  API token must never use a `NEXT_PUBLIC_` variable.
+- `frontend/src/components/`: UI and bilingual `@userGuide` source annotations.
+- `docs-site/`: generated component pages plus hand-written user documentation.
 
-| 凭证 | 环境变量 | 用途 |
-|------|----------|------|
-| GitHub PAT | `$CCGHTK` | Git push/PR 操作 |
-| Langfuse Keys | `$LANGFUSE_PUBLIC_KEY` / `$LANGFUSE_SECRET_KEY` | 可观测性追踪 |
+Conversation messages use SQLite/WAL to avoid rewriting full histories.
+Knowledge-base clients and collections are reused. When adding persistence,
+prefer atomic replacement or transactional append/update over repeated complete
+file rewrites.
 
-**Git 远程配置**: HTTPS URL，推送时使用 `$CCGHTK`：
+## Security and privacy
+
+- `AGENT_BUILDER_API_TOKEN` is generated into `.runtime/secrets/api-token` with
+  restrictive permissions. The frontend server injects it when proxying `/api`.
+- Every non-preflight backend `/api/**` request requires the token through a
+  Bearer or `X-API-Key` header. `/health` is the unauthenticated health check;
+  browser code must use the same-origin frontend proxy and must never read the
+  token.
+- CORS origins are explicit and never wildcarded. Outbound URLs reject embedded
+  credentials, metadata targets, and unsafe resolution. Every DNS hostname
+  requires a narrow `AGENT_BUILDER_SSRF_ALLOWLIST` entry; custom private targets
+  should use a port-scoped IP literal. Do not broadly allow private networks.
+- Upload handling is streaming and bounded by compressed size, expanded size,
+  entry count, and path containment.
+- Skill subprocesses require Linux Landlock, have bounded resources and output,
+  and cannot create network sockets unless the operator sets
+  `AGENT_BUILDER_SKILL_NETWORK=allow` before startup.
+- Trace and debug serializers redact credential-like fields and cap depth,
+  collection count, and string size.
+- Local observability uses OpenTelemetry/OpenInference and a project-local
+  Phoenix SQLite store. Use `./start.sh --no-observability` for a no-op tracer
+  and no dashboard; `OBSERVABILITY_ENABLED=false` applies when the backend is
+  launched outside the lifecycle script.
+- Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md), not
+  in a public issue containing exploit or credential details.
+
+## Testing policy
+
+Use the smallest relevant test first, then the full checks before handoff:
+
 ```bash
-git push https://${CCGHTK}@github.com/wlf186/agent-builder-general.git main
+source ./env.sh
+./.venv/bin/python -m pytest
+npm --prefix frontend run lint
+npm --prefix frontend run build
+npm run governance:check
 ```
 
----
+Playwright Test is the reproducible CI/regression harness. Interactive browser
+automation may use Playwright CLI for exploration, but it does not replace a
+committed regression test for a fixed defect. Browser tests must write artifacts
+under `.runtime/test-results` and must not assume a headed display.
 
-## 开发提示
+Tests must cover negative security cases when changing file paths, uploads,
+archives, URLs, authentication, subprocesses, or proxy behavior. Lifecycle
+changes require start/health/stop and stale-PID validation.
 
-**Playwright**:
-- **一律使用 playwright-cli 技能**，禁止 Test Runner
-- **默认 headless 模式**：开发后的例行测试、验证等场景，直接 `playwright-cli open <url>` 即可，无需 headed
-- **Headed 模式触发条件**：仅在用户明确要求"演示"、"show me"、"看一下效果"等可视化展示场景下使用。触发时：
-  1. 先检查 `echo $DISPLAY` 是否有值
-  2. 有值 → 加 `--headed` 参数：`playwright-cli open <url> --headed`
-  3. 无值 → 回退 headless 模式并告知用户无显示环境
-  4. playwright-cli **不会自动检测 DISPLAY 变量**，必须手动判断
-- **沙箱限制**: playwright-cli 命令需要绕过沙箱执行（`dangerouslyDisableSandbox: true`），否则浏览器进程无法启动
-- **可用浏览器**: `msedge`（默认，已安装），chrome 未安装
-- **X11 渲染问题**: 页面加载后执行 `playwright-cli eval "window.scrollTo(0, 0)"` 触发重绘
+## Documentation governance
 
-详见 [docs/references/testing-guide.md](docs/references/testing-guide.md)
+Documentation ownership and workflow are defined in
+[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md). The ownership summary is:
 
-**外部服务链接**:
-- **禁止硬编码 `localhost`** — 指向本机其他端口的外部服务（如 Langfuse `:3000`）不能写死 `localhost`，远程访问时会跳转到客户端本机
-- **使用服务端重定向 API** — 在 `frontend/src/app/api/redirect/<service>/route.ts` 创建重定向路由，从请求的 `Host` 头提取 hostname 动态构造目标 URL
-- **不能用 Next.js rewrite** — 同为 Next.js 的服务（如 Langfuse）`/_next` 路径会冲突
-- **不能依赖客户端 JS** — `onClick`/`useEffect` 可能因 hydration 时序问题不触发，`href` 必须本身正确
+| Surface | Accountable owner | Required review trigger |
+| --- | --- | --- |
+| `CLAUDE.md` and linked `AGENTS.md` | repository maintainers | commands, global invariants, definition of done |
+| `README.md` and lifecycle help | runtime owners | platforms, dependencies, network/capacity, paths, flags, ports, start/stop/purge behavior |
+| `SECURITY.md` | security maintainers | auth, trust boundaries, allowlists, sandboxing, secret handling |
+| `docs/design-docs/`, `docs/references/` | affected component owner | architecture, protocol, API, storage, or configuration changes |
+| `docs/product-specs/`, `docs-site/` | feature owner | acceptance criteria or user-visible workflow changes |
+| `docs/exec-plans/` | plan owner | work starts, changes direction, completes, or is abandoned |
 
----
+When behavior, flags, ports, APIs, configuration, security controls, or user
+flows change, update the authoritative document in the same change. Avoid
+duplicating rules across files; link to the source of truth. CI validates
+metadata, generated pages, Markdown, local links, documented lifecycle commands,
+the `AGENTS.md` symlink, generated-page drift, documented default ports, review
+freshness, dependency policy and vulnerability audits, the VitePress build,
+credential patterns, and a cold-checkout full-stack lifecycle smoke test.
 
-## 文档索引
+Maintainers review active plans when their work changes and audit maintained
+design, reference, security, and operator documents at least quarterly and
+before a release. The audit result updates the document or records that it was
+reviewed in [the governance ledger](docs/DOCUMENTATION.md); obsolete detail is
+deleted and remains available through Git history.
 
-| 用途 | 文档 |
-|------|------|
-| 黄金原则 | [docs/design-docs/core-beliefs.md](docs/design-docs/core-beliefs.md) |
-| 项目结构 | [docs/references/project-structure.md](docs/references/project-structure.md) |
-| API 参考 | [docs/references/api-reference.md](docs/references/api-reference.md) |
-| 流式协议 | [docs/design-docs/streaming-protocol.md](docs/design-docs/streaming-protocol.md) |
-| 测试指南 | [docs/references/testing-guide.md](docs/references/testing-guide.md) |
+Run the same local gates before handoff:
 
----
+```bash
+source ./env.sh
+npm run governance:check
+```
 
-## 文档维护规则
+## Definition of done
 
-| 内容类型 | 放置位置 | 示例 |
-|----------|----------|------|
-| 必须遵守的约束 | CLAUDE.md 核心约束 | 流式不可破坏、venv 使用 |
-| 高频命令/端口 | CLAUDE.md 快速启动 | ./start.sh、端口信息 |
-| 安全相关规则 | CLAUDE.md 凭证安全 | 禁止明文凭证 |
-| 文件/目录描述 | docs/references/project-structure.md | 组件表、目录树 |
-| 设计原则/流程 | docs/design-docs/ | core-beliefs.md |
-| API/技术参考 | docs/references/ | api-reference.md |
+A change is complete only when:
 
-**添加新内容时**: 先判断类型，再决定放 CLAUDE.md 还是 docs/。
+- implementation and migration/rollback behavior are present;
+- relevant unit, integration, and negative tests pass;
+- frontend and documentation builds pass when affected;
+- no new unbounded memory/disk growth, secret exposure, or outside-workspace
+  write is introduced;
+- generated artifacts and runtime state remain ignored;
+- documentation matches the final behavior.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md),
+[project structure](docs/references/project-structure.md),
+[API reference](docs/references/api-reference.md), and
+[streaming protocol](docs/design-docs/streaming-protocol.md) for details.

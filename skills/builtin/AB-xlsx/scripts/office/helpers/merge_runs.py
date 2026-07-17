@@ -35,8 +35,8 @@ def merge_runs(input_dir: str) -> tuple[int, str]:
         doc_xml.write_bytes(dom.toxml(encoding="UTF-8"))
         return merge_count, f"Merged {merge_count} runs"
 
-    except Exception as e:
-        return 0, f"Error: {e}"
+    except Exception:
+        return 0, "Error: unable to merge runs"
 
 
 

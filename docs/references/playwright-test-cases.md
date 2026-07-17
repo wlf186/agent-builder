@@ -11,11 +11,12 @@
 ## 1. 测试环境准备
 
 ### 1.1 前置条件
-1. 后端服务已启动 (`python backend.py`，端口 20881)
-2. 前端服务已启动 (`npm run dev`，端口 20880)
+
+1. 已通过 `./start.sh` 启动受管后端和生产前端
+2. 前端位于 `http://127.0.0.1:20815`
 3. `test001` 智能体已配置且可用
 4. MCP服务（如cold-jokes）已启用（用于测试工具调用）
-5. Playwright已安装并配置
+5. 已运行 `./bootstrap.sh` 安装项目内 Playwright 依赖
 
 ### 1.2 测试数据准备
 每个会话至少包含2-3轮对话，测试对话内容如下：
@@ -27,22 +28,14 @@
 | 会话C | "今天天气怎么样？" | "北京呢？" | "明天会下雨吗？" |
 
 ### 1.3 测试环境启动命令
+
 ```bash
-# 启动后端
-cd /work/agent-builder-general
-python backend.py &
+# 在仓库根目录启动受管服务并加载项目内工具链
+./start.sh
+source ./env.sh
 
-# 启动前端
-cd /work/agent-builder-general/frontend
-npm run dev &
-
-# 安装Playwright（如未安装）
-cd /work/agent-builder-general/frontend
-npm install playwright
-npx playwright install chromium
-
-# 运行测试
-npx playwright test tests/history-conversation.spec.ts
+# 运行已提交的回归测试
+npm --prefix frontend exec playwright test tests/history-conversation.spec.ts
 ```
 
 ---
@@ -55,7 +48,7 @@ npx playwright test tests/history-conversation.spec.ts
 |------|------|
 | **测试目的** | 验证历史会话按钮在调试对话区域正确显示 |
 | **前置条件** | 已选择 `test001` 智能体，调试对话区域已渲染 |
-| **测试步骤** | 1. 打开首页 `http://localhost:20880`<br>2. 点击 `test001` 智能体卡片<br>3. 观察调试对话区域标题栏 |
+| **测试步骤** | 1. 打开首页 `http://localhost:20815`<br>2. 点击 `test001` 智能体卡片<br>3. 观察调试对话区域标题栏 |
 | **预期结果** | 1. 标题栏右侧显示"历史"按钮<br>2. 按钮包含时钟图标<br>3. 按钮可点击，hover效果正常 |
 | **优先级** | P0 |
 

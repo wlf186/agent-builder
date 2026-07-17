@@ -5,12 +5,13 @@ Validator for Word document XML files against XSD schemas.
 import random
 import re
 import tempfile
-import zipfile
 
 import defusedxml.minidom
 import lxml.etree
 
 from .base import BaseSchemaValidator
+from safe_zip import safe_extract_zip
+from secure_temp import secure_temp_root
 
 
 class DOCXSchemaValidator(BaseSchemaValidator):
@@ -94,9 +95,9 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                                     f"Line {elem.sourceline}: w:t element with whitespace missing xml:space='preserve': {text_preview}"
                                 )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {xml_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {xml_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -145,9 +146,9 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                         f"Line {instr_elem.sourceline}: <w:instrText> found within <w:del> (use <w:delInstrText>): {text_preview}"
                     )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {xml_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {xml_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -171,8 +172,8 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                 root = lxml.etree.parse(str(xml_file)).getroot()
                 paragraphs = root.findall(f".//{{{self.WORD_2006_NAMESPACE}}}p")
                 count = len(paragraphs)
-            except Exception as e:
-                print(f"Error counting paragraphs in unpacked document: {e}")
+            except Exception:
+                print("Error counting paragraphs in unpacked document")
 
         return count
 
@@ -184,9 +185,8 @@ class DOCXSchemaValidator(BaseSchemaValidator):
         count = 0
 
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                with zipfile.ZipFile(original, "r") as zip_ref:
-                    zip_ref.extractall(temp_dir)
+            with tempfile.TemporaryDirectory(dir=secure_temp_root()) as temp_dir:
+                safe_extract_zip(original, temp_dir)
 
                 doc_xml_path = temp_dir + "/word/document.xml"
                 root = lxml.etree.parse(doc_xml_path).getroot()
@@ -194,8 +194,8 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                 paragraphs = root.findall(f".//{{{self.WORD_2006_NAMESPACE}}}p")
                 count = len(paragraphs)
 
-        except Exception as e:
-            print(f"Error counting paragraphs in original document: {e}")
+        except Exception:
+            print("Error counting paragraphs in original document")
 
         return count
 
@@ -225,9 +225,9 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                         f"Line {elem.sourceline}: <w:delText> within <w:ins>: {text_preview}"
                     )
 
-            except (lxml.etree.XMLSyntaxError, Exception) as e:
+            except Exception:
                 errors.append(
-                    f"  {xml_file.relative_to(self.unpacked_dir)}: Error: {e}"
+                    f"  {xml_file.relative_to(self.unpacked_dir)}: validation failed"
                 )
 
         if errors:
@@ -370,8 +370,8 @@ class DOCXSchemaValidator(BaseSchemaValidator):
                             f'  document.xml: marker id="{comment_id}" references non-existent comment'
                         )
 
-        except (lxml.etree.XMLSyntaxError, Exception) as e:
-            errors.append(f"  Error parsing XML: {e}")
+        except Exception:
+            errors.append("  Error parsing XML")
 
         if errors:
             print(f"FAILED - {len(errors)} comment marker violations:")

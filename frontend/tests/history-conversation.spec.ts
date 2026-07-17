@@ -12,16 +12,17 @@
  *
  * 前置条件:
  *   1. 后端服务运行在 http://localhost:20881
- *   2. 前端服务运行在 http://localhost:20880
+ *   2. 前端服务运行在 http://localhost:20815
  *   3. test001 智能体已配置
  *   4. MCP服务(如cold-jokes)已启用
  * ============================================================================
  */
 
 import { test, expect, Page, BrowserContext } from '@playwright/test';
+import { testOutputPath } from './test-paths';
 
 // 测试配置
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
 const TEST_AGENT = 'test001';
 
 // 测试对话内容
@@ -621,9 +622,10 @@ async function waitForStreamingComplete(page: Page, timeout: number = 60000) {
  */
 async function takeDebugScreenshot(page: Page, name: string) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const screenshotPath = testOutputPath('history-conversation', `test-${name}-${timestamp}.png`);
   await page.screenshot({
-    path: `/tmp/test-${name}-${timestamp}.png`,
+    path: screenshotPath,
     fullPage: true
   });
-  console.log(`[DEBUG] 截图已保存: /tmp/test-${name}-${timestamp}.png`);
+  console.log(`[DEBUG] 截图已保存: ${screenshotPath}`);
 }

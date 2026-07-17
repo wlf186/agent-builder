@@ -180,14 +180,17 @@ while (true) {
 ## 常见问题
 
 ### 流式输出不流畅
+
 1. 检查后端是否使用 `StreamingResponse`
 2. 检查 Headers 是否包含 `X-Accel-Buffering: no`
-3. 使用 `tests/test_streaming_output.py` 验证
+3. 使用 `./.venv/bin/python -m pytest tests/test_agent_engine_streaming.py`
+   验证增量事件、工具调用和内容重建
 
 ### 前端静态资源 404
+
 ```bash
-# 停止服务 → 清除缓存 → 重启
-pkill -f "next-server"
-rm -rf frontend/.next
-cd frontend && npm run dev
+# 停止受管服务，清理可重建产物，再完整启动
+./stop.sh
+./purge.sh build --yes
+./start.sh
 ```

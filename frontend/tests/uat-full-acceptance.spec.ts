@@ -9,9 +9,11 @@
  */
 
 import { test, expect } from '@playwright/test';
+import path from 'node:path';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
-const SCREENSHOT_DIR = '../teams/AC130/iterations/AC130-202603151423/screenshots';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('uat-full-acceptance');
 
 test.describe('完整 UAT 验收: 调试日志导出', () => {
 
@@ -131,6 +133,7 @@ test.describe('完整 UAT 验收: 调试日志导出', () => {
     let downloadedContent = '';
     page.on('download', async (download) => {
       console.log(`[下载] 文件名: ${download.suggestedFilename()}`);
+      await download.saveAs(path.join(SCREENSHOT_DIR, path.basename(download.suggestedFilename())));
       const stream = await download.createReadStream();
       const chunks: Buffer[] = [];
       for await (const chunk of stream) {

@@ -32,23 +32,18 @@
  * @related SkillUploadDialog
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   X,
   FileText,
-  Folder,
-  ChevronRight,
-  Download,
   Code,
   File,
 } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { useLocale } from "@/lib/LocaleContext";
-
-const API_BASE = "/api";
+import { apiPath } from "@/lib/apiPath";
 
 interface SkillDetail {
   name: string;
@@ -84,59 +79,62 @@ export function SkillDetailDialog({
   const [skill, setSkill] = useState<SkillDetail | null>(null);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileContent, setFileContent] = useState<SkillFileContent | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(() => Boolean(isOpen && skillName));
 
-  useEffect(() => {
-    if (isOpen && skillName) {
-      loadSkillDetail();
-      setSelectedFile(null);
-      setFileContent(null);
-    }
-  }, [isOpen, skillName]);
-
-  useEffect(() => {
-    if (selectedFile && skillName) {
-      loadFileContent(selectedFile);
-    }
-  }, [selectedFile]);
-
-  const loadSkillDetail = async () => {
-    if (!skillName) return;
-    setIsLoading(true);
+  const fetchSkillDetail = useCallback(async (): Promise<SkillDetail | null> => {
+    if (!skillName) return null;
     try {
-      const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(skillName)}`);
+      const res = await fetch(apiPath('skills', skillName));
       if (res.ok) {
-        const data = await res.json();
-        setSkill(data);
-        // Auto-select first md file
-        const mdFile = data.files.find((f: string) => f.endsWith('.md'));
-        if (mdFile) {
-          setSelectedFile(mdFile);
-        } else if (data.files.length > 0) {
-          setSelectedFile(data.files[0]);
-        }
+        return await res.json() as SkillDetail;
       }
     } catch (e) {
       console.error("Failed to load skill detail:", e);
-    } finally {
-      setIsLoading(false);
     }
-  };
+    return null;
+  }, [skillName]);
 
-  const loadFileContent = async (filepath: string) => {
-    if (!skillName) return;
+  const fetchFileContent = useCallback(async (filepath: string): Promise<SkillFileContent | null> => {
+    if (!skillName) return null;
     try {
-      const res = await fetch(
-        `${API_BASE}/skills/${encodeURIComponent(skillName)}/files/${encodeURIComponent(filepath)}`
-      );
+      const res = await fetch(apiPath('skills', skillName, 'files', filepath));
       if (res.ok) {
-        const data = await res.json();
-        setFileContent(data);
+        return await res.json() as SkillFileContent;
       }
     } catch (e) {
       console.error("Failed to load file content:", e);
     }
-  };
+    return null;
+  }, [skillName]);
+
+  useEffect(() => {
+    if (!isOpen || !skillName) return;
+    let cancelled = false;
+    void fetchSkillDetail().then((data) => {
+      if (cancelled) return;
+      setSkill(data);
+      setIsLoading(false);
+      if (!data) return;
+
+      // Auto-select first md file
+      const mdFile = data.files.find((file) => file.endsWith('.md'));
+      setSelectedFile(mdFile ?? data.files[0] ?? null);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, skillName, fetchSkillDetail]);
+
+  useEffect(() => {
+    if (!selectedFile || !skillName) return;
+    let cancelled = false;
+    void fetchFileContent(selectedFile).then((data) => {
+      if (!cancelled) setFileContent(data);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedFile, skillName, fetchFileContent]);
 
   const getFileIcon = (filename: string) => {
     const ext = filename.split('.').pop()?.toLowerCase();
@@ -153,23 +151,6 @@ export function SkillDetailDialog({
       default:
         return <File size={14} className="text-gray-400" />;
     }
-  };
-
-  // Build file tree
-  const buildFileTree = (files: string[]) => {
-    const tree: Record<string, string[]> = {};
-    files.forEach((file) => {
-      const parts = file.split('/');
-      if (parts.length === 1) {
-        if (!tree['']) tree[''] = [];
-        tree[''].push(file);
-      } else {
-        const dir = parts[0];
-        if (!tree[dir]) tree[dir] = [];
-        tree[dir].push(parts.slice(1).join('/'));
-      }
-    });
-    return tree;
   };
 
   if (!isOpen || !skillName) return null;

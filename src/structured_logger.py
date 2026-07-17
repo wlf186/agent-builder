@@ -13,10 +13,13 @@
 
 import json
 import re
+import threading
 import traceback
 from datetime import datetime
 from typing import Any, Optional, Dict, List
-from collections import defaultdict
+from collections import defaultdict, deque
+
+from .log_safety import content_length, summarize_arguments
 
 
 class StructuredLogger:
@@ -35,14 +38,21 @@ class StructuredLogger:
         (re.compile(r'private[_-]?key', re.IGNORECASE), 'private_key'),
         (re.compile(r'bearer', re.IGNORECASE), 'bearer'),
     ]
+    MAX_TRACES = 500
+    MAX_EVENTS_PER_TRACE = 500
+    MAX_VALUE_CHARS = 4000
+    MAX_COLLECTION_ITEMS = 50
 
     def __init__(self):
         # 日志存储：按 trace_id 分组
-        self._log_store: Dict[str, List[Dict]] = defaultdict(list)
+        self._log_store: Dict[str, deque] = defaultdict(
+            lambda: deque(maxlen=self.MAX_EVENTS_PER_TRACE)
+        )
         # 性能指标存储
         self._metrics_store: Dict[str, Dict] = {}
+        self._lock = threading.RLock()
 
-    def _sanitize(self, data: Any) -> Any:
+    def _sanitize(self, data: Any, depth: int = 0) -> Any:
         """
         敏感信息脱敏
 
@@ -52,16 +62,21 @@ class StructuredLogger:
         Returns:
             脱敏后的数据
         """
+        if depth >= 4:
+            return '<max-depth>'
+
         if isinstance(data, str):
             # 检查是否为敏感值
             for pattern, key_type in self.SENSITIVE_PATTERNS:
                 if pattern.search(data):
                     return self._mask_value(data, key_type)
-            return data
+            return data[:self.MAX_VALUE_CHARS] + ('<truncated>' if len(data) > self.MAX_VALUE_CHARS else '')
 
         elif isinstance(data, dict):
             sanitized = {}
-            for key, value in data.items():
+            items = list(data.items())
+            for key, value in items[:self.MAX_COLLECTION_ITEMS]:
+                key = str(key)
                 # 检查键名是否为敏感字段
                 is_sensitive = any(
                     pattern.search(key)
@@ -71,13 +86,30 @@ class StructuredLogger:
                 if is_sensitive:
                     sanitized[key] = self._mask_value(str(value), key)
                 else:
-                    sanitized[key] = self._sanitize(value)
+                    sanitized[key] = self._sanitize(value, depth + 1)
+            if len(items) > self.MAX_COLLECTION_ITEMS:
+                sanitized['_truncated_items'] = len(items) - self.MAX_COLLECTION_ITEMS
             return sanitized
 
-        elif isinstance(data, list):
-            return [self._sanitize(item) for item in data]
+        elif isinstance(data, (list, tuple, set)):
+            values = list(data)
+            sanitized_values = [
+                self._sanitize(item, depth + 1)
+                for item in values[:self.MAX_COLLECTION_ITEMS]
+            ]
+            if len(values) > self.MAX_COLLECTION_ITEMS:
+                sanitized_values.append(f'<truncated {len(values) - self.MAX_COLLECTION_ITEMS} items>')
+            return sanitized_values
 
         return data
+
+    def _append(self, trace_id: str, entry: Dict[str, Any]) -> None:
+        with self._lock:
+            if trace_id not in self._log_store and len(self._log_store) >= self.MAX_TRACES:
+                oldest_trace = next(iter(self._log_store))
+                self._log_store.pop(oldest_trace, None)
+                self._metrics_store.pop(oldest_trace, None)
+            self._log_store[trace_id].append(entry)
 
     def _mask_value(self, value: str, key_type: str = 'default') -> str:
         """
@@ -90,16 +122,9 @@ class StructuredLogger:
         Returns:
             掩码后的值
         """
-        if not value:
-            return '****'
-
-        str_value = str(value)
-
-        # 对于 API Key 等长字符串，保留前4后4
-        if len(str_value) > 8:
-            return f"{str_value[:4]}****{str_value[-4:]}"
-        else:
-            return '****'
+        # Never retain credential fragments. Prefix/suffix disclosure is enough
+        # to identify short-lived tokens when logs are exported together.
+        return '<redacted>'
 
     def log_request(
         self,
@@ -131,13 +156,12 @@ class StructuredLogger:
                 'method': method,
                 'path': path,
                 'agent_name': agent_name,
-                'user_input': user_input,
                 'user_input_length': len(user_input),
                 'conversation_id': conversation_id,
                 'file_ids': file_ids or [],
             })
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
     def log_prompt(
         self,
@@ -165,14 +189,13 @@ class StructuredLogger:
             'category': 'prompt',
             'data': self._sanitize({
                 'system_prompt_length': len(system_prompt),
-                'system_prompt_preview': system_prompt[:200] + '...' if len(system_prompt) > 200 else system_prompt,
                 'user_message_length': len(user_message),
                 'message_count': message_count,
                 'model_provider': model_provider,
                 'model_name': model_name,
             })
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
     def log_tool_call(
         self,
@@ -200,14 +223,13 @@ class StructuredLogger:
             'category': 'tool_call',
             'data': self._sanitize({
                 'tool_name': tool_name,
-                'tool_args': tool_args,
-                'tool_result': tool_result,
-                'tool_result_preview': (tool_result[:200] + '...' if tool_result and len(tool_result) > 200 else tool_result),
+                **summarize_arguments(tool_args),
+                'tool_result_length': content_length(tool_result),
                 'duration_ms': duration_ms,
-                'error': error,
+                'error_length': content_length(error),
             })
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
     def log_reasoning(
         self,
@@ -226,11 +248,10 @@ class StructuredLogger:
             'level': 'DEBUG',
             'category': 'reasoning',
             'data': {
-                'reasoning_preview': reasoning_content[:200] + '...' if len(reasoning_content) > 200 else reasoning_content,
                 'reasoning_length': len(reasoning_content),
             }
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
     def log_completion(
         self,
@@ -258,14 +279,15 @@ class StructuredLogger:
                 'first_token_latency_ms': first_token_latency_ms,
             }
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
         # 保存性能指标
-        self._metrics_store[trace_id] = {
-            'duration_ms': duration_ms,
-            'chunk_count': chunk_count,
-            'first_token_latency_ms': first_token_latency_ms,
-        }
+        with self._lock:
+            self._metrics_store[trace_id] = {
+                'duration_ms': duration_ms,
+                'chunk_count': chunk_count,
+                'first_token_latency_ms': first_token_latency_ms,
+            }
 
     def log_error(
         self,
@@ -287,12 +309,12 @@ class StructuredLogger:
             'category': 'error',
             'data': self._sanitize({
                 'error_type': type(error).__name__,
-                'error_message': str(error),
-                'stack_trace': traceback.format_exc(),
-                'context': context or {},
+                'error_message_length': content_length(str(error)),
+                'stack_trace_length': content_length(traceback.format_exc()),
+                'context': summarize_arguments(context or {}),
             })
         }
-        self._log_store[trace_id].append(entry)
+        self._append(trace_id, entry)
 
     def get_logs(self, trace_id: str) -> List[Dict]:
         """
@@ -304,7 +326,8 @@ class StructuredLogger:
         Returns:
             日志列表
         """
-        return self._log_store.get(trace_id, [])
+        with self._lock:
+            return list(self._log_store.get(trace_id, []))
 
     def get_metrics(self, trace_id: str) -> Optional[Dict]:
         """
@@ -316,7 +339,9 @@ class StructuredLogger:
         Returns:
             性能指标字典
         """
-        return self._metrics_store.get(trace_id)
+        with self._lock:
+            metric = self._metrics_store.get(trace_id)
+            return dict(metric) if metric is not None else None
 
     def get_full_log_package(self, trace_id: str) -> Optional[Dict]:
         """
@@ -349,8 +374,9 @@ class StructuredLogger:
         Args:
             trace_id: 追踪 ID
         """
-        self._log_store.pop(trace_id, None)
-        self._metrics_store.pop(trace_id, None)
+        with self._lock:
+            self._log_store.pop(trace_id, None)
+            self._metrics_store.pop(trace_id, None)
 
     def clear_old_logs(self, max_age_seconds: int = 3600) -> int:
         """
@@ -365,14 +391,16 @@ class StructuredLogger:
         cutoff_time = datetime.utcnow().timestamp() - max_age_seconds
         cleared = 0
 
-        for trace_id in list(self._log_store.keys()):
-            logs = self._log_store[trace_id]
-            if logs:
-                first_timestamp = logs[0]['timestamp']
-                log_time = datetime.fromisoformat(first_timestamp).timestamp()
-                if log_time < cutoff_time:
-                    self.clear_logs(trace_id)
-                    cleared += 1
+        with self._lock:
+            for trace_id in list(self._log_store.keys()):
+                logs = self._log_store[trace_id]
+                if logs:
+                    first_timestamp = logs[0]['timestamp']
+                    log_time = datetime.fromisoformat(first_timestamp).timestamp()
+                    if log_time < cutoff_time:
+                        self._log_store.pop(trace_id, None)
+                        self._metrics_store.pop(trace_id, None)
+                        cleared += 1
 
         return cleared
 

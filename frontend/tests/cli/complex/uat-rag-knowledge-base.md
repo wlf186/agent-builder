@@ -4,7 +4,7 @@
 > 复杂度: complex
 
 ## 前置条件
-- 服务已启动 (前端 localhost:20880, 后端 localhost:20881)
+- 服务已启动 (前端 localhost:20815, 后端 localhost:20881)
 - 测试智能体 `UAT-RAG测试智能体` (测试过程中按需创建)
 
 ---
@@ -13,7 +13,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 导航到 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. 截图保存到 `test-results/cli/uat-rag-kb/TC-01-01-知识库列表页.png`
 3. 在 snapshot 中找到 "新建知识库" 或 "Create" 按钮，点击
 4. 等待 1 秒
@@ -38,7 +38,7 @@
 ## 步骤
 
 1. 创建测试文档 (员工手册内容)，保存为 txt 文件
-2. 导航到 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+2. 导航到 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 3. 在 snapshot 中找到 "UAT测试知识库" 文本，点击进入详情页
 4. 等待 2 秒
 5. 截图保存到 `test-results/cli/uat-rag-kb/TC-02-01-知识库详情页.png`
@@ -60,7 +60,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880/knowledge-bases`，等待页面加载完成
+1. 导航到 `http://localhost:20815/knowledge-bases`，等待页面加载完成
 2. 在 snapshot 中找到 "UAT测试知识库" 文本，点击进入详情页
 3. 等待 2 秒
 4. 找到检索输入框 (搜索/检索 placeholder 的 input 或 textarea)
@@ -80,7 +80,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880`，等待页面加载完成
+1. 导航到 `http://localhost:20815`，等待页面加载完成
 2. 截图保存到 `test-results/cli/uat-rag-kb/TC-04-01-主页.png`
 3. 在 snapshot 中查找 "UAT-RAG测试智能体"
    - 如果存在: 点击该智能体
@@ -111,7 +111,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880`，等待页面加载完成
+1. 导航到 `http://localhost:20815`，等待页面加载完成
 2. 在 snapshot 中找到 "UAT-RAG测试智能体" 或第一个可用智能体，点击
 3. 等待 2 秒
 4. 找到调试对话输入框 (`input[type="text"][placeholder]`)
@@ -135,7 +135,7 @@
 
 ## 步骤
 
-1. 导航到 `http://localhost:20880`，等待页面加载完成
+1. 导航到 `http://localhost:20815`，等待页面加载完成
 2. 选择一个没有挂载知识库的智能体 (如 test3、main-agent、DEMO)
    - 如果找不到指定名称，选择第一个不包含 "UAT-RAG" 的智能体
 3. 等待 2 秒

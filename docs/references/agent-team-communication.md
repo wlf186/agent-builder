@@ -37,7 +37,7 @@
 - 重新使用general-purpose类型启动Agent-1和Agent-3
 
 #### [10:10] Agent-1 完成设计
-- 已输出完整的UI设计文档到 `/work/agent-builder-general/docs/ui-design-history-conversation.md`
+- 已输出完整的 UI 设计文档到仓库内 `docs/ui-design-history-conversation.md`
 - 设计方案采用**抽屉式(Drawer)**从右侧滑出
 - 定义了6个新API端点
 - 定义了3个Phase的实现优先级
@@ -65,4 +65,3 @@
 - Agent-3: 测试用例和脚本完成 ✅
 
 ---
-

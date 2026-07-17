@@ -2,6 +2,25 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { glob } from 'glob';
 
+const checkOnly = process.argv.includes('--check');
+const driftFailures: string[] = [];
+
+function writeOrCheck(outputPath: string, content: string, displayPath: string): void {
+  if (!checkOnly) {
+    fs.writeFileSync(outputPath, content);
+    console.log(`  Written: ${displayPath}`);
+    return;
+  }
+
+  if (!fs.existsSync(outputPath)) {
+    driftFailures.push(`missing generated file: ${displayPath}`);
+    return;
+  }
+  if (fs.readFileSync(outputPath, 'utf-8') !== content) {
+    driftFailures.push(`out-of-date generated file: ${displayPath}`);
+  }
+}
+
 // Data model for extracted documentation
 interface UserGuideDoc {
   component: string;
@@ -92,11 +111,11 @@ const componentCategories = new Map<string, string>();
 // Generate markdown for a language
 function generateMarkdown(doc: UserGuideDoc, lang: 'en' | 'zh'): string {
   const frontmatter = `---
-title: ${doc.title[lang]}
+title: ${JSON.stringify(doc.title[lang])}
 category: ${doc.category}
 component: ${doc.component}
-related:
-${doc.related.map(r => `  - ${r}`).join('\n')}
+generated: true
+related:${doc.related.length ? `\n${doc.related.map(r => `  - ${r}`).join('\n')}` : ' []'}
 ---
 `;
 
@@ -158,7 +177,7 @@ async function extractUserGuides() {
   const outputDir = path.resolve(__dirname, '../docs-site');
 
   // Find all TSX files
-  const files = await glob('**/*.tsx', { cwd: componentsDir });
+  const files = (await glob('**/*.tsx', { cwd: componentsDir })).sort();
   console.log(`Found ${files.length} component files`);
 
   const docs: UserGuideDoc[] = [];
@@ -176,6 +195,16 @@ async function extractUserGuides() {
   }
 
   console.log(`\nExtracted ${docs.length} user guide documents`);
+  docs.sort((left, right) => left.component.localeCompare(right.component));
+
+  const outputNames = new Set<string>();
+  for (const doc of docs) {
+    const outputName = `${doc.category}/${toKebabCase(doc.component)}.md`;
+    if (outputNames.has(outputName)) {
+      throw new Error(`Duplicate generated documentation path: ${outputName}`);
+    }
+    outputNames.add(outputName);
+  }
 
   // Build component to category mapping for cross-category links
   for (const doc of docs) {
@@ -189,7 +218,25 @@ async function extractUserGuides() {
     // Create category directories
     for (const category of ['core', 'advanced', 'reference']) {
       const categoryDir = path.join(langDir, category);
-      fs.mkdirSync(categoryDir, { recursive: true });
+      if (!checkOnly) fs.mkdirSync(categoryDir, { recursive: true });
+
+      // Remove only stale files previously owned by this generator. Hand-written
+      // pages (for example observability.md) have no `generated: true` marker.
+      if (!fs.existsSync(categoryDir)) continue;
+      for (const filename of fs.readdirSync(categoryDir)) {
+        const existingPath = path.join(categoryDir, filename);
+        if (!filename.endsWith('.md') || filename === 'index.md') continue;
+        const existing = fs.readFileSync(existingPath, 'utf-8');
+        const relativeName = `${category}/${filename}`;
+        if (/^generated:\s*true\s*$/m.test(existing) && !outputNames.has(relativeName)) {
+          if (checkOnly) {
+            driftFailures.push(`stale generated file: ${lang}/${relativeName}`);
+          } else {
+            fs.unlinkSync(existingPath);
+            console.log(`  Removed stale generated page: ${lang}/${relativeName}`);
+          }
+        }
+      }
     }
 
     // Write component docs
@@ -197,19 +244,30 @@ async function extractUserGuides() {
       const markdown = generateMarkdown(doc, lang);
       const filename = toKebabCase(doc.component) + '.md';
       const outputPath = path.join(langDir, doc.category, filename);
-      fs.writeFileSync(outputPath, markdown);
-      console.log(`  Written: ${lang}/${doc.category}/${filename}`);
+      writeOrCheck(outputPath, markdown, `${lang}/${doc.category}/${filename}`);
     }
 
     // Write category index files
     for (const category of ['core', 'advanced', 'reference']) {
       const indexContent = generateIndex(docs, category, lang);
       const indexPath = path.join(langDir, category, 'index.md');
-      fs.writeFileSync(indexPath, indexContent);
+      writeOrCheck(indexPath, indexContent, `${lang}/${category}/index.md`);
     }
   }
 
-  console.log('\n✅ User guide extraction complete!');
+  if (driftFailures.length > 0) {
+    throw new Error(
+      `Generated user guide drift detected:\n${driftFailures.map(item => `  - ${item}`).join('\n')}\n`
+      + "Run 'npm run docs:extract' and commit the result.",
+    );
+  }
+
+  console.log(checkOnly
+    ? '\nUser guide generated pages are current.'
+    : '\nUser guide extraction complete!');
 }
 
-extractUserGuides().catch(console.error);
+extractUserGuides().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -1,7 +1,8 @@
 ---
-title: Chat Interface
+title: "Chat Interface"
 category: core
 component: AgentChat
+generated: true
 related:
   - KnowledgeBaseSelector
   - FileUploader

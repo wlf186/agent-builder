@@ -4,8 +4,10 @@
  */
 
 import { test, expect } from '@playwright/test';
+import { testOutputDir } from './test-paths';
 
-const BASE_URL = 'http://localhost:20880';
+const BASE_URL = 'http://localhost:20815';
+const SCREENSHOT_DIR = testOutputDir('rag-uat-final');
 
 test.describe('RAG 知识库验收测试', () => {
 
@@ -93,10 +95,10 @@ test.describe('RAG 知识库验收测试', () => {
 
     // 截图
     await page.screenshot({
-      path: 'test-results/rag-uat-admin-final.png',
+      path: `${SCREENSHOT_DIR}/rag-uat-admin-final.png`,
       fullPage: true
     });
-    console.log('6. ✓ 截图已保存: test-results/rag-uat-admin-final.png');
+    console.log(`6. ✓ 截图已保存: ${SCREENSHOT_DIR}/rag-uat-admin-final.png`);
 
     // 断言 - 关键检查
     expect(hasAnswer, '行政助手应能回答年假问题').toBeTruthy();
@@ -161,10 +163,10 @@ test.describe('RAG 知识库验收测试', () => {
 
     // 截图
     await page.screenshot({
-      path: 'test-results/rag-uat-tech-final.png',
+      path: `${SCREENSHOT_DIR}/rag-uat-tech-final.png`,
       fullPage: true
     });
-    console.log('6. ✓ 截图已保存: test-results/rag-uat-tech-final.png');
+    console.log(`6. ✓ 截图已保存: ${SCREENSHOT_DIR}/rag-uat-tech-final.png`);
 
     // 断言 - 不应该有检索提示
     expect(!hasRetrieving, '技术支持不应显示RAG检索提示').toBeTruthy();
@@ -220,10 +222,10 @@ test.describe('RAG 知识库验收测试', () => {
 
     // 截图
     await page.screenshot({
-      path: 'test-results/rag-uat-code-final.png',
+      path: `${SCREENSHOT_DIR}/rag-uat-code-final.png`,
       fullPage: true
     });
-    console.log('5. ✓ 截图已保存: test-results/rag-uat-code-final.png');
+    console.log(`5. ✓ 截图已保存: ${SCREENSHOT_DIR}/rag-uat-code-final.png`);
 
     expect(hasAnswer, '应能检索到代码规范信息').toBeTruthy();
   });
@@ -289,7 +291,7 @@ test.describe('前端 UI 元素验证', () => {
 
     // 最终截图
     await page.screenshot({
-      path: 'test-results/rag-uat-ui-check-final.png',
+      path: `${SCREENSHOT_DIR}/rag-uat-ui-check-final.png`,
       fullPage: true
     });
     console.log('✓ 完整页面截图已保存');

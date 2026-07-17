@@ -1,7 +1,8 @@
 ---
-title: 对话历史
+title: "对话历史"
 category: core
 component: ConversationDrawer
+generated: true
 related:
   - AgentChat
 ---

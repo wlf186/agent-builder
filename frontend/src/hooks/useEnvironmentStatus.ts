@@ -4,6 +4,7 @@
  * 轮询智能体的环境创建状态，当环境就绪或失败时停止。
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { apiPath } from '@/lib/apiPath';
 
 export type EnvironmentStatus = 'not_found' | 'creating' | 'ready' | 'error';
 
@@ -57,7 +58,7 @@ export function useEnvironmentStatus({
     }
 
     try {
-      const response = await fetch(`/api/agents/${encodeURIComponent(agentName)}/environment`);
+      const response = await fetch(apiPath('agents', agentName, 'environment'));
       if (response.ok) {
         const data = await response.json();
 
@@ -132,7 +133,7 @@ export function useEnvironmentStatus({
     if (!agentName) return;
 
     try {
-      const response = await fetch(`/api/agents/${encodeURIComponent(agentName)}/environment/retry`, {
+      const response = await fetch(apiPath('agents', agentName, 'environment', 'retry'), {
         method: 'POST'
       });
       if (response.ok) {

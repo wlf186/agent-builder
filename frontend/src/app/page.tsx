@@ -1,7 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import Link from "next/link";
+import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Plus,
@@ -21,13 +20,9 @@ import {
   Loader2,
   Server,
   Wrench,
-  Play,
   Download,
   BookOpen,
   Upload,
-  Clock,
-  Zap,
-  Hash,
   History,
   AlertTriangle,
   ExternalLink,
@@ -41,7 +36,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent } from "@/components/ui/card";
 import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { AgentChat } from "@/components/AgentChat";
+import { AgentChat, type ChatMessage } from "@/components/AgentChat";
 import { MCPServiceDialog } from "@/components/MCPServiceDialog";
 import { ModelServiceDialog, ModelService } from "@/components/ModelServiceDialog";
 import { SkillDetailDialog } from "@/components/SkillDetailDialog";
@@ -58,11 +53,18 @@ import { KnowledgeBaseSidebar } from "@/components/KnowledgeBaseSidebar";
 import { useLocale } from "@/lib/LocaleContext";
 import { CycleDependencyError } from "@/types";
 import { useEnvironmentStatus } from "@/hooks/useEnvironmentStatus";
-import { systemApi, CondaCheckResult } from "@/lib/systemApi";
+import { systemApi, RuntimeCheckResult, type EnvironmentError } from "@/lib/systemApi";
 import { EnvironmentErrorDialog } from "@/components/EnvironmentErrorDialog";
-import { kbApi, KnowledgeBase, Document } from "@/lib/kbApi";
+import { kbApi, KnowledgeBase } from "@/lib/kbApi";
+import { selectConversationPersistence } from "@/lib/chatMessages";
+import { apiPath } from "@/lib/apiPath";
+import { sanitizeForLogging } from "@/lib/debugLogger";
 
 const API_BASE = "/api";
+const MAX_CONSOLE_LOGS = 500;
+const MAX_CONSOLE_MESSAGE_LENGTH = 4_000;
+type CapturedConsoleLog = { type: string; timestamp: string; message: string };
+const capturedConsoleLogs: CapturedConsoleLog[] = [];
 
 // 后端消息格式转换为前端 ChatMessage 格式
 interface BackendMessage {
@@ -72,7 +74,7 @@ interface BackendMessage {
   thinking?: string;
   tool_calls?: Array<{
     name: string;
-    args: Record<string, any>;
+    args: Record<string, unknown>;
     result?: string;
   }>;
   metrics?: {
@@ -82,7 +84,7 @@ interface BackendMessage {
   };
 }
 
-function convertBackendMessages(messages: BackendMessage[]): any[] {
+function convertBackendMessages(messages: BackendMessage[]): ChatMessage[] {
   return messages.map(msg => ({
     id: msg.id || `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
     role: msg.role as 'user' | 'assistant',
@@ -146,7 +148,7 @@ interface Skill {
 const BUILTIN_SERVICES = ["calculator", "cold-jokes"];
 
 export default function Home() {
-  const { locale, setLocale, t, getLocaleName } = useLocale();
+  const { locale, setLocale, t } = useLocale();
   const [agents, setAgents] = useState<Agent[]>([]);
   const [currentView, setCurrentView] = useState<"list" | "create" | "config">("list");
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
@@ -225,7 +227,7 @@ export default function Home() {
   // 巻加历史会话相关状态
   const [conversationDrawerOpen, setConversationDrawerOpen] = useState(false);
   const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
-  const [currentConversationMessages, setCurrentConversationMessages] = useState<any[]>([]);
+  const [currentConversationMessages, setCurrentConversationMessages] = useState<ChatMessage[]>([]);
 
   // 计算已选中的工具总数
   const totalSelectedTools = selectedMcpServices.length + selectedSkills.length + selectedSubAgents.length + selectedKnowledgeBases.length;
@@ -239,26 +241,26 @@ export default function Home() {
 
   // 环境就绪通知状态
   const [showReadyNotification, setShowReadyNotification] = useState(false);
-  const [previousWasCreating, setPreviousWasCreating] = useState(false);
+  const previousWasCreatingRef = useRef(false);
 
-  // Conda 检测状态
-  const [condaStatus, setCondaStatus] = useState<CondaCheckResult | null>(null);
-  const [condaChecking, setCondaChecking] = useState(false);
-  const [showCondaError, setShowCondaError] = useState(false);
-  const [environmentError, setEnvironmentError] = useState<any>(null);
+  // 项目本地 uv 运行时检测状态
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeCheckResult | null>(null);
+  const [runtimeChecking, setRuntimeChecking] = useState(false);
+  const [showRuntimeError, setShowRuntimeError] = useState(false);
+  const [environmentError, setEnvironmentError] = useState<EnvironmentError | null>(null);
 
-  // 检测 Conda 可用性（仅在创建视图时执行）
+  // 检测项目本地 uv 运行时（仅在创建视图时执行）
   useEffect(() => {
-    if (currentView === "create" && !condaStatus && !condaChecking) {
-      setCondaChecking(true);
+    if (currentView === "create" && !runtimeStatus && !runtimeChecking) {
+      setRuntimeChecking(true);
       systemApi
-        .checkConda()
+        .checkRuntime()
         .then((result) => {
-          setCondaStatus(result);
+          setRuntimeStatus(result);
         })
         .catch((err) => {
-          console.error("Conda 检测失败:", err);
-          setCondaStatus({
+          console.error("本地运行时检测失败:", err);
+          setRuntimeStatus({
             available: false,
             path: null,
             version: null,
@@ -267,20 +269,22 @@ export default function Home() {
           });
         })
         .finally(() => {
-          setCondaChecking(false);
+          setRuntimeChecking(false);
         });
     }
-  }, [currentView, condaStatus, condaChecking]);
+  }, [currentView, runtimeStatus, runtimeChecking]);
 
   // 监听环境状态变化，在从creating变为ready时显示通知
   useEffect(() => {
+    const previousWasCreating = previousWasCreatingRef.current;
+    previousWasCreatingRef.current = isEnvironmentCreating;
+
     if (previousWasCreating && isEnvironmentReady && selectedAgent) {
       setShowReadyNotification(true);
       // 10秒后自动消失
       const timer = setTimeout(() => setShowReadyNotification(false), 10000);
       return () => clearTimeout(timer);
     }
-    setPreviousWasCreating(isEnvironmentCreating);
   }, [isEnvironmentReady, isEnvironmentCreating, selectedAgent]);
 
   const showToast = (message: string, type: "success" | "error" = "success") => {
@@ -338,16 +342,6 @@ export default function Home() {
     }
   };
 
-  const handleDeleteKb = async (kbId: string) => {
-    if (!confirm(locale === "zh" ? "确定要删除这个知识库吗？" : "Delete this knowledge base?")) return;
-    try {
-      await kbApi.deleteKnowledgeBase(kbId);
-      await loadKnowledgeBases();
-    } catch (e) {
-      console.error("Failed to delete knowledge base:", e);
-    }
-  };
-
   const testMcpConnection = async (name: string) => {
     // 设置测试中状态
     setMcpTestResults(prev => ({
@@ -356,7 +350,7 @@ export default function Home() {
     }));
 
     try {
-      const res = await fetch(`${API_BASE}/mcp-services/${encodeURIComponent(name)}/test`, {
+      const res = await fetch(apiPath('mcp-services', name, 'test'), {
         method: "POST",
       });
       const data = await res.json();
@@ -393,7 +387,7 @@ export default function Home() {
     if (!confirm(confirmMsg)) return;
 
     try {
-      const res = await fetch(`${API_BASE}/mcp-services/${name}`, { method: "DELETE" });
+      const res = await fetch(apiPath('mcp-services', name), { method: "DELETE" });
       const data = await res.json();
       if (res.ok) {
         await loadMcpServices();
@@ -412,7 +406,7 @@ export default function Home() {
     if (!confirm(confirmMsg)) return;
 
     try {
-      const res = await fetch(`${API_BASE}/model-services/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const res = await fetch(apiPath('model-services', name), { method: "DELETE" });
       const data = await res.json();
       if (res.ok) {
         await loadModelServices();
@@ -431,7 +425,7 @@ export default function Home() {
     if (!confirm(confirmMsg)) return;
 
     try {
-      const res = await fetch(`${API_BASE}/skills/${encodeURIComponent(name)}`, { method: "DELETE" });
+      const res = await fetch(apiPath('skills', name), { method: "DELETE" });
       const data = await res.json();
       if (res.ok) {
         await loadSkills();
@@ -454,58 +448,44 @@ export default function Home() {
       info: console.info,
     };
 
-    const maxLogs = 500;
-    let logs: Array<{ type: string; timestamp: string; message: string }> = [];
-
-    const addLog = (type: string, ...args: any[]) => {
+    const addLog = (type: string, ...args: unknown[]) => {
       const message = args.map(arg => {
-        if (typeof arg === 'object') {
-          try {
-            return JSON.stringify(arg, null, 2);
-          } catch {
-            return String(arg);
-          }
+        const sanitized = sanitizeForLogging(arg);
+        if (typeof sanitized === 'string') return sanitized;
+        try {
+          return JSON.stringify(sanitized);
+        } catch {
+          return '[Unserializable log value]';
         }
-        return String(arg);
-      }).join(' ');
+      }).join(' ').slice(0, MAX_CONSOLE_MESSAGE_LENGTH);
 
-      logs.push({
+      capturedConsoleLogs.push({
         type,
         timestamp: new Date().toISOString(),
         message,
       });
 
-      // 限制日志数量
-      if (logs.length > maxLogs) {
-        logs = logs.slice(-maxLogs);
-      }
-
-      // 保存到 sessionStorage
-      try {
-        sessionStorage.setItem('console_logs', JSON.stringify(logs));
-      } catch {
-        // sessionStorage 满了，清理一半
-        logs = logs.slice(-maxLogs / 2);
-        sessionStorage.setItem('console_logs', JSON.stringify(logs));
+      if (capturedConsoleLogs.length > MAX_CONSOLE_LOGS) {
+        capturedConsoleLogs.splice(0, capturedConsoleLogs.length - MAX_CONSOLE_LOGS);
       }
     };
 
-    console.log = (...args: any[]) => {
+    console.log = (...args: unknown[]) => {
       originalConsole.log.apply(console, args);
       addLog('log', ...args);
     };
 
-    console.warn = (...args: any[]) => {
+    console.warn = (...args: unknown[]) => {
       originalConsole.warn.apply(console, args);
       addLog('warn', ...args);
     };
 
-    console.error = (...args: any[]) => {
+    console.error = (...args: unknown[]) => {
       originalConsole.error.apply(console, args);
       addLog('error', ...args);
     };
 
-    console.info = (...args: any[]) => {
+    console.info = (...args: unknown[]) => {
       originalConsole.info.apply(console, args);
       addLog('info', ...args);
     };
@@ -537,17 +517,20 @@ export default function Home() {
         agentsCount: agents.length,
         mcpServicesCount: mcpServices.length,
         selectedAgent: selectedAgent,
-        url: window.location.href,
-        localStorage: { ...localStorage },
+        // 不导出 query/hash 或 Web Storage 内容，它们可能包含凭据。
+        url: `${window.location.origin}${window.location.pathname}`,
+        storageEntryCounts: {
+          localStorage: localStorage.length,
+          sessionStorage: sessionStorage.length,
+        },
         performance: {
-          memory: (performance as any).memory?.usedJSHeapSize || 'N/A',
+          memory: (performance as Performance & { memory?: { usedJSHeapSize?: number } }).memory?.usedJSHeapSize || 'N/A',
           timing: performance.timing?.navigationStart || 'N/A',
         },
       };
 
       // 收集控制台日志
-      const consoleLogsStr = sessionStorage.getItem('console_logs') || '[]';
-      const consoleLogs = JSON.parse(consoleLogsStr);
+      const consoleLogs = capturedConsoleLogs.slice();
 
       // 组装完整日志
       const fullLog = {
@@ -594,7 +577,7 @@ export default function Home() {
       setCurrentConversationId(null);
       setCurrentConversationMessages([]);
 
-      const res = await fetch(`${API_BASE}/agents/${name}`);
+      const res = await fetch(apiPath('agents', name));
       const config = await res.json();
       setSelectedAgent(name);
       setPersona(config.persona || "");
@@ -654,42 +637,42 @@ export default function Home() {
         showToast(message);
       } else {
         const detail = data.detail || "";
-        // 检测是否为 Conda 环境错误
-        if (detail.includes("Conda") || detail.includes("conda") || data.error_code === "CONDA_NOT_FOUND") {
+        // 检测是否为项目本地运行时错误
+        if (detail.includes("uv") || data.error_code === "UV_NOT_FOUND") {
           // 设置结构化错误信息并显示弹窗
           setEnvironmentError({
-            error_code: data.error_code || "CONDA_NOT_FOUND",
+            error_code: data.error_code || "UV_NOT_FOUND",
             error_type: "环境依赖缺失",
-            user_message: detail || "系统无法创建 Conda 环境",
+            user_message: detail || "系统无法创建项目本地运行环境",
             solutions: [
               {
-                title: "安装 Miniconda（推荐）",
+                title: "重新运行项目引导脚本",
                 steps: [
-                  "下载 Miniconda 安装脚本",
-                  "运行安装命令",
-                  "重启系统服务",
+                  "返回项目根目录",
+                  "运行 ./bootstrap.sh --rebuild",
+                  "重新启动整套服务",
                 ],
-                estimated_time: "5-10 分钟",
+                estimated_time: "2-10 分钟",
                 commands: [
-                  "wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh",
-                  "bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3",
-                  "source ~/.bashrc",
+                  "./stop.sh",
+                  "./bootstrap.sh --rebuild",
+                  "./start.sh --skip-bootstrap",
                 ],
               },
               {
-                title: "使用系统 Python（功能受限）",
+                title: "离线恢复",
                 steps: [
-                  "请先安装 Conda 以获得完整功能支持",
-                  "系统 Python 模式将在后续版本支持",
+                  "确认项目本地缓存完整",
+                  "运行 ./bootstrap.sh --offline",
                 ],
-                estimated_time: "N/A",
+                estimated_time: "1-5 分钟",
               },
             ],
             technical_details: {
               error_message: detail,
             },
           });
-          setShowCondaError(true);
+          setShowRuntimeError(true);
         } else {
           setCreateError(detail || (locale === "zh" ? "创建失败" : "Creation failed"));
         }
@@ -707,7 +690,7 @@ export default function Home() {
     setIsSaving(true);
     setCycleError(null);  // 【AC130 新增】清除旧的循环依赖错误
     try {
-      const res = await fetch(`${API_BASE}/agents/${selectedAgent}`, {
+      const res = await fetch(apiPath('agents', selectedAgent), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -754,7 +737,7 @@ export default function Home() {
     if (!confirm(confirmMsg)) return;
 
     try {
-      await fetch(`${API_BASE}/agents/${selectedAgent}`, { method: "DELETE" });
+      await fetch(apiPath('agents', selectedAgent), { method: "DELETE" });
       await loadAgents();
       setCurrentView("list");
       setSelectedAgent(null);
@@ -860,7 +843,7 @@ export default function Home() {
                           className="flex items-center justify-between py-2 px-3 cursor-pointer"
                           onClick={async () => {
                             try {
-                              const res = await fetch(`${API_BASE}/mcp-services/${service.name}`);
+                              const res = await fetch(apiPath('mcp-services', service.name));
                               const data = await res.json();
                               setEditingMcpService(data as MCPServiceDetail);
                               setMcpDialogOpen(true);
@@ -999,7 +982,7 @@ export default function Home() {
                       className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-white/5 group cursor-pointer"
                       onClick={async () => {
                         try {
-                          const res = await fetch(`${API_BASE}/model-services/${service.name}`);
+                          const res = await fetch(apiPath('model-services', service.name));
                           const data = await res.json();
                           setEditingModelService(data as ModelService);
                           setModelServiceDialogOpen(true);
@@ -1150,14 +1133,16 @@ export default function Home() {
                   <ExternalLink size={12} className="text-gray-500 group-hover:text-gray-400" />
                 </a>
                 <a
-                  href="/api/redirect/langfuse"
+                  href="/api/redirect/observability"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center justify-between py-2 px-3 rounded-lg hover:bg-white/5 group cursor-pointer"
                 >
                   <div className="flex items-center gap-2">
                     <Activity size={12} className="text-orange-400" />
-                    <span className="text-sm text-gray-300">Langfuse</span>
+                    <span className="text-sm text-gray-300">
+                      {locale === "zh" ? "本地追踪" : "Local Traces"}
+                    </span>
                   </div>
                   <ExternalLink size={12} className="text-gray-500 group-hover:text-gray-400" />
                 </a>
@@ -1255,6 +1240,7 @@ export default function Home() {
 
         {/* MCP Service Dialog */}
         <MCPServiceDialog
+          key={`${mcpDialogOpen}:${editingMcpService?.name ?? "new"}`}
           isOpen={mcpDialogOpen}
           onClose={() => { setMcpDialogOpen(false); setEditingMcpService(null); }}
           onSave={loadMcpServices}
@@ -1263,6 +1249,7 @@ export default function Home() {
 
         {/* Model Service Dialog */}
         <ModelServiceDialog
+          key={`${modelServiceDialogOpen}:${editingModelService?.name ?? "new"}`}
           open={modelServiceDialogOpen}
           onClose={() => { setModelServiceDialogOpen(false); setEditingModelService(null); }}
           onSave={loadModelServices}
@@ -1271,6 +1258,7 @@ export default function Home() {
 
         {/* Skill Detail Dialog */}
         <SkillDetailDialog
+          key={`${skillDialogOpen}:${selectedSkillName ?? "none"}`}
           isOpen={skillDialogOpen}
           onClose={() => { setSkillDialogOpen(false); setSelectedSkillName(null); }}
           skillName={selectedSkillName}
@@ -1345,38 +1333,38 @@ export default function Home() {
 
             {/* Form */}
             <div className="p-6 space-y-5">
-              {/* Conda 检测警告 */}
-              {!condaChecking && condaStatus && !condaStatus.available && (
+              {/* 项目本地运行时检测警告 */}
+              {!runtimeChecking && runtimeStatus && !runtimeStatus.available && (
                 <div className="bg-orange-50 dark:bg-orange-950/20 border border-orange-200 dark:border-orange-800 rounded-lg p-4">
                   <div className="flex items-start gap-3">
                     <AlertTriangle className="h-5 w-5 text-orange-500 shrink-0 mt-0.5" />
                     <div className="flex-1 min-w-0">
                       <h4 className="font-medium text-orange-900 dark:text-orange-100 text-sm">
-                        Conda 环境未检测到
+                        项目本地运行时未就绪
                       </h4>
                       <p className="text-sm text-orange-800 dark:text-orange-200 mt-1">
-                        系统未检测到 Conda，智能体功能可能受限。
+                        未检测到项目内 uv；请先修复引导环境再创建智能体。
                       </p>
                       <div className="mt-3 flex flex-wrap gap-2">
                         <button
                           onClick={() => {
                             setEnvironmentError({
-                              error_code: "CONDA_NOT_FOUND",
+                              error_code: "UV_NOT_FOUND",
                               error_type: "环境依赖缺失",
-                              user_message: condaStatus.message || "系统未检测到 Conda",
+                              user_message: runtimeStatus.message || "项目本地 uv 未就绪",
                               solutions: [
                                 {
-                                  title: "安装 Miniconda（推荐）",
+                                  title: "重新运行项目引导脚本",
                                   steps: [
-                                    "下载 Miniconda 安装脚本",
-                                    "运行安装命令",
-                                    "重启系统服务",
+                                    "返回项目根目录",
+                                    "重建项目本地依赖",
+                                    "重新启动整套服务",
                                   ],
-                                  estimated_time: "5-10 分钟",
+                                  estimated_time: "2-10 分钟",
                                   commands: [
-                                    "wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh",
-                                    "bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3",
-                                    "source ~/.bashrc",
+                                    "./stop.sh",
+                                    "./bootstrap.sh --rebuild",
+                                    "./start.sh --skip-bootstrap",
                                   ],
                                 },
                                 {
@@ -1388,7 +1376,7 @@ export default function Home() {
                                 },
                               ],
                             });
-                            setShowCondaError(true);
+                            setShowRuntimeError(true);
                           }}
                           className="text-sm text-orange-700 dark:text-orange-300 hover:text-orange-900 dark:hover:text-orange-100 font-medium flex items-center gap-1"
                         >
@@ -1396,7 +1384,7 @@ export default function Home() {
                           <ChevronRight size={14} />
                         </button>
                         <span className="text-xs text-orange-600 dark:text-orange-400 self-center">
-                          或继续创建（功能受限）
+                          修复后刷新页面
                         </span>
                       </div>
                     </div>
@@ -1444,8 +1432,8 @@ export default function Home() {
 
         {/* 环境错误弹窗 */}
         <EnvironmentErrorDialog
-          isOpen={showCondaError}
-          onClose={() => setShowCondaError(false)}
+          isOpen={showRuntimeError}
+          onClose={() => setShowRuntimeError(false)}
           error={environmentError}
         />
       </div>
@@ -2135,7 +2123,8 @@ export default function Home() {
                 onCreateConversation={async () => {
                   try {
                     // 创建新会话记录
-                    const res = await fetch(`${API_BASE}/agents/${selectedAgent}/conversations`, {
+                    if (!selectedAgent) return null;
+                    const res = await fetch(apiPath('agents', selectedAgent, 'conversations'), {
                       method: "POST",
                       headers: { "Content-Type": "application/json" },
                       body: JSON.stringify({ title: locale === "zh" ? "新对话" : "New Chat" })
@@ -2150,18 +2139,19 @@ export default function Home() {
                   }
                   return null;
                 }}
-                onConversationChange={async (id, messages) => {
+                onConversationChange={async (id, messages, turnMessages) => {
                   // 更新本地状态
                   if (id) {
                     setCurrentConversationId(id);
                   }
                   setCurrentConversationMessages(messages);
 
-                  // 保存到后端
                   if (id && messages.length > 0) {
                     try {
-                      // 转换消息格式为后端格式
-                      const backendMessages = messages.map(msg => ({
+                      // 正常对话只同步本轮增量，避免每轮重写整段会话。
+                      // 未提供 turnMessages 的显式调用仍保留全量保存语义。
+                      const persistence = selectConversationPersistence(messages, turnMessages);
+                      const backendMessages = persistence.messages.map(msg => ({
                         id: msg.id,
                         role: msg.role,
                         content: msg.content,
@@ -2170,13 +2160,20 @@ export default function Home() {
                         metrics: msg.metrics || undefined
                       }));
 
-                      await fetch(`${API_BASE}/agents/${selectedAgent}/conversations/${id}/save`, {
+                      if (!selectedAgent) return;
+                      const endpoint = persistence.mode === 'sync'
+                        ? apiPath('agents', selectedAgent, 'conversations', id, 'messages', 'sync')
+                        : apiPath('agents', selectedAgent, 'conversations', id, 'save');
+                      const response = await fetch(endpoint, {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify({ messages: backendMessages })
                       });
+                      if (!response.ok) {
+                        throw new Error(`Conversation persistence failed: ${response.status}`);
+                      }
                     } catch (error) {
-                      console.error("Failed to save conversation:", error);
+                      console.error("Failed to persist conversation:", error);
                     }
                   }
                 }}
@@ -2195,7 +2192,7 @@ export default function Home() {
             if (!selectedAgent) return;
             try {
               // 从后端加载会话详情（含消息）
-              const res = await fetch(`${API_BASE}/agents/${selectedAgent}/conversations/${id}`);
+              const res = await fetch(apiPath('agents', selectedAgent, 'conversations', id));
               if (res.ok) {
                 const data = await res.json();
                 // 转换消息格式并设置
@@ -2212,7 +2209,7 @@ export default function Home() {
             if (!selectedAgent) return;
             try {
               // 创建新会话记录
-              const res = await fetch(`${API_BASE}/agents/${selectedAgent}/conversations`, {
+              const res = await fetch(apiPath('agents', selectedAgent, 'conversations'), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ title: locale === "zh" ? "新对话" : "New Chat" })

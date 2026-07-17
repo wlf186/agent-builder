@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@assistant-ui/react": "^0.12.14",
-    "framer-motion": "^12.34.3",
+    "framer-motion": "^12.42.2",
     "lucide-react": "^0.575.0",
     "playwright": "^1.58.2",
     "react-markdown": "^10.1.0",

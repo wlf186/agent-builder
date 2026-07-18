@@ -20,62 +20,47 @@ from uuid import uuid4
 
 import httpx
 
+from .context import (
+    MAX_NATIVE_CONTEXT_TOKENS,
+    ContextPlan,
+    ContextPlanError,
+    ModelProfile,
+    estimate_provider_input_tokens,
+)
+from .model import MAX_BROKER_FRAME_BYTES, MAX_BROKER_RESPONSE_FRAMES
+from .tools import PROTOTYPE_ECHO_SPEC, ToolSpec, prototype_tool_specs
+
 
 OLLAMA_HOST = "iollama"
 OLLAMA_PORT = 11434
 OLLAMA_MODEL = "qwen3.5:2b"
-OLLAMA_TOOL_NAME = "builtin_echo"
-HARNESS_TOOL_ID = "builtin/echo"
+OLLAMA_TOOL_NAME = PROTOTYPE_ECHO_SPEC.provider_name
+HARNESS_TOOL_ID = PROTOTYPE_ECHO_SPEC.tool_id
 
 MAX_USER_BYTES = 8_192
-MAX_TOOL_RESULT_BYTES = 2_048
-MAX_TOOL_ARGUMENT_BYTES = 2_048
-MAX_REQUEST_BYTES = 64 * 1024
+MAX_METADATA_REQUEST_BYTES = 64 * 1024
 MAX_QUALIFICATION_BYTES = 1024 * 1024
 MAX_NDJSON_LINE_BYTES = 64 * 1024
 MAX_STREAM_BYTES = 512 * 1024
-MAX_STREAM_FRAMES = 512
+MAX_STREAM_FRAMES = 4_096
 MAX_OUTPUT_BYTES = 12_288
 MAX_MODEL_TURNS = 3
-MODEL_NUM_CONTEXT = 4_096
-MODEL_NUM_PREDICT = 256
+MAX_CONCURRENT_MODEL_STREAMS = 2
+MODEL_QUEUE_TIMEOUT_SECONDS = 30.0
+RUNTIME_CONTEXT_TOKEN_CAP = 32_768
+MODEL_NUM_PREDICT = 2_048
 CONTENT_COALESCE_BYTES = 256
 CONTENT_COALESCE_SECONDS = 0.05
+MAX_NORMALIZED_CONTENT_FRAMES = MAX_BROKER_RESPONSE_FRAMES - 1
+MAX_TAIL_CONTENT_FRAMES = 2
+MAX_CONTENT_JSON_STRING_BYTES = MAX_BROKER_FRAME_BYTES - 16 * 1024
 CANCEL_POLL_SECONDS = 0.05
 QUALIFICATION_TIMEOUT_SECONDS = 8.0
 TURN_TIMEOUT_SECONDS = 25.0
 
 _SAFE_CALL_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
-
-_SYSTEM_MESSAGE = (
-    "You are the Harness V2 prototype agent. On the first model turn, call "
-    "builtin_echo exactly once with the complete user message and do not answer "
-    "directly. After its Tool result arrives, do not call another Tool; answer "
-    "the user concisely in Chinese using that result. Use only declared "
-    "structured tools and never reveal hidden reasoning."
-)
-
-_TOOLS = (
-    {
-        "type": "function",
-        "function": {
-            "name": OLLAMA_TOOL_NAME,
-            "description": "Return one bounded string unchanged.",
-            "parameters": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["text"],
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "maxLength": MAX_TOOL_ARGUMENT_BYTES,
-                    }
-                },
-            },
-        },
-    },
-)
+_ARCHITECTURE = re.compile(r"^[a-z0-9._-]{1,64}$")
 
 
 class OllamaBrokerError(RuntimeError):
@@ -117,11 +102,13 @@ class OllamaQualification:
     digest: str
     size: int
     address: str
+    model_profile: ModelProfile
 
 
 @dataclass(frozen=True)
 class _PendingTool:
     call_id: str
+    tool_id: str
     assistant_call: dict[str, Any]
 
 
@@ -136,6 +123,86 @@ def _bounded_text(value: object, maximum_bytes: int, *, allow_empty: bool) -> st
     if len(encoded) > maximum_bytes:
         raise OllamaBrokerError("model_protocol_error", "Bounded text is too large.")
     return value
+
+
+def _split_content_for_ipc(value: str) -> tuple[str, ...]:
+    """Split text by its conservative JSON-string encoding size."""
+
+    if not value:
+        return ()
+    chunks: list[str] = []
+    characters: list[str] = []
+    encoded_bytes = 0
+    for character in value:
+        if ord(character) < 0x20:
+            character_bytes = 6
+        elif character in {'"', "\\"}:
+            character_bytes = 2
+        else:
+            try:
+                character_bytes = len(character.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise OllamaBrokerError(
+                    "model_protocol_error", "Ollama returned invalid Unicode content."
+                ) from exc
+        if characters and (
+            encoded_bytes + character_bytes > MAX_CONTENT_JSON_STRING_BYTES
+        ):
+            chunks.append("".join(characters))
+            characters.clear()
+            encoded_bytes = 0
+        characters.append(character)
+        encoded_bytes += character_bytes
+    if characters:
+        chunks.append("".join(characters))
+    return tuple(chunks)
+
+
+def _native_context_tokens(show_value: dict[str, Any]) -> int:
+    model_info = show_value.get("model_info")
+    if not isinstance(model_info, dict) or len(model_info) > 4_096:
+        raise OllamaBrokerError(
+            "model_protocol_error", "Ollama returned invalid model capabilities."
+        )
+    architecture = model_info.get("general.architecture")
+    if not isinstance(architecture, str) or _ARCHITECTURE.fullmatch(architecture) is None:
+        raise OllamaBrokerError(
+            "model_protocol_error", "Ollama returned an invalid model architecture."
+        )
+    value = model_info.get(f"{architecture}.context_length")
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 4_096 <= value <= MAX_NATIVE_CONTEXT_TOKENS
+    ):
+        raise OllamaBrokerError(
+            "model_protocol_error", "Ollama returned an invalid context window."
+        )
+    return value
+
+
+def _model_profile(*, digest: str, native_context_tokens: int) -> ModelProfile:
+    operational_context_tokens = min(
+        native_context_tokens, RUNTIME_CONTEXT_TOKEN_CAP
+    )
+    output_tokens = min(
+        MODEL_NUM_PREDICT,
+        max(256, operational_context_tokens // 16),
+    )
+    try:
+        return ModelProfile(
+            provider="ollama",
+            model=OLLAMA_MODEL,
+            model_digest=digest,
+            native_context_tokens=native_context_tokens,
+            operational_context_tokens=operational_context_tokens,
+            max_output_tokens=output_tokens,
+            profile_source="ollama-show+runtime-cap-v1",
+        )
+    except ContextPlanError as exc:
+        raise OllamaBrokerError(
+            "model_protocol_error", "The qualified model profile is invalid."
+        ) from exc
 
 
 def _validated_address(raw: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -174,9 +241,13 @@ class OllamaBroker:
         # broker into an SSRF primitive or select an expensive provider model.
         self._transport = transport
         self._resolver = resolver
+        self._tool_catalog = {
+            spec.tool_id: spec for spec in prototype_tool_specs()
+        }
         self._client: httpx.AsyncClient | None = None
         self._qualification: OllamaQualification | None = None
         self._closed = False
+        self._model_slots = asyncio.Semaphore(MAX_CONCURRENT_MODEL_STREAMS)
 
     @property
     def qualification(self) -> OllamaQualification | None:
@@ -295,12 +366,18 @@ class OllamaBroker:
                 raise OllamaBrokerError(
                     "model_protocol_error", "Ollama returned invalid model metadata."
                 )
+            native_context_tokens = _native_context_tokens(show_value)
+            model_profile = _model_profile(
+                digest=digest,
+                native_context_tokens=native_context_tokens,
+            )
             self._qualification = OllamaQualification(
                 version=version,
                 model=OLLAMA_MODEL,
                 digest=digest,
                 size=size,
                 address=str(address),
+                model_profile=model_profile,
             )
             return self._qualification
         except OllamaBrokerError:
@@ -328,7 +405,7 @@ class OllamaBroker:
         client = self._require_client()
         headers = {"Accept": "application/json"}
         if content is not None:
-            if len(content) > MAX_REQUEST_BYTES:
+            if len(content) > MAX_METADATA_REQUEST_BYTES:
                 raise OllamaBrokerError(
                     "model_protocol_error", "Ollama metadata request is too large."
                 )
@@ -370,12 +447,12 @@ class OllamaBroker:
             )
         return value
 
-    def new_run(self) -> OllamaRunSession:
+    def new_run(self, context_plan: ContextPlan) -> OllamaRunSession:
         if self._qualification is None:
             raise OllamaBrokerError(
                 "model_broker_not_ready", "The model broker is not qualified."
             )
-        return OllamaRunSession(self)
+        return OllamaRunSession(self, context_plan)
 
     async def close(self) -> None:
         self._closed = True
@@ -398,8 +475,38 @@ class OllamaBroker:
 class OllamaRunSession:
     """Conversation state that is never shared between Runs."""
 
-    def __init__(self, broker: OllamaBroker) -> None:
+    def __init__(self, broker: OllamaBroker, context_plan: ContextPlan) -> None:
+        qualification = broker.qualification
+        catalog = broker._tool_catalog
+        if not isinstance(context_plan, ContextPlan):
+            raise OllamaBrokerError(
+                "model_context_invalid", "The trusted context plan is not executable."
+            )
+        exposed_tools_are_allowed = all(
+            catalog.get(spec.tool_id) == spec for spec in context_plan.tools
+        )
+        if (
+            qualification is None
+            or context_plan.model_profile != qualification.model_profile
+            or not exposed_tools_are_allowed
+        ):
+            raise OllamaBrokerError(
+                "model_context_invalid", "The trusted context plan is not executable."
+            )
         self._broker = broker
+        self._context_plan = context_plan
+        self._tools_by_id: dict[str, ToolSpec] = {
+            spec.tool_id: spec for spec in context_plan.tools
+        }
+        self._tools_by_provider: dict[str, ToolSpec] = {
+            spec.provider_name: spec for spec in context_plan.tools
+        }
+        if len(self._tools_by_id) != len(context_plan.tools) or len(
+            self._tools_by_provider
+        ) != len(context_plan.tools):
+            raise OllamaBrokerError(
+                "model_context_invalid", "The trusted Tool set is ambiguous."
+            )
         self._messages: list[dict[str, Any]] = []
         self._user_message: str | None = None
         self._applied_results: tuple[OllamaToolResult, ...] = ()
@@ -432,6 +539,10 @@ class OllamaRunSession:
         if not callable(is_cancelled):
             raise TypeError("is_cancelled must be callable")
         message = _bounded_text(user_message, MAX_USER_BYTES, allow_empty=False)
+        if message != self._context_plan.user_message():
+            raise OllamaBrokerError(
+                "model_context_invalid", "The user turn does not match its context plan."
+            )
         if self._user_message is not None and message != self._user_message:
             raise OllamaBrokerError(
                 "model_state_error", "The Run user message changed between model turns."
@@ -439,6 +550,10 @@ class OllamaRunSession:
         if self._turns >= MAX_MODEL_TURNS:
             raise OllamaBrokerError(
                 "model_iteration_limit", "The model turn budget was exhausted."
+            )
+        if len(tool_results) > MAX_MODEL_TURNS:
+            raise OllamaBrokerError(
+                "model_state_error", "The Tool result history exceeded its limit."
             )
         validated_results = tuple(self._validate_tool_result(item) for item in tool_results)
         if (
@@ -456,12 +571,7 @@ class OllamaRunSession:
                 raise OllamaBrokerError(
                     "model_state_error", "A first model turn cannot have Tool results."
                 )
-            candidate_messages.extend(
-                (
-                    {"role": "system", "content": _SYSTEM_MESSAGE},
-                    {"role": "user", "content": message},
-                )
-            )
+            candidate_messages.extend(self._context_plan.provider_messages())
         else:
             pending = self._pending_tool
             if pending is None or len(new_results) != 1:
@@ -469,47 +579,66 @@ class OllamaRunSession:
                     "model_state_error", "The model turn has no matching Tool result."
                 )
             result = new_results[0]
-            if result.call_id != pending.call_id or result.tool_id != HARNESS_TOOL_ID:
+            if result.call_id != pending.call_id or result.tool_id != pending.tool_id:
                 raise OllamaBrokerError(
                     "model_state_error", "The Tool result does not match its call."
                 )
+            spec = self._tools_by_id[pending.tool_id]
             candidate_messages.append(
                 {
                     "role": "tool",
-                    "tool_name": OLLAMA_TOOL_NAME,
+                    "tool_name": spec.provider_name,
                     "content": result.content,
                 }
             )
 
+        profile = self._context_plan.model_profile
+        available_tools = (
+            self._context_plan.tools if self._user_message is None else ()
+        )
+        try:
+            runtime_input_tokens = estimate_provider_input_tokens(
+                candidate_messages, available_tools
+            )
+        except ContextPlanError as exc:
+            raise OllamaBrokerError(
+                "model_context_limit", "The model context could not be bounded."
+            ) from exc
+        if runtime_input_tokens > self._context_plan.policy.hard_input_tokens:
+            raise OllamaBrokerError(
+                "model_context_limit", "The model context exceeded its token budget."
+            )
         request = {
-            "model": OLLAMA_MODEL,
+            "model": profile.model,
             "messages": candidate_messages,
-            "tools": list(_TOOLS),
+            "tools": [spec.ollama_definition() for spec in available_tools],
             "stream": True,
             "think": False,
             "keep_alive": "5m",
             "options": {
                 "temperature": 0,
                 "seed": 0,
-                "num_ctx": MODEL_NUM_CONTEXT,
-                "num_predict": MODEL_NUM_PREDICT,
+                "num_ctx": profile.operational_context_tokens,
+                "num_predict": profile.max_output_tokens,
             },
         }
         encoded_request = json.dumps(
             request, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
-        if len(encoded_request) > MAX_REQUEST_BYTES:
+        if len(encoded_request) > profile.request_byte_budget:
             raise OllamaBrokerError(
                 "model_context_limit", "The model request exceeded its byte budget."
             )
 
         self._in_flight = True
         self._turns += 1
+        result: AsyncIterator[dict[str, Any]] | None = None
         try:
             result = self._stream_response(encoded_request, is_cancelled)
             content_parts: list[str] = []
             coalesced: list[str] = []
             coalesced_bytes = 0
+            content_frames = 0
             output_bytes = 0
             provider_call: dict[str, Any] | None = None
             final_frame: dict[str, Any] | None = None
@@ -544,6 +673,11 @@ class OllamaRunSession:
                         "model_protocol_error", "Ollama returned invalid Tool calls."
                     )
                 for call in tool_calls:
+                    if not available_tools:
+                        raise OllamaBrokerError(
+                            "model_protocol_error",
+                            "Ollama requested a Tool after capabilities were narrowed.",
+                        )
                     if provider_call is not None:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Only one Tool call is allowed per turn."
@@ -551,7 +685,13 @@ class OllamaRunSession:
                     provider_call = self._normalize_tool_call(call)
 
                 if content:
-                    encoded_content = content.encode("utf-8")
+                    try:
+                        encoded_content = content.encode("utf-8")
+                    except UnicodeEncodeError as exc:
+                        raise OllamaBrokerError(
+                            "model_protocol_error",
+                            "Ollama returned invalid Unicode content.",
+                        ) from exc
                     output_bytes += len(encoded_content)
                     if output_bytes > MAX_OUTPUT_BYTES:
                         raise OllamaBrokerError(
@@ -561,14 +701,25 @@ class OllamaRunSession:
                     coalesced.append(content)
                     coalesced_bytes += len(encoded_content)
                     now = asyncio.get_running_loop().time()
-                    if (
+                    should_flush = (
                         coalesced_bytes >= CONTENT_COALESCE_BYTES
                         or now - last_flush >= CONTENT_COALESCE_SECONDS
-                    ):
-                        yield OllamaFrame("content", {"text": "".join(coalesced)})
-                        coalesced.clear()
-                        coalesced_bytes = 0
-                        last_flush = now
+                    )
+                    if should_flush:
+                        candidate_chunks = _split_content_for_ipc(
+                            "".join(coalesced)
+                        )
+                        if (
+                            content_frames + len(candidate_chunks)
+                            <= MAX_NORMALIZED_CONTENT_FRAMES
+                            - MAX_TAIL_CONTENT_FRAMES
+                        ):
+                            for chunk in candidate_chunks:
+                                yield OllamaFrame("content", {"text": chunk})
+                                content_frames += 1
+                            coalesced.clear()
+                            coalesced_bytes = 0
+                            last_flush = now
 
                 if raw_frame["done"]:
                     if final_frame is not None:
@@ -593,7 +744,26 @@ class OllamaRunSession:
             if is_cancelled():
                 raise OllamaCancelledError()
             if coalesced:
-                yield OllamaFrame("content", {"text": "".join(coalesced)})
+                for chunk in _split_content_for_ipc("".join(coalesced)):
+                    yield OllamaFrame("content", {"text": chunk})
+                    content_frames += 1
+            if content_frames > MAX_NORMALIZED_CONTENT_FRAMES:
+                raise OllamaBrokerError(
+                    "model_protocol_error", "Normalized model output exceeded its frame limit."
+                )
+
+            usage: dict[str, int] = {}
+            for field in ("prompt_eval_count", "eval_count"):
+                value = final_frame.get(field)
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or not 0 <= value <= 1_000_000_000
+                ):
+                    raise OllamaBrokerError(
+                        "model_protocol_error", "Ollama returned invalid usage data."
+                    )
+                usage[field] = value
 
             assistant: dict[str, Any] = {
                 "role": "assistant",
@@ -609,33 +779,24 @@ class OllamaRunSession:
 
             if provider_call is not None:
                 call_id = str(provider_call["id"])
-                self._pending_tool = _PendingTool(call_id, provider_call)
+                provider_name = str(provider_call["function"]["name"])
+                spec = self._tools_by_provider[provider_name]
+                self._pending_tool = _PendingTool(call_id, spec.tool_id, provider_call)
                 yield OllamaFrame(
                     "tool.use",
                     {
                         "call_id": call_id,
-                        "tool_id": HARNESS_TOOL_ID,
+                        "tool_id": spec.tool_id,
                         "arguments": provider_call["function"]["arguments"],
+                        "usage": usage,
                     },
                 )
             else:
                 self._stopped = True
-                usage: dict[str, int] = {}
-                for field in ("prompt_eval_count", "eval_count"):
-                    value = final_frame.get(field)
-                    if value is None:
-                        continue
-                    if (
-                        not isinstance(value, int)
-                        or isinstance(value, bool)
-                        or not 0 <= value <= 1_000_000_000
-                    ):
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Ollama returned invalid usage data."
-                        )
-                    usage[field] = value
                 yield OllamaFrame("stop", {"reason": "end_turn", "usage": usage})
         finally:
+            if result is not None:
+                await result.aclose()
             self._in_flight = False
 
     async def _stream_response(
@@ -644,7 +805,27 @@ class OllamaRunSession:
         if is_cancelled():
             raise OllamaCancelledError()
         client = self._broker._require_client()
+        loop = asyncio.get_running_loop()
+        queue_deadline = loop.time() + MODEL_QUEUE_TIMEOUT_SECONDS
+        while True:
+            if is_cancelled():
+                raise OllamaCancelledError()
+            remaining = queue_deadline - loop.time()
+            if remaining <= 0:
+                raise OllamaBrokerError(
+                    "model_busy", "The bounded model queue is full.", retryable=True
+                )
+            try:
+                await asyncio.wait_for(
+                    self._broker._model_slots.acquire(),
+                    timeout=min(CANCEL_POLL_SECONDS, remaining),
+                )
+                break
+            except TimeoutError:
+                continue
         try:
+            if is_cancelled():
+                raise OllamaCancelledError()
             async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
                 async with client.stream(
                     "POST",
@@ -678,7 +859,7 @@ class OllamaRunSession:
                         )
                     seen_done = False
                     async for frame in self._iter_ndjson(response, is_cancelled):
-                        if frame.get("model") != OLLAMA_MODEL:
+                        if frame.get("model") != self._context_plan.model_profile.model:
                             raise OllamaBrokerError(
                                 "model_protocol_error", "Ollama returned the wrong model."
                             )
@@ -712,6 +893,8 @@ class OllamaRunSession:
             raise OllamaBrokerError(
                 "model_unavailable", "The model request failed.", retryable=True
             ) from exc
+        finally:
+            self._broker._model_slots.release()
 
     async def _iter_ndjson(
         self, response: httpx.Response, is_cancelled: CancelCheck
@@ -807,7 +990,13 @@ class OllamaRunSession:
                 "model_protocol_error", "Ollama returned an invalid Tool call."
             )
         function = value.get("function")
-        if not isinstance(function, dict) or function.get("name") != OLLAMA_TOOL_NAME:
+        provider_name = function.get("name") if isinstance(function, dict) else None
+        spec = (
+            self._tools_by_provider.get(provider_name)
+            if isinstance(provider_name, str)
+            else None
+        )
+        if not isinstance(function, dict) or spec is None:
             raise OllamaBrokerError(
                 "model_protocol_error", "Ollama selected an unknown Tool."
             )
@@ -816,14 +1005,12 @@ class OllamaRunSession:
             raise OllamaBrokerError(
                 "model_protocol_error", "Ollama returned an invalid Tool index."
             )
-        arguments = function.get("arguments")
-        if not isinstance(arguments, dict) or set(arguments) != {"text"}:
+        try:
+            arguments = spec.validate_arguments(function.get("arguments"))
+        except ValueError as exc:
             raise OllamaBrokerError(
                 "model_protocol_error", "Ollama returned invalid Tool arguments."
-            )
-        text = _bounded_text(
-            arguments.get("text"), MAX_TOOL_ARGUMENT_BYTES, allow_empty=True
-        )
+            ) from exc
         call_id = value.get("id")
         if not isinstance(call_id, str) or _SAFE_CALL_ID.fullmatch(call_id) is None:
             call_id = f"call_{uuid4().hex}"
@@ -836,20 +1023,20 @@ class OllamaRunSession:
             "id": call_id,
             "function": {
                 "index": 0,
-                "name": OLLAMA_TOOL_NAME,
-                "arguments": {"text": text},
+                "name": spec.provider_name,
+                "arguments": arguments,
             },
         }
 
-    @staticmethod
-    def _validate_tool_result(result: OllamaToolResult) -> OllamaToolResult:
+    def _validate_tool_result(self, result: OllamaToolResult) -> OllamaToolResult:
         if not isinstance(result, OllamaToolResult):
             raise TypeError("tool_results must contain OllamaToolResult values")
         if _SAFE_CALL_ID.fullmatch(result.call_id) is None:
             raise OllamaBrokerError(
                 "model_state_error", "A Tool result has an invalid call ID."
             )
-        if result.tool_id != HARNESS_TOOL_ID:
+        spec = self._tools_by_id.get(result.tool_id)
+        if spec is None:
             raise OllamaBrokerError(
                 "model_state_error", "A Tool result named an unknown Tool."
             )
@@ -857,9 +1044,12 @@ class OllamaRunSession:
             raise OllamaBrokerError(
                 "model_state_error", "A Tool result has an invalid outcome."
             )
-        content = _bounded_text(
-            result.content, MAX_TOOL_RESULT_BYTES, allow_empty=True
-        )
+        try:
+            content = spec.validate_result(result.content)
+        except ValueError as exc:
+            raise OllamaBrokerError(
+                "model_state_error", "A Tool result exceeded its contract."
+            ) from exc
         return OllamaToolResult(
             call_id=result.call_id,
             tool_id=result.tool_id,

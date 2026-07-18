@@ -11,9 +11,15 @@ from typing import Any
 import httpx
 import pytest
 
+import agent_builder_v2.ollama as ollama_module
+from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
+from agent_builder_v2.context import ContextCompiler
+from agent_builder_v2.model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
 from agent_builder_v2.ollama import (
     HARNESS_TOOL_ID,
+    MAX_CONCURRENT_MODEL_STREAMS,
     MAX_NDJSON_LINE_BYTES,
+    MAX_NORMALIZED_CONTENT_FRAMES,
     MAX_OUTPUT_BYTES,
     MAX_STREAM_FRAMES,
     MODEL_NUM_PREDICT,
@@ -25,7 +31,9 @@ from agent_builder_v2.ollama import (
     OllamaCancelledError,
     OllamaFrame,
     OllamaToolResult,
+    RUNTIME_CONTEXT_TOKEN_CAP,
 )
+from agent_builder_v2.tools import prototype_tool_specs
 
 
 SAFE_ADDRESS = "10.89.0.18"
@@ -114,7 +122,13 @@ class _MockProvider:
         if request.url.path == "/api/show":
             assert json.loads(request.content) == {"model": OLLAMA_MODEL}
             return _json_response(
-                {"capabilities": ["completion", "vision", "tools", "thinking"]}
+                {
+                    "capabilities": ["completion", "vision", "tools", "thinking"],
+                    "model_info": {
+                        "general.architecture": "qwen35",
+                        "qwen35.context_length": 262_144,
+                    },
+                }
             )
         if request.url.path == "/api/chat" and self.chat_factories:
             return self.chat_factories.pop(0)(request)
@@ -148,6 +162,18 @@ async def _collect(stream: AsyncIterator[OllamaFrame]) -> list[OllamaFrame]:
     return [frame async for frame in stream]
 
 
+def _plan(broker: OllamaBroker, message: str) -> object:
+    qualification = broker.qualification
+    assert qualification is not None
+    return ContextCompiler().compile(
+        message,
+        model_profile=qualification.model_profile,
+        tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+
+
 @pytest.mark.asyncio
 async def test_qualification_pins_safe_ip_and_fixed_identity() -> None:
     broker, provider = await _started_broker([])
@@ -158,6 +184,12 @@ async def test_qualification_pins_safe_ip_and_fixed_identity() -> None:
         assert qualification.model == OLLAMA_MODEL
         assert qualification.digest == DIGEST
         assert qualification.address == SAFE_ADDRESS
+        assert qualification.model_profile.native_context_tokens == 262_144
+        assert (
+            qualification.model_profile.operational_context_tokens
+            == RUNTIME_CONTEXT_TOKEN_CAP
+        )
+        assert qualification.model_profile.max_output_tokens == MODEL_NUM_PREDICT
         assert [request.url.host for request in provider.requests] == [
             SAFE_ADDRESS,
             SAFE_ADDRESS,
@@ -235,7 +267,7 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
     )
     broker, provider = await _started_broker([first, second])
     try:
-        session = broker.new_run()
+        session = broker.new_run(_plan(broker, "please echo hello"))
         tool_frames = await _collect(session.stream_turn("please echo hello"))
         assert tool_frames == [
             OllamaFrame(
@@ -244,6 +276,7 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
                     "call_id": "call_provider_1",
                     "tool_id": HARNESS_TOOL_ID,
                     "arguments": {"text": "hello"},
+                    "usage": {"prompt_eval_count": 17, "eval_count": 5},
                 },
             )
         ]
@@ -291,11 +324,168 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
             assert body["think"] is False
             assert body["options"]["temperature"] == 0
             assert body["options"]["num_predict"] == MODEL_NUM_PREDICT
-            assert body["tools"][0]["function"]["name"] == "builtin_echo"
+            assert body["options"]["num_ctx"] == RUNTIME_CONTEXT_TOKEN_CAP
+        assert first_body["tools"][0]["function"]["name"] == "builtin_echo"
+        assert second_body["tools"] == []
+        assert first_body["messages"][0]["role"] == "system"
+        assert "[platform.contract]" in first_body["messages"][0]["content"]
+        assert "[agent.instructions]" in first_body["messages"][0]["content"]
+        assert first_body["messages"][1] == {
+            "role": "user",
+            "content": "please echo hello",
+        }
         assert second_body["messages"][-2:] == [
             {"role": "assistant", "content": "", "tool_calls": [provider_tool_call]},
             {"role": "tool", "tool_name": "builtin_echo", "content": "hello"},
         ]
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_capability_is_narrowed_after_the_first_call() -> None:
+    first_call = {
+        "id": "call_first",
+        "function": {"name": "builtin_echo", "arguments": {"text": "hello"}},
+    }
+    repeated_call = {
+        "id": "call_repeated",
+        "function": {"name": "builtin_echo", "arguments": {"text": "hello"}},
+    }
+    broker, provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(
+                    _provider_frame(tool_calls=[first_call]),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+            _chat_response(
+                _ndjson(
+                    _provider_frame(tool_calls=[repeated_call]),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+        ]
+    )
+    try:
+        session = broker.new_run(_plan(broker, "hello"))
+        await _collect(session.stream_turn("hello"))
+        result = OllamaToolResult("call_first", HARNESS_TOOL_ID, "hello")
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("hello", (result,)))
+        assert raised.value.code == "model_protocol_error"
+        chat_requests = [
+            request for request in provider.requests if request.url.path == "/api/chat"
+        ]
+        assert json.loads(chat_requests[1].content)["tools"] == []
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_later_turn_fails_closed_when_full_transcript_exceeds_token_budget() -> None:
+    tool_text = "t" * 8_192
+    tool_call = {
+        "id": "call_large",
+        "function": {
+            "name": "builtin_echo",
+            "arguments": {"text": tool_text},
+        },
+    }
+    first = _chat_response(
+        _ndjson(
+            _provider_frame(content="a" * MAX_OUTPUT_BYTES, tool_calls=[tool_call]),
+            _provider_frame(done=True, done_reason="stop"),
+        )
+    )
+    broker, provider = await _started_broker([first])
+    message = "u" * 8_192
+    try:
+        session = broker.new_run(_plan(broker, message))
+        first_turn = await _collect(session.stream_turn(message))
+        assert first_turn[-1].kind == "tool.use"
+
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(
+                session.stream_turn(
+                    message,
+                    (
+                        OllamaToolResult(
+                            call_id="call_large",
+                            tool_id=HARNESS_TOOL_ID,
+                            content=tool_text,
+                        ),
+                    ),
+                )
+            )
+        assert raised.value.code == "model_context_limit"
+        assert sum(request.url.path == "/api/chat" for request in provider.requests) == 1
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_normalized_content_frames_are_capped_without_losing_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ollama_module, "CONTENT_COALESCE_SECONDS", 0.0)
+    body = _ndjson(
+        *(_provider_frame(content="x") for _index in range(200)),
+        _provider_frame(done=True, done_reason="stop"),
+    )
+    broker, _provider = await _started_broker([_chat_response(body)])
+    try:
+        frames = await _collect(
+            broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+        )
+        content = [frame.payload["text"] for frame in frames if frame.kind == "content"]
+        assert len(content) <= MAX_NORMALIZED_CONTENT_FRAMES
+        assert "".join(content) == "x" * 200
+        assert frames[-1].kind == "stop"
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_json_control_characters_cannot_overflow_a_coalesced_ipc_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ollama_module, "CONTENT_COALESCE_SECONDS", 0.0)
+    early = 126
+    tail_size = MAX_OUTPUT_BYTES - early
+    first_tail = "\0" * (tail_size // 2)
+    second_tail = "\0" * (tail_size - len(first_tail))
+    body = _ndjson(
+        *(_provider_frame(content="x") for _index in range(early)),
+        _provider_frame(content=first_tail),
+        _provider_frame(content=second_tail),
+        _provider_frame(done=True, done_reason="stop"),
+    )
+    broker, _provider = await _started_broker([_chat_response(body)])
+    try:
+        frames = await _collect(
+            broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+        )
+        content = [frame.payload["text"] for frame in frames if frame.kind == "content"]
+        assert len(content) == MAX_NORMALIZED_CONTENT_FRAMES
+        assert "".join(content) == "x" * early + first_tail + second_tail
+        for index, text in enumerate(content, start=1):
+            encoded = (
+                json.dumps(
+                    {
+                        "internal": "model.response",
+                        "version": BROKER_PROTOCOL_VERSION,
+                        "request_id": f"model-{index}",
+                        "type": "content",
+                        "text": text,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            assert len(encoded) <= MAX_BROKER_FRAME_BYTES
     finally:
         await broker.close()
 
@@ -320,6 +510,17 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
         (
             _ndjson(_provider_frame(content="partial", done=True, done_reason="length")),
             "model_output_limit",
+        ),
+        (
+            _ndjson(
+                {
+                    "model": OLLAMA_MODEL,
+                    "message": {"role": "assistant", "content": "done"},
+                    "done": True,
+                    "done_reason": "stop",
+                }
+            ),
+            "model_protocol_error",
         ),
         (
             _ndjson(
@@ -359,10 +560,40 @@ async def test_malformed_or_over_budget_stream_fails_closed(
 ) -> None:
     broker, _provider = await _started_broker([_chat_response(body)])
     try:
-        session = broker.new_run()
+        session = broker.new_run(_plan(broker, "hello"))
         with pytest.raises(OllamaBrokerError) as raised:
             await _collect(session.stream_turn("hello"))
         assert raised.value.code == expected_code
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_body_level_protocol_errors_release_model_stream_slots() -> None:
+    invalid = _provider_frame(done=True, done_reason="stop")
+    invalid["message"]["role"] = "user"
+    valid = _ndjson(_provider_frame(done=True, done_reason="stop"))
+    broker, _provider = await _started_broker(
+        [_chat_response(_ndjson(invalid)), _chat_response(_ndjson(invalid)), _chat_response(valid)]
+    )
+    try:
+        for _index in range(MAX_CONCURRENT_MODEL_STREAMS):
+            session = broker.new_run(_plan(broker, "hello"))
+            with pytest.raises(OllamaBrokerError) as raised:
+                await _collect(session.stream_turn("hello"))
+            assert raised.value.code == "model_protocol_error"
+            assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+
+        final_session = broker.new_run(_plan(broker, "hello"))
+        assert await _collect(final_session.stream_turn("hello")) == [
+            OllamaFrame(
+                "stop",
+                {
+                    "reason": "end_turn",
+                    "usage": {"prompt_eval_count": 17, "eval_count": 5},
+                },
+            )
+        ]
     finally:
         await broker.close()
 
@@ -375,7 +606,9 @@ async def test_redirect_wrong_content_type_and_status_are_not_followed() -> None
     broker, _provider = await _started_broker([redirect])
     try:
         with pytest.raises(OllamaBrokerError) as raised:
-            await _collect(broker.new_run().stream_turn("hello"))
+            await _collect(
+                broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+            )
         assert raised.value.code == "model_redirect_rejected"
     finally:
         await broker.close()
@@ -385,7 +618,9 @@ async def test_redirect_wrong_content_type_and_status_are_not_followed() -> None
     )
     try:
         with pytest.raises(OllamaBrokerError) as raised:
-            await _collect(broker.new_run().stream_turn("hello"))
+            await _collect(
+                broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+            )
         assert raised.value.code == "model_protocol_error"
     finally:
         await broker.close()
@@ -396,7 +631,9 @@ async def test_redirect_wrong_content_type_and_status_are_not_followed() -> None
     broker, _provider = await _started_broker([unavailable])
     try:
         with pytest.raises(OllamaBrokerError) as raised:
-            await _collect(broker.new_run().stream_turn("hello"))
+            await _collect(
+                broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+            )
         assert raised.value.code == "model_unavailable"
         assert raised.value.retryable is True
         assert "provider detail" not in str(raised.value)
@@ -447,6 +684,76 @@ async def test_fixed_model_must_advertise_tool_capability() -> None:
     await broker.close()
 
 
+@pytest.mark.asyncio
+async def test_smaller_model_window_drives_operational_budget() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return _json_response({"version": "0.23.2"})
+        if request.url.path == "/api/tags":
+            return _json_response(
+                {"models": [{"name": OLLAMA_MODEL, "digest": DIGEST, "size": 1}]}
+            )
+        if request.url.path == "/api/show":
+            return _json_response(
+                {
+                    "capabilities": ["completion", "tools"],
+                    "model_info": {
+                        "general.architecture": "small",
+                        "small.context_length": 16_384,
+                    },
+                }
+            )
+        return _json_response({}, status=500)
+
+    broker = OllamaBroker(transport=httpx.MockTransport(handler), resolver=_resolver)
+    qualification = await broker.start()
+    try:
+        assert qualification.model_profile.native_context_tokens == 16_384
+        assert qualification.model_profile.operational_context_tokens == 16_384
+        assert qualification.model_profile.max_output_tokens == 1_024
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model_info",
+    [
+        {},
+        {"general.architecture": True, "x.context_length": 8_192},
+        {"general.architecture": "x", "x.context_length": True},
+        {"general.architecture": "x", "x.context_length": "32768"},
+        {"general.architecture": "x", "x.context_length": 0},
+        {"general.architecture": "x", "other.context_length": 32_768},
+        {"general.architecture": "../../x", "../../x.context_length": 32_768},
+    ],
+)
+async def test_invalid_model_context_metadata_fails_qualification(
+    model_info: object,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return _json_response({"version": "0.23.2"})
+        if request.url.path == "/api/tags":
+            return _json_response(
+                {"models": [{"name": OLLAMA_MODEL, "digest": DIGEST, "size": 1}]}
+            )
+        if request.url.path == "/api/show":
+            return _json_response(
+                {
+                    "capabilities": ["completion", "tools"],
+                    "model_info": model_info,
+                }
+            )
+        return _json_response({}, status=500)
+
+    broker = OllamaBroker(transport=httpx.MockTransport(handler), resolver=_resolver)
+    with pytest.raises(OllamaBrokerError) as raised:
+        await broker.start()
+    assert raised.value.code == "model_protocol_error"
+    await broker.close()
+
+
 class _HangingStream(httpx.AsyncByteStream):
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -479,7 +786,7 @@ async def test_cancel_callback_closes_blocked_provider_stream() -> None:
     broker, _provider = await _started_broker([response])
     cancelled = False
     try:
-        session = broker.new_run()
+        session = broker.new_run(_plan(broker, "wait"))
         task = asyncio.create_task(
             _collect(session.stream_turn("wait", is_cancelled=lambda: cancelled))
         )
@@ -489,6 +796,119 @@ async def test_cancel_callback_closes_blocked_provider_stream() -> None:
             await asyncio.wait_for(task, timeout=1.0)
         await asyncio.wait_for(hanging.closed.wait(), timeout=1.0)
         assert session.messages == ()
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_callback_interrupts_the_bounded_model_queue() -> None:
+    broker, _provider = await _started_broker([])
+    cancelled = False
+    acquired = 0
+    try:
+        for _index in range(MAX_CONCURRENT_MODEL_STREAMS):
+            await broker._model_slots.acquire()
+            acquired += 1
+        session = broker.new_run(_plan(broker, "queued"))
+        task = asyncio.create_task(
+            _collect(session.stream_turn("queued", is_cancelled=lambda: cancelled))
+        )
+        await asyncio.sleep(0.06)
+        cancelled = True
+        with pytest.raises(OllamaCancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+    finally:
+        for _index in range(acquired):
+            broker._model_slots.release()
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_bounded_model_queue_times_out_with_retryable_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ollama_module, "MODEL_QUEUE_TIMEOUT_SECONDS", 0.02)
+    broker, _provider = await _started_broker([])
+    acquired = 0
+    try:
+        for _index in range(MAX_CONCURRENT_MODEL_STREAMS):
+            await broker._model_slots.acquire()
+            acquired += 1
+        session = broker.new_run(_plan(broker, "queued"))
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("queued"))
+        assert raised.value.code == "model_busy"
+        assert raised.value.retryable is True
+    finally:
+        for _index in range(acquired):
+            broker._model_slots.release()
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_model_stream_concurrency_never_exceeds_two() -> None:
+    hanging = [_HangingStream(), _HangingStream()]
+
+    def response(stream: _HangingStream) -> ChatFactory:
+        def build(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/x-ndjson"},
+                stream=stream,
+            )
+
+        return build
+
+    broker, provider = await _started_broker([response(item) for item in hanging])
+    cancelled = [False, False, False]
+    try:
+        sessions = [
+            broker.new_run(_plan(broker, f"run-{index}")) for index in range(3)
+        ]
+        tasks = [
+            asyncio.create_task(
+                _collect(
+                    session.stream_turn(
+                        f"run-{index}",
+                        is_cancelled=lambda index=index: cancelled[index],
+                    )
+                )
+            )
+            for index, session in enumerate(sessions)
+        ]
+        await asyncio.gather(*(item.started.wait() for item in hanging))
+        await asyncio.sleep(0.02)
+        assert sum(request.url.path == "/api/chat" for request in provider.requests) == 2
+
+        cancelled[:] = [True, True, True]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert all(isinstance(item, OllamaCancelledError) for item in results)
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+    finally:
+        cancelled[:] = [True, True, True]
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_transport_error_releases_slot_for_the_next_request() -> None:
+    def broken(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("simulated transport failure", request=request)
+
+    valid = _chat_response(_ndjson(_provider_frame(done=True, done_reason="stop")))
+    broker, _provider = await _started_broker([broken, valid])
+    try:
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(
+                broker.new_run(_plan(broker, "first")).stream_turn("first")
+            )
+        assert raised.value.code == "model_unavailable"
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+
+        frames = await _collect(
+            broker.new_run(_plan(broker, "second")).stream_turn("second")
+        )
+        assert frames[-1].kind == "stop"
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
     finally:
         await broker.close()
 
@@ -514,7 +934,7 @@ async def test_tool_result_must_match_pending_call() -> None:
         ]
     )
     try:
-        session = broker.new_run()
+        session = broker.new_run(_plan(broker, "hello"))
         await _collect(session.stream_turn("hello"))
         wrong = OllamaToolResult("call_wrong", HARNESS_TOOL_ID, "hello")
         with pytest.raises(OllamaBrokerError) as raised:

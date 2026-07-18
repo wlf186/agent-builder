@@ -32,6 +32,12 @@ def _event(
     )
 
 
+def test_event_envelope_uses_the_current_protocol_schema() -> None:
+    assert _event(
+        seq=1, durability="durable", kind="run.started"
+    ).to_dict()["schema_version"] == "2.2-prototype"
+
+
 def test_journal_persists_only_durable_events_across_reopen(tmp_path: Path) -> None:
     database_path = tmp_path / "agent" / "state.sqlite3"
     events = [

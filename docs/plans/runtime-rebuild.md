@@ -19,18 +19,54 @@ review_cycle: quarterly
 ## Implemented baseline
 
 - 根级 bootstrap/start/stop/purge/governance 生命周期与 checkout-local 环境边界；
-- `0.0.0.0:20815` 认证 Web UI、CSRF、Run/cancel、SSE 和完整事件详情；
+- `0.0.0.0:20815` 认证 Web UI、CSRF、Conversation create/list/read/delete、同会话
+  多轮 Run/cancel、SSE 和完整事件详情；
 - 固定 demo Agent Capsule、Agent 专属 `worker-env`、每 Run 独立目录和进程组；
 - 单一 `HarnessKernel` context → model → tool → model loop，无 LangGraph/LangChain；
-- 受信 Ollama Broker，固定 `iollama:11434/qwen3.5:2b` 和 per-Run transcript；
+- 受信 Ollama Broker，固定 `iollama:11434/qwen3.5:2b` 和 per-Run transcript；启动时从
+  `/api/show` 资格检查原生上下文窗口，并应用受信 operational cap/output reserve；
+- Agent-scoped `state.sqlite` 中的 Conversation/Turn repository；一个 Conversation 同时
+  最多一个 active Run，Turn 接受/终态与 boundary event 事务提交，Gateway 重启将遗留
+  `running` Turn 收敛为 `interrupted`；
+- Control Plane 从仅含 completed user/assistant pairs 的 durable history 编译不可变、
+  带 provenance/digest/budget 的 ContextPlan；完整 plan 不进入 Worker，Model Broker
+  IPC v2 只传摘要引用；
+- 共享不可变 `ToolSpec` 同时生成 provider schema、Worker/Control Plane 校验和
+  toolset digest；
+- 当前模型画像为 native `262144`、operational `32768`、output reserve `2048`、硬输入
+  `30720`，并已生成 80% trigger / 60% target 的动态压缩策略；
+- admission estimator 是 `utf8-bytes-upper-bound-v1`，没有模型 tokenizer 时每个 UTF-8
+  byte 按一个 token 做保守上界，并计入实际 renderer、Tool manifest 与 `256` tokens
+  provider template reserve；初始 plan 和每个后续完整 transcript 都执行相同 admission；
+  超过动态 80% trigger 时从最旧端按完整 completed Turn pair 做 tail-window，直到不高于
+  60% target 或没有可移出的 pair，所有可省略 pair 移出后仍超硬预算则 fail closed；
+- 所有 terminal 都附带 `{input_tokens,output_tokens,last_input_tokens,complete}`；provider
+  报告 usage，Control Plane 按模型 profile 校验并累计，Worker 不可伪造；
+- Model Broker 最多同时执行 2 路 provider stream，其它 active Run 在总容量内有界排队，
+  30 秒无 slot 时以可重试 `model_busy` 失败；
+- 每轮最多 4096 个 provider 原始帧，合并为最多 128 个 content IPC frame；Broker error
+  code/retryability 由 Control Plane 绑定 canonical terminal；
 - Worker 无网络，Landlock + seccomp + rlimits + attestation，无 unconfined fallback；
-- 仅有界、只读 `builtin/echo`；
+- 仅有界、只读、输入/结果各 `8192` UTF-8 bytes 的 one-shot `builtin/echo`；结果回流后
+  provider ToolSet 收窄为空；
 - canonical event sequencing、durable semantic SQLite/WAL、ephemeral delta、取消和唯一终态；
 - bounded Run/event/log/journal/tree 资源与安全的 PID/process-group 清理；
 - 旧系统隔离到 `_legacy-reference/`，当前 runtime 不依赖它；
 - P1-P8 权威文档和自动文档/边界治理。
 
 “implemented baseline”只表示当前固定路径已跑通，不能解读为整个产品生产就绪。
+
+## Current validation evidence
+
+2026-07-18 在当前 `x86_64` checkout 完成了受控环境全量测试、文档治理、diff/脚本语法
+门禁和真实 lifecycle 复验：Gateway 在 `0.0.0.0:20815` 以真实
+`iollama:11434/qwen3.5:2b`、Landlock + seccomp 资格启动；同一 Conversation 的前两轮
+用依赖历史的暗号问答验证 completed history，重启 Gateway 后第三轮仍从恢复的 transcript
+得到相同答案。另一个已完成 Run 的会话删除后，session detail 与 event endpoint 都返回
+404；运行结束无 Worker PID 文件或 Run 根残留，Gateway 保持健康。
+
+这份证据不是 cold-checkout、多架构或 production qualification：依赖缓存已存在，尚未在
+`aarch64` 重复，也没有长期 load/soak、SSD SMART 对照、故障注入矩阵或 TLS/多用户边界。
 
 ## Phase 1 — Clean-root qualification
 
@@ -50,15 +86,37 @@ review_cycle: quarterly
 
 目标：从“有 durable events”升级为“可验证恢复的 conversation runtime”。
 
-- 定义 Conversation/Turn/Run repository 与事务边界；
-- 服务重启时从 durable journal + snapshot 重建状态；
+- 已实现：Conversation/Turn/Run 生命周期分离和 Agent-scoped repository；公共路径为
+  `GET|POST /api/sessions`、`GET|DELETE /api/sessions/<id>`、
+  `POST /api/sessions/<id>/runs`；
+- 已实现：一个 Conversation 最多一个 active Run；Turn 接受与 `run.started`、Turn 完成
+  与 terminal 分别在同一 SQLite/WAL 事务提交；completed-history snapshot revision 与
+  Turn 接受使用 CAS，拒绝编译期间的历史漂移；
+- 已实现：durable Conversation transcript 跨 Gateway 重启恢复，启动时把遗留
+  `running` Turn 标为 `interrupted`；旧 Worker/模型流不复活；
+- 已实现：删除空闲 Conversation 时原子移除 Turn 和关联 events；active Run 存在时拒绝，
+  先取消或等待终态；
+- 待实现：从 durable event journal 重建旧 Run、cursor availability、gap marker、
+  snapshot/replay 和幂等事件投影；当前活跃 SSE/ephemeral delta 不跨 Gateway 进程恢复；
 - SSE 增加明确的 cursor availability、gap marker、snapshot/replay 和幂等投影；
 - 对 journal prune、崩溃点、WAL 损坏/不可写设计可验证失败行为；
 - 继续批量语义写入，禁止 token delta 落盘和完整历史反复重写；
 - 添加 context/token/cost usage 的有界记录，但先定义 retention/redaction。
+- 以 ContextPlan 中的模型画像动态决定 projection/compaction，不按模型名称或固定
+  `4096` 阈值分支；保留输出预留，达到硬输入预算 80% 时触发，压缩到 60% 目标；
+- 压缩决策优先使用实际模型 profile 和 provider 报告、Control Plane 校验累计的 usage；
+  `utf8-bytes-upper-bound-v1` 只作为没有精确 tokenizer/终帧数据时的 admission fallback；
+- 已实现：仅 completed Turn 的完整 user/assistant pair 可进入模型历史；失败、取消、
+  interrupted 和 partial output 留在产品状态但不污染模型上下文；
+- 已实现：根据当前模型 profile 的 80%/60% 策略做完整 Turn pair 的确定性 tail-window；
+  到达目标或没有可移出的 pair 后停止；这不是语义 summary，durable transcript 不被
+  截断或重写；
+- 待实现：Tool-result clipping/micro-compaction、可恢复 snapshot 和模型 summary；完整
+  canonical events 保持 append-only，不反复重写历史。
 
-完成标准：任意受支持崩溃点恢复到最后 durable boundary；客户端能区分 replay、gap 和
-live；写放大与磁盘上界有测试。
+完成标准：当前 conversation transcript/interrupt recovery 子切片已落地；Phase 只有在
+任意受支持崩溃点恢复到最后 durable boundary、客户端能区分 replay/gap/live，且写放大
+与磁盘上界有测试后才整体完成。
 
 ## Phase 3 — General Agent Capsule lifecycle
 
@@ -96,15 +154,24 @@ Skill 与 stdio MCP 是代码执行，默认禁用。kernel 能力不足时 fail
 
 目标：让 `ContextCompiler` 真正拥有 provider-agnostic model view。
 
-- 分层 platform contract、Agent instructions、workspace instructions、history、Tool schema
-  和当前 user turn，并保留 provenance/cache scope；
-- 将编译后的有界 context 穿过 Broker，替代 Broker 内固定 prototype prompt；
-- 实现 token budget、deterministic truncation、summary/snapshot 与 compaction events；
+- 已完成基础：分层 platform contract、固定 demo Agent instructions 和当前 user turn，
+  保留 provenance/cache scope；编译结果已穿过 Broker 并替代 Broker 内固定 prompt；
+- 已完成基础：ToolSpec/model profile/budget/plan digest 进入同一受信 ContextPlan；模型
+  原生窗口变化会动态重算 operational window、输出预留、硬输入预算和 80%/60% 阈值；
+- 已实现：只从 durable completed Turn pairs 构建 conversation history；每个新 Turn 根据
+  当前模型 profile 重新计算 projection，并把 history source digest、完整/纳入/省略计数
+  和窗口策略绑定到 ContextPlan；
+- 已实现：超过 80% trigger 后按完整 Turn pair 从最旧端做 deterministic tail-window，
+  直到不高于 60% target 或没有可移出的 pair；这是有损窗口选择，不是语义 summary；
+- 待实现：workspace instructions（包括受控发现 `CLAUDE.md`）、Tool-result micro-
+  compaction、summary/snapshot 与 compaction events；
 - 防止 prompt/Tool/result 混淆、跨 Agent context 泄漏和 hidden instruction 输出；
 - 同一 Run 的 model/tool transcript 可恢复并与 canonical events 对账。
 
-完成标准：相同输入和 Capsule generation 产生可复现 context plan；超预算和压缩有明确
-事件；不同 Agent 指令/历史在进程、存储和模型请求层均隔离。
+完成标准：相同输入、completed history、模型画像和 Capsule generation 产生可复现
+context plan；超预算和未来语义压缩有明确事件；不同 Agent 指令/历史在进程、存储和
+模型请求层均隔离。当前满足 plan/tail-window 可复现和硬预算，summary/snapshot、
+workspace instructions 与 compaction event 尚未完成。
 
 ## Phase 6 — Tasks and sub-agents
 
@@ -140,12 +207,19 @@ ready”的声明。
   解决了具体缺口且不会产生第二套状态机、事件序列或不可控持久化。
 - 保持 Control Plane 为 identity/sequence/persistence authority，Worker 永不自报身份。
 - 保持 token-level streaming，但只在语义边界持久化。
+- 模型窗口和压缩阈值来自受信 qualification/profile，不按 provider/model 名称硬编码；
+  原生容量、运行上限、输出预留和估算器版本都必须进入可审计 plan metadata。
+- Provider usage 必须先由 Control Plane 对照 profile 校验后才进入 canonical terminal；
+  `complete=false` 必须阻止调用方把部分累计误当成本 Run 完整用量。
 - 新能力走显式 broker/capability，不扩大主 Worker 权限。
 - 所有资源先定义硬上限和失败语义，再实现 happy path。
 - 活动计划、设计、安全和用户文档与实现同改。
 
 ## Next decision
 
-Phase 1 是当前阻断项。完成 clean-root 全门禁和真实 lifecycle 复验后，再优先推进
-Phase 2（恢复语义）与 Phase 3（通用 Capsule 生命周期）；不要直接跳到大量 Tool 或
-多 Agent 功能，否则会把原型中的临时状态模型固化为新历史包袱。
+Phase 1 在当前 `x86_64` checkout 的真实模型 lifecycle 子切片已经复验；仍需完成空缓存
+cold-checkout、`aarch64`、load/soak、故障注入和磁盘写入基线，才能关闭该 Phase。
+Phase 2 已落地 durable Conversation/Turn、重启 interrupted recovery 和确定性
+completed-pair windowing 子切片；下一步应补 durable event replay/gap/snapshot，再推进
+Phase 3（通用 Capsule 生命周期）。不要把当前 tail-window 宣称为语义摘要，也不要直接
+跳到文件、Bash、大量 Tool 或多 Agent 功能，否则会把临时恢复语义固化为新历史包袱。

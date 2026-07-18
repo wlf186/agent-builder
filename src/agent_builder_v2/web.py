@@ -31,6 +31,13 @@ from .capsule import PROTOTYPE_AGENT_ID
 from .commands import RUN_ID, CommandBus
 from .contracts import StartRunCommand
 from .control import RunService
+from .sessions import (
+    Conversation,
+    ConversationConflictError,
+    ConversationNotFoundError,
+    ConversationStoreUnavailableError,
+    ConversationSummary,
+)
 
 
 SESSION_COOKIE = "abv2_session"
@@ -261,6 +268,60 @@ def _clear_session_cookies(response: Response, *, secure: bool) -> None:
     )
 
 
+def _conversation_state(active_run_id: str | None) -> str:
+    return "running" if active_run_id is not None else "idle"
+
+
+def _summary_response(
+    value: Conversation | ConversationSummary,
+) -> dict[str, object]:
+    if isinstance(value, Conversation):
+        turn_count = len(value.turns)
+        completed_turn_count = sum(
+            turn.status == "completed" for turn in value.turns
+        )
+    else:
+        turn_count = value.turn_count
+        completed_turn_count = value.completed_turn_count
+    return {
+        "session_id": value.conversation_id,
+        "title": value.title,
+        "created_at": value.created_at,
+        "updated_at": value.updated_at,
+        "message_count": turn_count + completed_turn_count,
+        "state": _conversation_state(value.active_run_id),
+    }
+
+
+def _conversation_response(value: Conversation) -> dict[str, object]:
+    messages: list[dict[str, object]] = []
+    for turn in value.turns:
+        messages.append(
+            {
+                "message_id": turn.user_message_id,
+                "role": "user",
+                "content": turn.user_content,
+                "created_at": turn.created_at,
+                "turn_id": turn.turn_id,
+                "run_id": turn.run_id,
+                "turn_status": turn.status,
+            }
+        )
+        if turn.assistant_content is not None:
+            messages.append(
+                {
+                    "message_id": turn.assistant_message_id,
+                    "role": "assistant",
+                    "content": turn.assistant_content,
+                    "created_at": turn.updated_at,
+                    "turn_id": turn.turn_id,
+                    "run_id": turn.run_id,
+                    "turn_status": turn.status,
+                }
+            )
+    return {"session": _summary_response(value), "messages": messages}
+
+
 def create_app(repository_root: Path | None = None) -> FastAPI:
     root = (repository_root or _repository_root()).resolve(strict=True)
     source = _source_root().resolve(strict=True)
@@ -443,6 +504,109 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         )
         return response
 
+    @app.get("/api/sessions")
+    async def list_conversations(request: Request) -> dict[str, object]:
+        _require_session(request)
+        try:
+            conversations = await request.app.state.run_service.list_conversations()
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return {
+            "sessions": [_summary_response(item) for item in conversations]
+        }
+
+    @app.post("/api/sessions", status_code=201)
+    async def create_conversation(request: Request) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) - {"title"}:
+            raise HTTPException(400, "unsupported conversation field")
+        title = body.get("title", "新会话")
+        if not isinstance(title, str):
+            raise HTTPException(400, "title must be a string")
+        try:
+            conversation = await request.app.state.run_service.create_conversation(
+                title
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation capacity exhausted") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _summary_response(conversation)
+
+    @app.get("/api/sessions/{conversation_id}")
+    async def get_conversation(
+        conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        try:
+            conversation = await request.app.state.run_service.get_conversation(
+                conversation_id
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _conversation_response(conversation)
+
+    @app.delete("/api/sessions/{conversation_id}", status_code=204)
+    async def delete_conversation(
+        conversation_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        try:
+            result = await request.app.state.run_service.delete_conversation(
+                conversation_id
+            )
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation has an active Run") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        if not result.deleted:
+            raise HTTPException(404, "conversation not found")
+        return Response(status_code=204)
+
+    @app.post("/api/sessions/{conversation_id}/runs", status_code=202)
+    async def start_conversation_run(
+        conversation_id: str, request: Request
+    ) -> dict[str, str]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        body = await _read_json_object(request)
+        if set(body) != {"message"}:
+            raise HTTPException(400, "message is required")
+        message = body.get("message")
+        if not isinstance(message, str):
+            raise HTTPException(400, "message must be a string")
+        try:
+            record = await request.app.state.commands.start(
+                StartRunCommand(
+                    agent_id=PROTOTYPE_AGENT_ID,
+                    message=message,
+                    conversation_id=conversation_id,
+                )
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation has an active Run") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "run_id": record.run_id,
+            "session_id": record.conversation_id,
+            "events_url": f"/api/runs/{record.run_id}/events",
+        }
+
     @app.post("/api/runs", status_code=202)
     async def start_run(request: Request) -> dict[str, str]:
         _require_csrf(request)
@@ -454,11 +618,14 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             record = await request.app.state.commands.start(
                 StartRunCommand(agent_id=PROTOTYPE_AGENT_ID, message=message)
             )
-        except ValueError as exc:
+        except (ValueError, ConversationConflictError) as exc:
             raise HTTPException(400, str(exc)) from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
         return {
             "agent_id": record.agent_id,
             "conversation_id": record.conversation_id,
+            "session_id": record.conversation_id,
             "turn_id": record.turn_id,
             "run_id": record.run_id,
             "events_url": f"/api/runs/{record.run_id}/events",

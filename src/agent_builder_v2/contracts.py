@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import re
 from typing import Any, Literal
 from uuid import uuid4
 
 
-SCHEMA_VERSION = "2.0-prototype"
+SCHEMA_VERSION = "2.2-prototype"
 TERMINAL_KINDS = frozenset({"run.completed", "run.failed", "run.cancelled"})
 MAX_MESSAGE_BYTES = 8_192
+RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
 Durability = Literal["durable", "ephemeral"]
 
 
@@ -28,6 +30,7 @@ def utc_now() -> str:
 class StartRunCommand:
     agent_id: str
     message: str
+    conversation_id: str | None = None
 
     def validate(self) -> None:
         if not self.agent_id or len(self.agent_id) > 64:
@@ -38,6 +41,10 @@ class StartRunCommand:
             self.message.encode("utf-8")
         ) > MAX_MESSAGE_BYTES:
             raise ValueError("message exceeds 8192 UTF-8 bytes")
+        if self.conversation_id is not None and not RESOURCE_ID.fullmatch(
+            self.conversation_id
+        ):
+            raise ValueError("invalid conversation_id")
 
 
 @dataclass(frozen=True)

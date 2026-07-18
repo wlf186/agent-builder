@@ -7,8 +7,32 @@ import json
 
 import pytest
 
-from agent_builder_v2.context import ContextCompiler
-from agent_builder_v2.model import BrokeredStreamingModel
+from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
+from agent_builder_v2.context import ContextCompiler, ModelContext, ModelProfile
+from agent_builder_v2.model import BrokeredStreamingModel, ModelToolResult
+from agent_builder_v2.tools import prototype_tool_specs
+
+
+def _context(
+    message: str, *, tools=prototype_tool_specs()
+) -> ModelContext:
+    profile = ModelProfile(
+        provider="ollama",
+        model="qwen3.5:2b",
+        model_digest="a" * 64,
+        native_context_tokens=262_144,
+        operational_context_tokens=32_768,
+        max_output_tokens=2_048,
+        profile_source="test",
+    )
+    plan = ContextCompiler().compile(
+        message,
+        model_profile=profile,
+        tools=tools,
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+    return ModelContext(plan.reference, message)
 
 
 def _frame(request_id: str, frame_type: str, **values: object) -> bytes:
@@ -16,7 +40,7 @@ def _frame(request_id: str, frame_type: str, **values: object) -> bytes:
         json.dumps(
             {
                 "internal": "model.response",
-                "version": 1,
+                "version": 2,
                 "request_id": request_id,
                 "type": frame_type,
                 **values,
@@ -46,10 +70,16 @@ def test_brokered_model_normalizes_tool_then_final_content() -> None:
     )
     requests = BytesIO()
     model = BrokeredStreamingModel(responses, requests)
-    sections = ContextCompiler().compile("hello")
+    context = _context("hello")
 
-    first = list(model.stream(sections, (), lambda: False))
-    second = list(model.stream(sections, ("hello",), lambda: False))
+    first = list(model.stream(context, (), lambda: False))
+    second = list(
+        model.stream(
+            context,
+            (ModelToolResult("call-safe-1", "builtin/echo", "succeeded", "hello"),),
+            lambda: False,
+        )
+    )
 
     assert [block.kind for block in first] == [
         "text.start",
@@ -72,33 +102,35 @@ def test_brokered_model_normalizes_tool_then_final_content() -> None:
     assert sent == [
         {
             "internal": "model.request",
-            "version": 1,
+            "version": 2,
             "request_id": "model-1",
             "iteration": 1,
-            "tool_results": [],
+            "context_plan": context.reference.to_dict(),
+            "tool_result_call_ids": [],
         },
         {
             "internal": "model.request",
-            "version": 1,
+            "version": 2,
             "request_id": "model-2",
             "iteration": 2,
-            "tool_results": ["hello"],
+            "context_plan": context.reference.to_dict(),
+            "tool_result_call_ids": ["call-safe-1"],
         },
     ]
 
 
 def test_brokered_model_rejects_mismatched_or_oversized_frames() -> None:
-    sections = ContextCompiler().compile("hello")
+    context = _context("hello")
     mismatched = BrokeredStreamingModel(
         BytesIO(_frame("another-request", "stop", reason="end_turn")),
         BytesIO(),
     )
     with pytest.raises(RuntimeError, match="invalid envelope"):
-        list(mismatched.stream(sections, (), lambda: False))
+        list(mismatched.stream(context, (), lambda: False))
 
     oversized = BrokeredStreamingModel(BytesIO(b"x" * 65_537 + b"\n"), BytesIO())
     with pytest.raises(RuntimeError, match="exceeded"):
-        list(oversized.stream(sections, (), lambda: False))
+        list(oversized.stream(context, (), lambda: False))
 
 
 def test_brokered_model_rejects_capability_escalation() -> None:
@@ -114,4 +146,20 @@ def test_brokered_model_rejects_capability_escalation() -> None:
     model = BrokeredStreamingModel(responses, BytesIO())
 
     with pytest.raises(RuntimeError, match="tool call is invalid"):
-        list(model.stream(ContextCompiler().compile("hello"), (), lambda: False))
+        list(model.stream(_context("hello"), (), lambda: False))
+
+
+def test_explicit_empty_tool_set_never_restores_prototype_capabilities() -> None:
+    responses = BytesIO(
+        _frame(
+            "model-1",
+            "tool.use",
+            call_id="call-1",
+            tool_id="builtin/echo",
+            arguments={"text": "not authorized"},
+        )
+    )
+    model = BrokeredStreamingModel(responses, BytesIO(), effective_tools=())
+
+    with pytest.raises(RuntimeError, match="tool call is invalid"):
+        list(model.stream(_context("hello", tools=()), (), lambda: False))

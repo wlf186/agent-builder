@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from threading import Event
 from typing import Iterator
 
-from .context import ContextCompiler
+from .context import ContextPlanReference, ModelContext
 from .contracts import TERMINAL_KINDS, WorkerEvent
-from .model import FakeStreamingModel, ModelBlock, StreamingModel
-from .tools import ToolRegistry, prototype_tools
+from .model import FakeStreamingModel, ModelBlock, ModelToolResult, StreamingModel
+from .tools import ToolRegistry, prototype_tools, toolset_digest
 
 
 @dataclass
@@ -18,7 +19,7 @@ class RunState:
     model_iterations: int = 0
     open_blocks: dict[str, list[str]] = field(default_factory=dict)
     pending_tools: set[str] = field(default_factory=set)
-    tool_results: list[str] = field(default_factory=list)
+    tool_results: list[ModelToolResult] = field(default_factory=list)
     terminal_kind: str | None = None
 
 
@@ -39,12 +40,10 @@ class HarnessKernel:
     def __init__(
         self,
         *,
-        context: ContextCompiler | None = None,
         model: StreamingModel | None = None,
         tools: ToolRegistry | None = None,
         cancellation: CancellationToken | None = None,
     ) -> None:
-        self.context = context or ContextCompiler()
         self.model = model or FakeStreamingModel()
         self.tools = tools or prototype_tools()
         self.cancellation = cancellation or CancellationToken()
@@ -132,7 +131,14 @@ class HarnessKernel:
                 result_outcome = result.outcome
                 result_content = result.content
             self.state.pending_tools.remove(call_id)
-            self.state.tool_results.append(result_content)
+            self.state.tool_results.append(
+                ModelToolResult(
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome=result_outcome,
+                    content=result_content,
+                )
+            )
             yield self._event(
                 "tool.call.finished",
                 {
@@ -147,10 +153,31 @@ class HarnessKernel:
         else:
             raise RuntimeError(f"unknown normalized model block: {block.kind}")
 
-    def run(self, user_message: str) -> Iterator[WorkerEvent]:
+    def _local_context_reference(self, user_message: str) -> ContextPlanReference:
+        effective_toolset_digest = toolset_digest(self.tools.specs())
+        digest = hashlib.sha256(
+            b"agent-builder-local-kernel-context-v1\0"
+            + effective_toolset_digest.encode("ascii")
+            + b"\0"
+            + user_message.encode("utf-8")
+        ).hexdigest()
+        return ContextPlanReference(
+            plan_id=f"context-{digest[:24]}",
+            digest=digest,
+            toolset_digest=effective_toolset_digest,
+        )
+
+    def run(
+        self,
+        user_message: str,
+        context_reference: ContextPlanReference | None = None,
+    ) -> Iterator[WorkerEvent]:
         try:
             self.state.phase = "preparing_context"
-            sections = self.context.compile(user_message)
+            model_context = ModelContext(
+                context_reference or self._local_context_reference(user_message),
+                user_message,
+            )
             while self.state.model_iterations < 3:
                 if self.cancellation.is_cancelled():
                     yield from self._cancel_events()
@@ -160,7 +187,7 @@ class HarnessKernel:
                 saw_stop = False
                 saw_tool = False
                 for block in self.model.stream(
-                    sections,
+                    model_context,
                     tuple(self.state.tool_results),
                     self.cancellation.is_cancelled,
                 ):

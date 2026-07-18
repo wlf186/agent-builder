@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from io import BytesIO, TextIOWrapper
+import json
 import resource
 from pathlib import Path
 from typing import Any
@@ -9,6 +11,36 @@ from typing import Any
 import pytest
 
 from agent_builder_v2 import worker
+from agent_builder_v2.context import ContextPlanReference
+
+
+CONTEXT_REFERENCE = ContextPlanReference(
+    plan_id="context-" + "a" * 24,
+    digest="a" * 64,
+    toolset_digest="b" * 64,
+)
+
+
+def test_worker_command_budget_covers_worst_case_json_escaping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = "\0" * 8_192
+    payload = (
+        json.dumps(
+            {"message": message, "context_plan": CONTEXT_REFERENCE.to_dict()},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    assert 16_384 < len(payload) <= worker.MAX_COMMAND_BYTES
+    stdin = TextIOWrapper(BytesIO(payload), encoding="utf-8")
+    monkeypatch.setattr(worker.sys, "stdin", stdin)
+
+    assert worker._read_command() == {
+        "message": message,
+        "context_plan": CONTEXT_REFERENCE,
+    }
 
 
 def test_lower_resource_limit_preserves_stricter_inherited_caps(
@@ -57,14 +89,17 @@ def test_worker_applies_all_limits_before_input_or_kernel(
     monkeypatch.setattr(
         worker,
         "_read_command",
-        lambda: calls.append("read") or {"message": "hello"},
+        lambda: calls.append("read")
+        or {"message": "hello", "context_plan": CONTEXT_REFERENCE},
     )
 
     class _Kernel:
         def __init__(self, **_kwargs: Any) -> None:
             calls.append("kernel")
 
-        def run(self, _message: str) -> list[Any]:
+        def run(
+            self, _message: str, _context_reference: ContextPlanReference
+        ) -> list[Any]:
             return []
 
     monkeypatch.setattr(worker, "HarnessKernel", _Kernel)
@@ -128,7 +163,10 @@ def test_worker_sandbox_failure_does_not_publish_or_read(
         worker, "_publish_sandbox_ready", lambda _value: calls.append("ready")
     )
     monkeypatch.setattr(
-        worker, "_read_command", lambda: calls.append("read") or {"message": "bad"}
+        worker,
+        "_read_command",
+        lambda: calls.append("read")
+        or {"message": "bad", "context_plan": CONTEXT_REFERENCE},
     )
 
     with pytest.raises(OSError, match="sandbox unavailable"):

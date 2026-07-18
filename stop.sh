@@ -72,7 +72,7 @@ process_marker() {
 
 process_command() {
     if [[ -r "/proc/$1/cmdline" ]]; then
-        tr '\0' ' ' < "/proc/$1/cmdline"
+        tr '\0' ' ' 2>/dev/null < "/proc/$1/cmdline" || true
     else
         ps -o command= -p "$1" 2>/dev/null || true
     fi

@@ -24,6 +24,7 @@ class AgentCapsule:
     data_root: Path
     runtime_root: Path
     interpreter: Path
+    generation: int = 1
 
 
 class CapsuleManager:
@@ -84,7 +85,7 @@ class CapsuleManager:
             raise RuntimeError("secure Capsule metadata requires O_NOFOLLOW")
         return flag
 
-    def _read_manifest(self, path: Path, agent_id: str) -> None:
+    def _read_manifest(self, path: Path, agent_id: str) -> int:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | self._no_follow_flag())
         try:
             metadata = os.fstat(descriptor)
@@ -112,11 +113,11 @@ class CapsuleManager:
             or value.get("generation") != 1
         ):
             raise RuntimeError("prototype Agent manifest has an unexpected identity")
+        return 1
 
-    def _ensure_manifest(self, path: Path, agent_id: str) -> None:
+    def _ensure_manifest(self, path: Path, agent_id: str) -> int:
         try:
-            self._read_manifest(path, agent_id)
-            return
+            return self._read_manifest(path, agent_id)
         except FileNotFoundError:
             pass
 
@@ -171,7 +172,7 @@ class CapsuleManager:
                 os.fsync(parent_descriptor)
             finally:
                 os.close(parent_descriptor)
-        self._read_manifest(path, agent_id)
+        return self._read_manifest(path, agent_id)
 
     def _validate_interpreter(self, environment: Path) -> Path:
         self._require_real_directory(environment)
@@ -238,6 +239,7 @@ class CapsuleManager:
             or capsule.data_root != expected_data
             or capsule.runtime_root != expected_runtime
             or capsule.interpreter != expected_interpreter
+            or capsule.generation != 1
         ):
             raise ValueError("Capsule identity is invalid")
         self._require_real_directory(capsule.data_root)
@@ -448,9 +450,9 @@ class CapsuleManager:
             self._ensure_real_directory(runtime_root / child)
 
         manifest = data_root / "manifest.json"
-        self._ensure_manifest(manifest, agent_id)
+        generation = self._ensure_manifest(manifest, agent_id)
         interpreter = self._ensure_environment(runtime_root)
-        return AgentCapsule(agent_id, data_root, runtime_root, interpreter)
+        return AgentCapsule(agent_id, data_root, runtime_root, interpreter, generation)
 
     def create_run_root(self, capsule: AgentCapsule, run_id: str) -> Path:
         self._validate_capsule(capsule)

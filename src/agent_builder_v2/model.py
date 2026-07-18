@@ -8,7 +8,8 @@ import re
 from time import sleep
 from typing import Any, BinaryIO, Callable, Iterator, Protocol
 
-from .context import PromptSection
+from .context import ModelContext
+from .tools import ToolSpec, prototype_tool_specs, toolset_digest
 
 
 @dataclass(frozen=True)
@@ -17,11 +18,19 @@ class ModelBlock:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ModelToolResult:
+    call_id: str
+    tool_id: str
+    outcome: str
+    content: str = field(repr=False)
+
+
 class StreamingModel(Protocol):
     def stream(
         self,
-        sections: tuple[PromptSection, ...],
-        tool_results: tuple[str, ...],
+        context: ModelContext,
+        tool_results: tuple[ModelToolResult, ...],
         is_cancelled: Callable[[], bool],
     ) -> Iterator[ModelBlock]: ...
 
@@ -31,13 +40,10 @@ class FakeStreamingModel:
 
     def stream(
         self,
-        sections: tuple[PromptSection, ...],
-        tool_results: tuple[str, ...],
+        context: ModelContext,
+        tool_results: tuple[ModelToolResult, ...],
         is_cancelled: Callable[[], bool],
     ) -> Iterator[ModelBlock]:
-        user_message = next(
-            section.content for section in sections if section.section_id == "turn.user"
-        )
         if not tool_results:
             block_id = "analysis-summary"
             yield ModelBlock("text.start", {"block_id": block_id})
@@ -54,7 +60,7 @@ class FakeStreamingModel:
                 {
                     "call_id": "prototype-echo-call",
                     "tool_id": "builtin/echo",
-                    "arguments": {"text": user_message.strip()},
+                    "arguments": {"text": context.user_message.strip()},
                 },
             )
             return
@@ -63,7 +69,7 @@ class FakeStreamingModel:
         yield ModelBlock("text.start", {"block_id": block_id})
         fragments = (
             "工具结果已按原调用 ID 回流：",
-            tool_results[-1],
+            tool_results[-1].content,
             "。这条响应来自同一个 HarnessKernel 的第二次模型迭代。",
         )
         for fragment in fragments:
@@ -75,9 +81,11 @@ class FakeStreamingModel:
         yield ModelBlock("stop", {"reason": "end_turn"})
 
 
-BROKER_PROTOCOL_VERSION = 1
+BROKER_PROTOCOL_VERSION = 2
 MAX_BROKER_FRAME_BYTES = 65_536
-MAX_BROKER_RESPONSE_FRAMES = 256
+# The trusted provider adapter may emit at most 128 coalesced content frames
+# plus one Tool/stop/error terminal frame per model iteration.
+MAX_BROKER_RESPONSE_FRAMES = 129
 MAX_BROKER_TEXT_BYTES = 12_288
 _BROKER_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 
@@ -85,10 +93,20 @@ _BROKER_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 class BrokeredStreamingModel:
     """Use bounded inherited pipes; the untrusted Worker never opens a socket."""
 
-    def __init__(self, reader: BinaryIO, writer: BinaryIO) -> None:
+    def __init__(
+        self,
+        reader: BinaryIO,
+        writer: BinaryIO,
+        effective_tools: tuple[ToolSpec, ...] | None = None,
+    ) -> None:
         self._reader = reader
         self._writer = writer
         self._iteration = 0
+        specs = prototype_tool_specs() if effective_tools is None else effective_tools
+        self._tools = {spec.tool_id: spec for spec in specs}
+        if len(self._tools) != len(specs):
+            raise RuntimeError("model capability set has duplicate Tool IDs")
+        self._toolset_digest = toolset_digest(specs)
 
     @staticmethod
     def _bounded_text(value: object, maximum: int = MAX_BROKER_TEXT_BYTES) -> str:
@@ -98,18 +116,40 @@ class BrokeredStreamingModel:
             raise RuntimeError("model broker text exceeded its limit")
         return value
 
-    def _send_request(self, request_id: str, tool_results: tuple[str, ...]) -> None:
-        if len(tool_results) > 3:
+    def _send_request(
+        self,
+        request_id: str,
+        context: ModelContext,
+        tool_results: tuple[ModelToolResult, ...],
+    ) -> None:
+        if context.reference.toolset_digest != self._toolset_digest:
+            raise RuntimeError("model context Tool set changed")
+        if len(tool_results) > 3 or len({item.call_id for item in tool_results}) != len(
+            tool_results
+        ):
             raise RuntimeError("model broker tool-result limit exceeded")
         for result in tool_results:
-            self._bounded_text(result, 2_048)
+            if not isinstance(result, ModelToolResult):
+                raise RuntimeError("model broker Tool result is invalid")
+            spec = self._tools.get(result.tool_id)
+            if (
+                not _BROKER_ID.fullmatch(result.call_id)
+                or spec is None
+                or result.outcome not in {"succeeded", "failed", "cancelled"}
+            ):
+                raise RuntimeError("model broker Tool result is invalid")
+            try:
+                spec.validate_result(result.content)
+            except ValueError as exc:
+                raise RuntimeError("model broker Tool result is invalid") from exc
         payload = json.dumps(
             {
                 "internal": "model.request",
                 "version": BROKER_PROTOCOL_VERSION,
                 "request_id": request_id,
                 "iteration": self._iteration,
-                "tool_results": list(tool_results),
+                "context_plan": context.reference.to_dict(),
+                "tool_result_call_ids": [result.call_id for result in tool_results],
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -141,17 +181,15 @@ class BrokeredStreamingModel:
 
     def stream(
         self,
-        sections: tuple[PromptSection, ...],
-        tool_results: tuple[str, ...],
+        context: ModelContext,
+        tool_results: tuple[ModelToolResult, ...],
         is_cancelled: Callable[[], bool],
     ) -> Iterator[ModelBlock]:
-        # The trusted broker already owns the original validated user message.
-        # Sections are deliberately not allowed to select a model or endpoint.
-        if not any(section.section_id == "turn.user" for section in sections):
-            raise RuntimeError("model context has no user turn")
+        if not isinstance(context, ModelContext):
+            raise RuntimeError("model context is invalid")
         self._iteration += 1
         request_id = f"model-{self._iteration}"
-        self._send_request(request_id, tool_results)
+        self._send_request(request_id, context, tool_results)
         block_id = f"ollama-content-{self._iteration}"
         block_open = False
 
@@ -191,23 +229,25 @@ class BrokeredStreamingModel:
                 }:
                     raise RuntimeError("model broker tool frame is invalid")
                 call_id = frame.get("call_id")
-                arguments = frame.get("arguments")
+                tool_id = frame.get("tool_id")
+                spec = self._tools.get(tool_id) if isinstance(tool_id, str) else None
                 if (
                     not isinstance(call_id, str)
                     or _BROKER_ID.fullmatch(call_id) is None
-                    or frame.get("tool_id") != "builtin/echo"
-                    or not isinstance(arguments, dict)
-                    or set(arguments) != {"text"}
+                    or spec is None
                 ):
                     raise RuntimeError("model broker tool call is invalid")
-                self._bounded_text(arguments.get("text"), 2_048)
+                try:
+                    arguments = spec.validate_arguments(frame.get("arguments"))
+                except ValueError as exc:
+                    raise RuntimeError("model broker tool call is invalid") from exc
                 if block_open:
                     yield ModelBlock("text.finish", {"block_id": block_id})
                 yield ModelBlock(
                     "tool.use",
                     {
                         "call_id": call_id,
-                        "tool_id": "builtin/echo",
+                        "tool_id": spec.tool_id,
                         "arguments": arguments,
                     },
                 )
@@ -238,3 +278,14 @@ class BrokeredStreamingModel:
                 raise RuntimeError("trusted model broker rejected the request")
             raise RuntimeError("model broker returned an unknown frame")
         raise RuntimeError("model broker response-frame limit exceeded")
+
+
+__all__ = [
+    "BROKER_PROTOCOL_VERSION",
+    "BrokeredStreamingModel",
+    "FakeStreamingModel",
+    "MAX_BROKER_FRAME_BYTES",
+    "ModelBlock",
+    "ModelToolResult",
+    "StreamingModel",
+]

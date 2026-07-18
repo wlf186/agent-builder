@@ -10,6 +10,7 @@ import signal
 import sys
 from typing import Any
 
+from .context import ContextPlanError, ContextPlanReference
 from .contracts import MAX_MESSAGE_BYTES
 from .kernel import CancellationToken, HarnessKernel
 from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES, BrokeredStreamingModel
@@ -22,7 +23,9 @@ from .sandbox import (
 )
 
 
-MAX_COMMAND_BYTES = 16_384
+# JSON control characters can expand to six bytes (for example ``\u0000``).
+# Reserve a fixed envelope budget in addition to the public message boundary.
+MAX_COMMAND_BYTES = MAX_MESSAGE_BYTES * 6 + 4_096
 
 
 def _lower_resource_limit(resource_name: int, desired: int) -> None:
@@ -108,7 +111,7 @@ def _read_command() -> dict[str, Any]:
     if len(raw) > MAX_COMMAND_BYTES:
         raise ValueError("command is too large")
     value = json.loads(raw)
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or set(value) != {"message", "context_plan"}:
         raise ValueError("command must be an object")
     message = value.get("message")
     if (
@@ -118,6 +121,11 @@ def _read_command() -> dict[str, Any]:
         or len(message.encode("utf-8")) > MAX_MESSAGE_BYTES
     ):
         raise ValueError("invalid message")
+    try:
+        context_reference = ContextPlanReference.from_dict(value.get("context_plan"))
+    except ContextPlanError as exc:
+        raise ValueError("invalid context plan reference") from exc
+    value["context_plan"] = context_reference
     return value
 
 
@@ -152,7 +160,7 @@ def main() -> int:
 
     model = BrokeredStreamingModel(sys.stdin.buffer, sys.stdout.buffer)
     kernel = HarnessKernel(model=model, cancellation=cancellation)
-    for event in kernel.run(command["message"]):
+    for event in kernel.run(command["message"], command["context_plan"]):
         _write_json(event.to_dict())
     return 0
 

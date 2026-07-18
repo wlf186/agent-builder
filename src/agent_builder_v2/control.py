@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .capsule import AgentCapsule, CapsuleManager
+from .context import ConversationMessage, ContextCompiler, ContextPlan
 from .contracts import (
-    MAX_MESSAGE_BYTES,
     TERMINAL_KINDS,
     EventEnvelope,
     StartRunCommand,
@@ -24,7 +24,6 @@ from .contracts import (
 )
 from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
 from .ollama import (
-    OLLAMA_MODEL,
     OllamaBroker,
     OllamaBrokerError,
     OllamaCancelledError,
@@ -33,7 +32,15 @@ from .ollama import (
     OllamaToolResult,
 )
 from .sandbox import HostQualification, require_qualified_host
+from .sessions import (
+    Conversation,
+    ConversationDeleteResult,
+    ConversationNotFoundError,
+    ConversationStore,
+    ConversationSummary,
+)
 from .state import EventJournal
+from .tools import ToolSpec, prototype_tool_specs, toolset_digest
 
 
 WORKER_EVENT_KINDS = frozenset(
@@ -58,7 +65,9 @@ MAX_LIVE_EVENT_BYTES = 1024 * 1024
 MAX_DURABLE_BYTES_PER_RUN = 256 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
 RECOVERY_EVENT_RESERVE = 32 * 1024
-RECOVERY_EVENT_SLOTS = 3
+# Worst case after one accepted nonterminal event: discard one open assistant
+# block, start and finish one requested-only Tool, then publish the terminal.
+RECOVERY_EVENT_SLOTS = 4
 MAX_DURABLE_EVENT_BYTES = 65_536
 RUN_WALL_TIMEOUT_SECONDS = 60.0
 CANCEL_GRACE_SECONDS = 2.0
@@ -350,6 +359,11 @@ class RunRecord:
     conversation_id: str
     turn_id: str
     run_id: str
+    user_message: str | None = field(default=None, repr=False)
+    conversation_managed: bool = False
+    conversation_revision: int | None = None
+    context_plan: ContextPlan | None = None
+    effective_tools: tuple[ToolSpec, ...] = ()
     events: list[EventEnvelope] = field(default_factory=list)
     terminal_kind: str | None = None
     cancel_requested: bool = False
@@ -364,26 +378,48 @@ class RunRecord:
     open_blocks: set[str] = field(default_factory=set)
     seen_blocks: set[str] = field(default_factory=set)
     pending_tools: dict[str, str] = field(default_factory=dict)
+    pending_tool_arguments: dict[str, dict[str, str]] = field(default_factory=dict)
     started_tools: set[str] = field(default_factory=set)
     seen_tools: set[str] = field(default_factory=set)
+    broker_pending_tool_calls: dict[
+        str, tuple[str, dict[str, str]]
+    ] = field(default_factory=dict)
     broker_tool_results: list[OllamaToolResult] = field(default_factory=list)
+    model_request_count: int = 0
+    broker_stop_iteration: int | None = None
+    final_assistant_content: str | None = field(default=None, repr=False)
+    model_failure: tuple[str, bool] | None = None
+    model_usage: dict[str, int | bool] = field(
+        default_factory=lambda: {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "last_input_tokens": 0,
+            "complete": True,
+        }
+    )
     journal_failed: bool = False
     resource_failure: str | None = None
+    retired: bool = False
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
 
     async def events_after(
         self, after: int, timeout: float = 15.0
     ) -> tuple[list[EventEnvelope], bool]:
         async with self.condition:
+            if self.retired:
+                return [], True
             available = [event for event in self.events if event.seq > after]
             if not available and self.terminal_kind is None:
                 try:
                     await asyncio.wait_for(self.condition.wait(), timeout=timeout)
                 except TimeoutError:
                     return [], False
+                if self.retired:
+                    return [], True
                 available = [event for event in self.events if event.seq > after]
-            done = self.terminal_kind is not None and (
-                not available or available[-1].kind in TERMINAL_KINDS
+            done = self.retired or (
+                self.terminal_kind is not None
+                and (not available or available[-1].kind in TERMINAL_KINDS)
             )
             return available, done
 
@@ -395,17 +431,45 @@ class RunService:
         source_root: Path,
         *,
         model_broker: OllamaBroker | None = None,
+        context_compiler: ContextCompiler | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve(strict=True)
         self.source_root = source_root.resolve(strict=True)
         self.capsules = CapsuleManager(self.repository_root)
         self.capsule: AgentCapsule | None = None
         self.journal: EventJournal | None = None
+        self.conversations: ConversationStore | None = None
         self.model_broker = model_broker or OllamaBroker()
+        self.context_compiler = context_compiler or ContextCompiler()
+        self.effective_tools = prototype_tool_specs()
+        toolset_digest(self.effective_tools)
         self.model_qualification: OllamaQualification | None = None
         self.sandbox_qualification: HostQualification | None = None
         self.runs: dict[str, RunRecord] = {}
         self._lock = asyncio.Lock()
+        self._control_tasks: set[asyncio.Task[Any]] = set()
+        self._closing = False
+
+    def _track_control_task(self, task: asyncio.Task[Any]) -> None:
+        """Keep a mutation alive after its request task has been cancelled."""
+
+        self._control_tasks.add(task)
+
+        def completed(value: asyncio.Task[Any]) -> None:
+            self._control_tasks.discard(value)
+            if not value.cancelled():
+                # Retrieve background exceptions.  Awaiting callers still see
+                # the same exception; abandoned request tasks do not produce
+                # an unhandled-task warning or hide a failed mutation.
+                value.exception()
+
+        task.add_done_callback(completed)
+
+    async def _drain_control_tasks(self) -> None:
+        while self._control_tasks:
+            await asyncio.gather(
+                *tuple(self._control_tasks), return_exceptions=True
+            )
 
     async def initialize(self) -> None:
         try:
@@ -417,14 +481,34 @@ class RunService:
                 self.capsule,
             )
             self.journal = EventJournal(self.capsule.data_root / "state.sqlite")
+            self.conversations = ConversationStore(
+                self.capsule.data_root / "state.sqlite",
+                self.capsule.agent_id,
+            )
+            await asyncio.to_thread(
+                self.conversations.recover_running_as_interrupted
+            )
             await asyncio.to_thread(self.journal.prune_to_recent_runs, 256)
         except BaseException:
+            if self.conversations is not None:
+                self.conversations.close()
+                self.conversations = None
+            if self.journal is not None:
+                self.journal.close()
+                self.journal = None
             self.sandbox_qualification = None
             self.model_qualification = None
             await self.model_broker.close()
             raise
 
     async def close(self) -> None:
+        async with self._lock:
+            self._closing = True
+        # Admissions and deletes registered before the closing fence may still
+        # be completing checkout-local thread commits.  Drain them first, then
+        # take a fresh Run snapshot so a late admitted lifecycle cannot outlive
+        # the stores it uses.
+        await self._drain_control_tasks()
         async with self._lock:
             records = list(self.runs.values())
         for record in records:
@@ -437,45 +521,320 @@ class RunService:
         )
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._drain_control_tasks()
         if self.journal is not None:
             self.journal.close()
             self.journal = None
+        if self.conversations is not None:
+            self.conversations.close()
+            self.conversations = None
         self.model_qualification = None
         self.sandbox_qualification = None
         await self.model_broker.close()
 
+    def _conversation_store(self) -> ConversationStore:
+        if self.conversations is None:
+            raise RuntimeError("conversation store is unavailable")
+        return self.conversations
+
+    async def create_conversation(self, title: str = "新会话") -> Conversation:
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        request_cancelled = asyncio.Event()
+        operation = asyncio.create_task(
+            self._create_conversation_owned(title, request_cancelled),
+            name="harness-v2-create-conversation",
+        )
+        self._track_control_task(operation)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            request_cancelled.set()
+
+            def delete_if_created(value: asyncio.Task[Conversation]) -> None:
+                if value.cancelled():
+                    return
+                try:
+                    conversation = value.result()
+                except BaseException:
+                    return
+                cleanup = asyncio.create_task(
+                    self._delete_conversation_fenced(
+                        conversation.conversation_id
+                    ),
+                    name=(
+                        "harness-v2-abandoned-conversation-"
+                        f"{conversation.conversation_id}"
+                    ),
+                )
+                self._track_control_task(cleanup)
+
+            operation.add_done_callback(delete_if_created)
+            raise
+
+    async def _create_conversation_owned(
+        self,
+        title: str,
+        request_cancelled: asyncio.Event,
+    ) -> Conversation:
+        conversation = await asyncio.to_thread(
+            self._conversation_store().create_conversation,
+            title,
+        )
+        if request_cancelled.is_set() or self._closing:
+            await asyncio.to_thread(
+                self._conversation_store().delete_conversation,
+                conversation.conversation_id,
+            )
+            raise asyncio.CancelledError
+        return conversation
+
+    async def list_conversations(self) -> tuple[ConversationSummary, ...]:
+        return await asyncio.to_thread(
+            self._conversation_store().list_conversations,
+            limit=100,
+        )
+
+    async def get_conversation(self, conversation_id: str) -> Conversation:
+        return await asyncio.to_thread(
+            self._conversation_store().get_conversation,
+            conversation_id,
+        )
+
+    async def delete_conversation(
+        self, conversation_id: str
+    ) -> ConversationDeleteResult:
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        operation = asyncio.create_task(
+            self._delete_conversation_fenced(conversation_id),
+            name=f"harness-v2-delete-{conversation_id}",
+        )
+        self._track_control_task(operation)
+        return await asyncio.shield(operation)
+
+    async def _delete_conversation_fenced(
+        self, conversation_id: str
+    ) -> ConversationDeleteResult:
+        # This lock is also held while a managed terminal is committed and
+        # published in memory.  Therefore an inactive Conversation cannot be
+        # deleted in the gap between the SQLite terminal commit and the
+        # matching RunRecord transition.  The caller shields this owned task,
+        # so request cancellation cannot abandon a committed database delete
+        # before the corresponding records have been retired.
+        async with self._lock:
+            result = await asyncio.to_thread(
+                self._conversation_store().delete_conversation,
+                conversation_id,
+            )
+            if result.deleted:
+                retired: list[RunRecord] = []
+                for run_id in tuple(self.runs):
+                    record = self.runs[run_id]
+                    if record.conversation_id != conversation_id:
+                        continue
+                    del self.runs[run_id]
+                    record.retired = True
+                    record.events.clear()
+                    record.live_event_bytes = 0
+                    record.durable_event_bytes = 0
+                    record.user_message = None
+                    record.final_assistant_content = None
+                    record.context_plan = None
+                    record.open_blocks.clear()
+                    record.seen_blocks.clear()
+                    record.pending_tools.clear()
+                    record.pending_tool_arguments.clear()
+                    record.started_tools.clear()
+                    record.seen_tools.clear()
+                    record.broker_pending_tool_calls.clear()
+                    record.broker_tool_results.clear()
+                    retired.append(record)
+                for record in retired:
+                    async with record.condition:
+                        record.condition.notify_all()
+        return result
+
     async def start(self, command: StartRunCommand) -> RunRecord:
         command.validate()
-        if self.capsule is None or self.journal is None:
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        if (
+            self.capsule is None
+            or self.journal is None
+            or self.conversations is None
+            or self.model_qualification is None
+        ):
             raise RuntimeError("RunService is not initialized")
         if command.agent_id != self.capsule.agent_id:
             raise ValueError("unknown agent")
+
+        request_cancelled = asyncio.Event()
+        operation = asyncio.create_task(
+            self._prepare_run(command, request_cancelled),
+            name="harness-v2-start-admission",
+        )
+        self._track_control_task(operation)
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # The owned admission task is intentionally not cancelled.  This
+            # covers checkout-local SQLite commits occurring in to_thread both
+            # before and during begin_turn.  It either removes an auto-created
+            # empty Conversation or hands an admitted Run to its supervisor.
+            request_cancelled.set()
+
+            def cancel_if_admitted(value: asyncio.Task[RunRecord]) -> None:
+                if value.cancelled():
+                    return
+                try:
+                    record = value.result()
+                except BaseException:
+                    return
+                cancel_task = asyncio.create_task(
+                    self.cancel(record.run_id),
+                    name=f"harness-v2-abandoned-start-{record.run_id}",
+                )
+                self._track_control_task(cancel_task)
+
+            operation.add_done_callback(cancel_if_admitted)
+            raise
+
+    async def _prepare_run(
+        self,
+        command: StartRunCommand,
+        request_cancelled: asyncio.Event,
+    ) -> RunRecord:
+        """Prepare one Run in an owned task that survives request cancellation."""
+
+        if (
+            self.capsule is None
+            or self.journal is None
+            or self.conversations is None
+            or self.model_qualification is None
+        ):
+            raise RuntimeError("RunService is not initialized")
+        created_conversation = False
+        try:
+            if command.conversation_id is None:
+                conversation = await asyncio.to_thread(
+                    self.conversations.create_conversation,
+                    "新会话",
+                )
+                conversation_id = conversation.conversation_id
+                created_conversation = True
+            else:
+                conversation_id = command.conversation_id
+            if request_cancelled.is_set() or self._closing:
+                raise asyncio.CancelledError
+            snapshot = await asyncio.to_thread(
+                self.conversations.snapshot_for_turn,
+                conversation_id,
+            )
+            if request_cancelled.is_set() or self._closing:
+                raise asyncio.CancelledError
+            context_history = tuple(
+                ConversationMessage(message.message_id, message.role, message.content)
+                for message in snapshot.committed_history
+            )
+            context_plan = self.context_compiler.compile(
+                command.message,
+                model_profile=self.model_qualification.model_profile,
+                tools=self.effective_tools,
+                agent_id=command.agent_id,
+                capsule_generation=self.capsule.generation,
+                history=context_history,
+            )
+            if request_cancelled.is_set() or self._closing:
+                raise asyncio.CancelledError
+        except BaseException:
+            if created_conversation:
+                await asyncio.to_thread(
+                    self.conversations.delete_conversation,
+                    conversation_id,
+                )
+            raise
         record = RunRecord(
             agent_id=command.agent_id,
-            conversation_id=new_id(),
+            conversation_id=conversation_id,
             turn_id=new_id(),
             run_id=new_id(),
+            user_message=command.message,
+            conversation_managed=True,
+            conversation_revision=snapshot.revision,
+            context_plan=context_plan,
+            effective_tools=self.effective_tools,
             deadline_at=asyncio.get_running_loop().time() + RUN_WALL_TIMEOUT_SECONDS,
         )
+        reservation_error: ValueError | None = None
         async with self._lock:
             active = sum(
                 existing.terminal_kind is None for existing in self.runs.values()
             )
             if active >= MAX_ACTIVE_RUNS:
-                raise ValueError("prototype active Run capacity exhausted")
-            while len(self.runs) >= MAX_RETAINED_RUNS:
-                completed_id = next(
-                    (
-                        run_id
-                        for run_id, existing in self.runs.items()
-                        if existing.terminal_kind is not None
-                    ),
-                    None,
+                reservation_error = ValueError(
+                    "prototype active Run capacity exhausted"
                 )
-                if completed_id is None:
-                    raise ValueError("prototype Run capacity exhausted")
-                del self.runs[completed_id]
-            self.runs[record.run_id] = record
+            else:
+                while len(self.runs) >= MAX_RETAINED_RUNS:
+                    completed_id = next(
+                        (
+                            run_id
+                            for run_id, existing in self.runs.items()
+                            if existing.terminal_kind is not None
+                        ),
+                        None,
+                    )
+                    if completed_id is None:
+                        reservation_error = ValueError(
+                            "prototype Run capacity exhausted"
+                        )
+                        break
+                    del self.runs[completed_id]
+                if reservation_error is None:
+                    self.runs[record.run_id] = record
+        if reservation_error is not None:
+            if created_conversation:
+                await asyncio.to_thread(
+                    self.conversations.delete_conversation,
+                    conversation_id,
+                )
+            raise reservation_error
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        record.task = asyncio.create_task(
+            self._admit_and_run(
+                record,
+                command.message,
+                context_plan=context_plan,
+                created_conversation=created_conversation,
+                ready=ready,
+                request_cancelled=request_cancelled,
+            ),
+            name=f"harness-v2-run-{record.run_id}",
+        )
+        if request_cancelled.is_set() or self._closing:
+            if not record.cancel_requested:
+                record.cancel_requested_at = asyncio.get_running_loop().time()
+            record.cancel_requested = True
+        await ready
+        if request_cancelled.is_set() or self._closing:
+            if not record.cancel_requested:
+                record.cancel_requested_at = asyncio.get_running_loop().time()
+            record.cancel_requested = True
+        return record
+
+    async def _admit_and_run(
+        self,
+        record: RunRecord,
+        message: str,
+        *,
+        context_plan: ContextPlan,
+        created_conversation: bool,
+        ready: asyncio.Future[None],
+        request_cancelled: asyncio.Event,
+    ) -> None:
+        """Own admission through terminal publication independently of a request."""
+
         try:
             assert self.journal is not None
             async with self._lock:
@@ -489,26 +848,55 @@ class RunService:
                 256 - len(protected_run_ids),
                 protected_run_ids,
             )
+            if self.model_qualification is None:
+                raise RuntimeError("model qualification is unavailable")
             await self._publish(
                 record,
                 "run.started",
                 "durable",
                 {
                     "prototype": True,
-                    "model": OLLAMA_MODEL,
-                    "visible_tools": ["builtin/echo"],
+                    "model": self.model_qualification.model,
+                    "visible_tools": [
+                        spec.tool_id for spec in record.effective_tools
+                    ],
                     "sandbox": SANDBOX_POLICY,
+                    "context_plan": context_plan.public_metadata(),
                 },
             )
-        except Exception:
+        except BaseException as exc:
             async with self._lock:
-                self.runs.pop(record.run_id, None)
-            raise
-        record.task = asyncio.create_task(
-            self._run_worker(record, command.message),
-            name=f"harness-v2-run-{record.run_id}",
-        )
-        return record
+                if self.runs.get(record.run_id) is record:
+                    self.runs.pop(record.run_id, None)
+            try:
+                if self.conversations is not None:
+                    await asyncio.to_thread(
+                        self.conversations.finalize_noncompleted,
+                        record.run_id,
+                        "interrupted",
+                    )
+            except Exception:
+                pass
+            if created_conversation:
+                try:
+                    if self.conversations is not None:
+                        await asyncio.to_thread(
+                            self.conversations.delete_conversation,
+                            record.conversation_id,
+                        )
+                except Exception:
+                    pass
+            if not ready.done():
+                ready.set_exception(exc)
+            return
+
+        if not ready.done():
+            ready.set_result(None)
+        if request_cancelled.is_set() or self._closing:
+            if not record.cancel_requested:
+                record.cancel_requested_at = asyncio.get_running_loop().time()
+            record.cancel_requested = True
+        await self._run_worker(record, message)
 
     def get(self, run_id: str) -> RunRecord:
         try:
@@ -548,6 +936,8 @@ class RunService:
                 yield None
                 continue
             for event in events:
+                if record.retired:
+                    return
                 cursor = event.seq
                 yield event
             if events[-1].kind in TERMINAL_KINDS:
@@ -564,6 +954,28 @@ class RunService:
     @staticmethod
     def _worker_id(value: object) -> bool:
         return isinstance(value, str) and WORKER_ID.fullmatch(value) is not None
+
+    @staticmethod
+    def _effective_tool(record: RunRecord, tool_id: object) -> ToolSpec | None:
+        if not isinstance(tool_id, str):
+            return None
+        return next(
+            (spec for spec in record.effective_tools if spec.tool_id == tool_id),
+            None,
+        )
+
+    @staticmethod
+    def _model_failure_payload(record: RunRecord) -> dict[str, Any] | None:
+        if record.model_failure is None:
+            return None
+        code, retryable = record.model_failure
+        if WORKER_ID.fullmatch(code) is None or not isinstance(retryable, bool):
+            raise RuntimeError("trusted model failure metadata is invalid")
+        return {
+            "code": code,
+            "message": "The trusted model broker could not complete the request.",
+            "retryable": retryable,
+        }
 
     def _validate_worker_event(
         self,
@@ -616,17 +1028,23 @@ class RunService:
         elif kind == "tool.call.requested":
             call_id = payload.get("call_id")
             arguments = payload.get("arguments")
+            spec = self._effective_tool(record, payload.get("tool_id"))
+            broker_call = record.broker_pending_tool_calls.get(str(call_id))
+            try:
+                validated_arguments = (
+                    spec.validate_arguments(arguments) if spec is not None else None
+                )
+            except ValueError:
+                validated_arguments = None
             if (
                 keys != {"call_id", "tool_id", "arguments"}
                 or not self._worker_id(call_id)
                 or call_id in record.seen_tools
                 or record.pending_tools
-                or payload.get("tool_id") != "builtin/echo"
-                or not isinstance(arguments, dict)
-                or set(arguments) != {"text"}
-                or not self._bounded_worker_text(
-                    arguments.get("text"), MAX_MESSAGE_BYTES
-                )
+                or spec is None
+                or validated_arguments is None
+                or broker_call
+                != (spec.tool_id, validated_arguments)
             ):
                 raise ValueError("invalid tool call request")
         elif kind == "tool.call.started":
@@ -640,6 +1058,16 @@ class RunService:
                 raise ValueError("invalid tool call start")
         elif kind == "tool.call.finished":
             call_id = payload.get("call_id")
+            pending_tool_id = record.pending_tools.get(str(call_id))
+            spec = self._effective_tool(record, pending_tool_id)
+            try:
+                validated_result = (
+                    spec.validate_result(payload.get("result"))
+                    if spec is not None
+                    else None
+                )
+            except ValueError:
+                validated_result = None
             allowed_keys = {"call_id", "outcome", "result"}
             if "tool_id" in payload:
                 allowed_keys.add("tool_id")
@@ -647,10 +1075,28 @@ class RunService:
                 keys != allowed_keys
                 or call_id not in record.started_tools
                 or payload.get("outcome") not in {"succeeded", "failed", "cancelled"}
-                or not self._bounded_worker_text(payload.get("result"))
+                or validated_result is None
                 or (
                     "tool_id" in payload
                     and payload.get("tool_id") != record.pending_tools.get(call_id)
+                )
+                or (
+                    spec is not None
+                    and spec.tool_id == "builtin/echo"
+                    and not (
+                        (
+                            payload.get("outcome") == "succeeded"
+                            and validated_result
+                            == record.pending_tool_arguments.get(
+                                str(call_id), {}
+                            ).get("text")
+                        )
+                        or (
+                            payload.get("outcome") == "cancelled"
+                            and record.cancel_requested
+                            and validated_result == "cancelled"
+                        )
+                    )
                 )
             ):
                 raise ValueError("invalid tool call finish")
@@ -659,9 +1105,13 @@ class RunService:
                 keys != {"reason", "model_iterations"}
                 or payload.get("reason") != "end_turn"
                 or not isinstance(payload.get("model_iterations"), int)
-                or not 1 <= payload["model_iterations"] <= 3
+                or isinstance(payload.get("model_iterations"), bool)
+                or payload["model_iterations"] != record.model_request_count
+                or record.broker_stop_iteration != record.model_request_count
+                or not 1 <= record.model_request_count <= 3
                 or record.open_blocks
                 or record.pending_tools
+                or record.broker_pending_tool_calls
             ):
                 raise ValueError("invalid completed terminal")
         elif kind == "run.failed":
@@ -678,6 +1128,7 @@ class RunService:
             if (
                 keys != {"reason"}
                 or payload.get("reason") != "cancelled"
+                or not record.cancel_requested
                 or record.open_blocks
                 or record.pending_tools
             ):
@@ -698,6 +1149,7 @@ class RunService:
         elif kind == "tool.call.requested":
             call_id = str(payload["call_id"])
             record.pending_tools[call_id] = str(payload["tool_id"])
+            record.pending_tool_arguments[call_id] = dict(payload["arguments"])
             record.seen_tools.add(call_id)
         elif kind == "tool.call.started":
             record.started_tools.add(str(payload["call_id"]))
@@ -715,6 +1167,8 @@ class RunService:
                 )
             )
             record.pending_tools.pop(call_id, None)
+            record.pending_tool_arguments.pop(call_id, None)
+            record.broker_pending_tool_calls.pop(call_id, None)
             record.started_tools.discard(call_id)
 
     async def _close_incomplete_worker_events(
@@ -731,20 +1185,35 @@ class RunService:
             )
             record.open_blocks.discard(block_id)
         for call_id, tool_id in sorted(record.pending_tools.items()):
+            if call_id not in record.started_tools:
+                started_payload = {"call_id": call_id, "tool_id": tool_id}
+                await self._publish(
+                    record,
+                    "tool.call.started",
+                    "durable",
+                    started_payload,
+                    recovery=True,
+                )
+                self._apply_worker_event(
+                    record, "tool.call.started", started_payload
+                )
+            finished_payload = {
+                "call_id": call_id,
+                "tool_id": tool_id,
+                "outcome": "cancelled" if cancelled else "failed",
+                "result": "cancelled" if cancelled else "Worker stopped",
+            }
             await self._publish(
                 record,
                 "tool.call.finished",
                 "durable",
-                {
-                    "call_id": call_id,
-                    "tool_id": tool_id,
-                    "outcome": "cancelled" if cancelled else "failed",
-                    "result": "cancelled" if cancelled else "Worker stopped",
-                },
+                finished_payload,
                 recovery=True,
             )
-            record.pending_tools.pop(call_id, None)
-            record.started_tools.discard(call_id)
+            self._apply_worker_event(
+                record, "tool.call.finished", finished_payload
+            )
+        record.broker_pending_tool_calls.clear()
 
     async def _publish_memory_only(
         self,
@@ -754,6 +1223,19 @@ class RunService:
     ) -> EventEnvelope:
         """Converge a live stream honestly when durable storage is unavailable."""
 
+        async with self._lock:
+            return await self._publish_memory_only_locked(record, kind, payload)
+
+    async def _publish_memory_only_locked(
+        self,
+        record: RunRecord,
+        kind: str,
+        payload: dict[str, Any],
+    ) -> EventEnvelope:
+        """Publish while holding the Control-plane state fence."""
+
+        if record.retired:
+            raise ConversationNotFoundError("conversation was deleted")
         if record.terminal_kind is not None:
             raise RuntimeError("attempted event after terminal")
         if len(record.events) >= MAX_LIVE_EVENTS:
@@ -780,6 +1262,22 @@ class RunService:
             or record.live_event_bytes + encoded_size > MAX_LIVE_EVENT_BYTES
         ):
             raise RuntimeError("prototype emergency event capacity exhausted")
+        if (
+            kind in TERMINAL_KINDS
+            and record.conversation_managed
+            and self.conversations is not None
+        ):
+            status = "cancelled" if kind == "run.cancelled" else "failed"
+            try:
+                await asyncio.to_thread(
+                    self.conversations.finalize_noncompleted,
+                    record.run_id,
+                    status,
+                )
+            except Exception:
+                LOGGER.error(
+                    "Conversation turn could not be closed after durable-state failure"
+                )
         record.events.append(envelope)
         record.live_event_bytes += encoded_size
         if kind in TERMINAL_KINDS:
@@ -803,20 +1301,33 @@ class RunService:
             )
             record.open_blocks.discard(block_id)
         for call_id, tool_id in sorted(record.pending_tools.items()):
+            if call_id not in record.started_tools:
+                started_payload = {"call_id": call_id, "tool_id": tool_id}
+                await self._publish_memory_only(
+                    record,
+                    "tool.call.started",
+                    started_payload,
+                )
+                self._apply_worker_event(
+                    record, "tool.call.started", started_payload
+                )
+            finished_payload = {
+                "call_id": call_id,
+                "tool_id": tool_id,
+                "outcome": "cancelled" if cancelled else "failed",
+                "result": (
+                    "cancelled" if cancelled else "Persistence unavailable"
+                ),
+            }
             await self._publish_memory_only(
                 record,
                 "tool.call.finished",
-                {
-                    "call_id": call_id,
-                    "tool_id": tool_id,
-                    "outcome": "cancelled" if cancelled else "failed",
-                    "result": (
-                        "cancelled" if cancelled else "Persistence unavailable"
-                    ),
-                },
+                finished_payload,
             )
-            record.pending_tools.pop(call_id, None)
-            record.started_tools.discard(call_id)
+            self._apply_worker_event(
+                record, "tool.call.finished", finished_payload
+            )
+        record.broker_pending_tool_calls.clear()
         await self._publish_memory_only(
             record,
             "run.failed",
@@ -824,6 +1335,7 @@ class RunService:
                 "code": "journal_unavailable",
                 "message": "Durable state became unavailable; this Run was stopped.",
                 "retryable": False,
+                "usage": dict(record.model_usage),
             },
         )
 
@@ -836,8 +1348,41 @@ class RunService:
         *,
         recovery: bool = False,
     ) -> EventEnvelope:
+        # Managed terminal commits, RunRecord state, and Conversation deletion
+        # share this fence.  A successful DELETE can therefore retire every
+        # matching record without a post-delete terminal publication racing in.
+        async with self._lock:
+            return await self._publish_locked(
+                record,
+                kind,
+                durability,
+                payload,
+                recovery=recovery,
+            )
+
+    async def _publish_locked(
+        self,
+        record: RunRecord,
+        kind: str,
+        durability: str,
+        payload: dict[str, Any],
+        *,
+        recovery: bool = False,
+    ) -> EventEnvelope:
+        """Validate and publish one event under the Control-plane state fence."""
+
+        if record.retired:
+            raise ConversationNotFoundError("conversation was deleted")
         if record.terminal_kind is not None:
             raise RuntimeError("attempted event after terminal")
+        if kind in TERMINAL_KINDS:
+            payload = {**payload, "usage": dict(record.model_usage)}
+            # A failed/cancelled Worker may stop after receiving a broker-owned
+            # Tool call but before acknowledging it.  The call never became a
+            # canonical Tool event, so terminal publication must forget its
+            # arguments.  Successful terminals are separately rejected while
+            # any broker-owned call remains pending.
+            record.broker_pending_tool_calls.clear()
         reserved_slots = 0
         if kind not in TERMINAL_KINDS:
             reserved_slots = 1 if recovery else RECOVERY_EVENT_SLOTS
@@ -878,7 +1423,42 @@ class RunService:
         if self.journal is None:
             raise RuntimeError("journal is unavailable")
         try:
-            self.journal.append(envelope)
+            if record.conversation_managed and kind == "run.started":
+                if self.conversations is None or record.user_message is None:
+                    raise RuntimeError("conversation store is unavailable")
+                if record.conversation_revision is None:
+                    raise RuntimeError("conversation revision is unavailable")
+                await asyncio.to_thread(
+                    self.conversations.begin_turn,
+                    record.conversation_id,
+                    turn_id=record.turn_id,
+                    run_id=record.run_id,
+                    user_content=record.user_message,
+                    expected_revision=record.conversation_revision,
+                    started_event=envelope,
+                )
+            elif record.conversation_managed and kind in TERMINAL_KINDS:
+                if self.conversations is None:
+                    raise RuntimeError("conversation store is unavailable")
+                if kind == "run.completed":
+                    if record.final_assistant_content is None:
+                        raise RuntimeError("completed Run has no trusted assistant content")
+                    await asyncio.to_thread(
+                        self.conversations.finalize_completed,
+                        record.run_id,
+                        record.final_assistant_content,
+                        envelope,
+                    )
+                else:
+                    status = "cancelled" if kind == "run.cancelled" else "failed"
+                    await asyncio.to_thread(
+                        self.conversations.finalize_noncompleted,
+                        record.run_id,
+                        status,
+                        envelope,
+                    )
+            else:
+                self.journal.append(envelope)
         except Exception:
             record.journal_failed = True
             raise
@@ -910,7 +1490,13 @@ class RunService:
         if terminal == "run.cancelled":
             payload = {"reason": "cancelled"}
         else:
-            payload = {
+            model_payload = (
+                self._model_failure_payload(record)
+                if code
+                in {"worker_crash", "worker_exit", "worker_stopped_without_terminal"}
+                else None
+            )
+            payload = model_payload or {
                 "code": code,
                 "message": "The prototype Worker stopped unexpectedly.",
                 "retryable": False,
@@ -1001,30 +1587,43 @@ class RunService:
             "version",
             "request_id",
             "iteration",
-            "tool_results",
+            "context_plan",
+            "tool_result_call_ids",
         }
         request_id = value.get("request_id")
-        tool_results = value.get("tool_results")
-        trusted_results = [item.content for item in record.broker_tool_results]
+        result_call_ids = value.get("tool_result_call_ids")
+        trusted_result_call_ids = [
+            item.call_id for item in record.broker_tool_results
+        ]
+        context_plan = record.context_plan
         if (
             set(value) != expected_keys
             or value.get("internal") != "model.request"
             or value.get("version") != BROKER_PROTOCOL_VERSION
             or value.get("iteration") != expected_iteration
             or request_id != f"model-{expected_iteration}"
-            or not isinstance(tool_results, list)
-            or tool_results != trusted_results
+            or context_plan is None
+            or value.get("context_plan") != context_plan.reference.to_dict()
+            or not isinstance(result_call_ids, list)
+            or result_call_ids != trusted_result_call_ids
         ):
             raise ValueError("Worker model request is invalid")
         assert isinstance(request_id, str)
+        record.model_request_count = expected_iteration
+        record.broker_stop_iteration = None
+        record.model_failure = None
+        record.model_usage["complete"] = False
 
         saw_terminal_frame = False
+        trusted_content: list[str] = []
+        model_frames: AsyncIterator[Any] | None = None
         try:
-            async for frame in session.stream_turn(
+            model_frames = session.stream_turn(
                 user_message,
                 tuple(record.broker_tool_results),
                 lambda: record.cancel_requested,
-            ):
+            )
+            async for frame in model_frames:
                 if frame.kind == "content":
                     if set(frame.payload) != {"text"}:
                         raise OllamaBrokerError(
@@ -1036,29 +1635,64 @@ class RunService:
                         "content",
                         text=frame.payload["text"],
                     )
+                    trusted_content.append(str(frame.payload["text"]))
                 elif frame.kind == "tool.use":
                     if set(frame.payload) != {
                         "call_id",
                         "tool_id",
                         "arguments",
+                        "usage",
                     }:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Invalid normalized Tool frame."
                         )
+                    call_id = frame.payload.get("call_id")
+                    tool_id = frame.payload.get("tool_id")
+                    spec = self._effective_tool(record, tool_id)
+                    try:
+                        arguments = (
+                            spec.validate_arguments(frame.payload.get("arguments"))
+                            if spec is not None
+                            else None
+                        )
+                    except ValueError as exc:
+                        raise OllamaBrokerError(
+                            "model_protocol_error", "Invalid normalized Tool call."
+                        ) from exc
+                    if (
+                        not self._worker_id(call_id)
+                        or spec is None
+                        or arguments is None
+                        or call_id in record.seen_tools
+                        or call_id in record.broker_pending_tool_calls
+                        or record.pending_tools
+                    ):
+                        raise OllamaBrokerError(
+                            "model_protocol_error", "Invalid normalized Tool call."
+                        )
+                    self._apply_model_usage(record, frame.payload["usage"])
+                    assert isinstance(call_id, str)
+                    record.broker_pending_tool_calls[call_id] = (
+                        spec.tool_id,
+                        arguments,
+                    )
                     saw_terminal_frame = True
                     await self._write_model_response(
                         stream,
                         request_id,
                         "tool.use",
-                        call_id=frame.payload["call_id"],
-                        tool_id=frame.payload["tool_id"],
-                        arguments=frame.payload["arguments"],
+                        call_id=call_id,
+                        tool_id=spec.tool_id,
+                        arguments=arguments,
                     )
                 elif frame.kind == "stop":
                     if set(frame.payload) != {"reason", "usage"}:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Invalid normalized stop frame."
                         )
+                    self._apply_model_usage(record, frame.payload["usage"])
+                    record.broker_stop_iteration = expected_iteration
+                    record.final_assistant_content = "".join(trusted_content)
                     saw_terminal_frame = True
                     await self._write_model_response(
                         stream,
@@ -1075,12 +1709,68 @@ class RunService:
                     "model_protocol_error", "Model stream had no terminal frame."
                 )
         except (OllamaCancelledError, OllamaBrokerError) as exc:
+            record.model_failure = (exc.code, exc.retryable)
             await self._write_model_response(
                 stream,
                 request_id,
                 "error",
                 code=exc.code,
             )
+        finally:
+            if model_frames is not None:
+                await model_frames.aclose()
+
+    @staticmethod
+    def _apply_model_usage(record: RunRecord, value: object) -> None:
+        if not isinstance(value, dict) or set(value) != {
+            "prompt_eval_count",
+            "eval_count",
+        }:
+            raise OllamaBrokerError(
+                "model_protocol_error", "Invalid normalized model usage."
+            )
+        prompt_tokens = value.get("prompt_eval_count", 0)
+        output_tokens = value.get("eval_count", 0)
+        context_plan = record.context_plan
+        if any(
+            not isinstance(item, int)
+            or isinstance(item, bool)
+            or not 0 <= item <= 1_000_000_000
+            for item in (prompt_tokens, output_tokens)
+        ) or context_plan is None:
+            raise OllamaBrokerError(
+                "model_protocol_error", "Invalid normalized model usage."
+            )
+        if (
+            prompt_tokens > context_plan.policy.hard_input_tokens
+            or output_tokens > context_plan.model_profile.max_output_tokens
+            or prompt_tokens + output_tokens
+            > context_plan.model_profile.operational_context_tokens
+        ):
+            raise OllamaBrokerError(
+                "model_protocol_error", "Model usage exceeded its qualified profile."
+            )
+        current_input = record.model_usage["input_tokens"]
+        current_output = record.model_usage["output_tokens"]
+        if (
+            not isinstance(current_input, int)
+            or isinstance(current_input, bool)
+            or not isinstance(current_output, int)
+            or isinstance(current_output, bool)
+        ):
+            raise OllamaBrokerError(
+                "model_protocol_error", "Invalid accumulated model usage."
+            )
+        input_total = current_input + prompt_tokens
+        output_total = current_output + output_tokens
+        if input_total > 1_000_000_000 or output_total > 1_000_000_000:
+            raise OllamaBrokerError(
+                "model_protocol_error", "Model usage exceeded its bound."
+            )
+        record.model_usage["input_tokens"] = input_total
+        record.model_usage["output_tokens"] = output_total
+        record.model_usage["last_input_tokens"] = prompt_tokens
+        record.model_usage["complete"] = True
 
     async def _run_worker(self, record: RunRecord, message: str) -> None:
         assert self.capsule is not None
@@ -1174,12 +1864,19 @@ class RunService:
                     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
                         raise ValueError("Worker sandbox handshake is invalid") from exc
                     diagnostic_stage = "model_session"
-                    model_session = self.model_broker.new_run()
+                    if record.context_plan is None:
+                        raise RuntimeError("Run lost its trusted context plan")
+                    model_session = self.model_broker.new_run(record.context_plan)
                     diagnostic_stage = "command_write"
                     process.stdin.write(
-                        json.dumps({"message": message}, ensure_ascii=False).encode(
-                            "utf-8"
-                        )
+                        json.dumps(
+                            {
+                                "message": message,
+                                "context_plan": record.context_plan.reference.to_dict(),
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
                         + b"\n"
                     )
                     await process.stdin.drain()
@@ -1238,6 +1935,8 @@ class RunService:
                                 process, process_marker, signal.SIGKILL
                             )
                             break
+                        if kind == "run.failed":
+                            payload = self._model_failure_payload(record) or payload
                         if kind in TERMINAL_KINDS:
                             pending_terminal = (kind, durability, payload)
                             break
@@ -1350,7 +2049,13 @@ class RunService:
             pending_terminal = None
         if pending_terminal is not None and failure_code is None:
             try:
-                await self._publish(record, *pending_terminal)
+                terminal_kind, terminal_durability, terminal_payload = pending_terminal
+                await self._publish(
+                    record,
+                    terminal_kind,
+                    terminal_durability,
+                    terminal_payload,
+                )
                 return
             except Exception:
                 pending_terminal = None

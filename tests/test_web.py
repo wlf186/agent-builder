@@ -19,6 +19,13 @@ from agent_builder_v2.web import (
     LoginLimiter,
     create_app,
 )
+from agent_builder_v2.sessions import (
+    Conversation,
+    ConversationDeleteResult,
+    ConversationNotFoundError,
+    ConversationSummary,
+    ConversationTurn,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -42,13 +49,67 @@ class _Commands:
 
     async def start(self, command: Any) -> _RunRecord:
         self.started.append(command)
-        return _RunRecord()
+        return _RunRecord(
+            conversation_id=command.conversation_id or "2" * 32
+        )
 
 
 class _RunService:
     capsule = object()
     model_qualification = SimpleNamespace(model="qwen3.5:2b")
     sandbox_qualification = object()
+
+    def __init__(self) -> None:
+        self.conversations: dict[str, Conversation] = {}
+
+    async def create_conversation(self, title: str) -> Conversation:
+        conversation = Conversation(
+            conversation_id="4" * 32,
+            agent_id=PROTOTYPE_AGENT_ID,
+            title=title,
+            created_at="2026-07-18T00:00:00.000Z",
+            updated_at="2026-07-18T00:00:00.000Z",
+            revision=0,
+            active_run_id=None,
+            turns=(),
+        )
+        self.conversations[conversation.conversation_id] = conversation
+        return conversation
+
+    async def list_conversations(self) -> tuple[ConversationSummary, ...]:
+        return tuple(
+            ConversationSummary(
+                conversation_id=value.conversation_id,
+                agent_id=value.agent_id,
+                title=value.title,
+                created_at=value.created_at,
+                updated_at=value.updated_at,
+                revision=value.revision,
+                active_run_id=value.active_run_id,
+                turn_count=len(value.turns),
+                completed_turn_count=sum(
+                    turn.status == "completed" for turn in value.turns
+                ),
+                last_run_id=value.turns[-1].run_id if value.turns else None,
+            )
+            for value in self.conversations.values()
+        )
+
+    async def get_conversation(self, conversation_id: str) -> Conversation:
+        try:
+            return self.conversations[conversation_id]
+        except KeyError as exc:
+            raise ConversationNotFoundError("conversation not found") from exc
+
+    async def delete_conversation(
+        self, conversation_id: str
+    ) -> ConversationDeleteResult:
+        value = self.conversations.pop(conversation_id, None)
+        return ConversationDeleteResult(
+            deleted=value is not None,
+            deleted_turns=len(value.turns) if value is not None else 0,
+            deleted_events=0,
+        )
 
 
 @pytest.fixture
@@ -216,6 +277,127 @@ def test_login_csrf_run_and_logout_session_flow(
     assert logout.status_code == 204
     assert client.get("/api/session").status_code == 401
     assert client.get("/api/auth/status").json() == {"authenticated": False}
+
+
+def test_authenticated_conversation_create_restore_multiturn_and_delete_api(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, commands = web_client
+    assert client.get("/api/sessions").status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf_token = login.json()["csrf_token"]
+    mutation_headers = {**SAME_ORIGIN, "x-csrf-token": csrf_token}
+
+    created = client.post(
+        "/api/sessions",
+        json={"title": "持续会话"},
+        headers=mutation_headers,
+    )
+    assert created.status_code == 201
+    conversation_id = created.json()["session_id"]
+    assert created.json()["state"] == "idle"
+
+    listed = client.get("/api/sessions")
+    assert listed.status_code == 200
+    assert [item["session_id"] for item in listed.json()["sessions"]] == [
+        conversation_id
+    ]
+
+    run = client.post(
+        f"/api/sessions/{conversation_id}/runs",
+        json={"message": "第一轮"},
+        headers=mutation_headers,
+    )
+    assert run.status_code == 202
+    assert run.json() == {
+        "run_id": RUN_ID,
+        "session_id": conversation_id,
+        "events_url": f"/api/runs/{RUN_ID}/events",
+    }
+    assert commands.started[-1].conversation_id == conversation_id
+
+    service = client.app.state.run_service
+    service.conversations[conversation_id] = Conversation(
+        conversation_id=conversation_id,
+        agent_id=PROTOTYPE_AGENT_ID,
+        title="持续会话",
+        created_at="2026-07-18T00:00:00.000Z",
+        updated_at="2026-07-18T00:00:00.500Z",
+        revision=1,
+        active_run_id=RUN_ID,
+        turns=(
+            ConversationTurn(
+                turn_id="5" * 32,
+                conversation_id=conversation_id,
+                run_id=RUN_ID,
+                position=1,
+                status="running",
+                user_content="第一轮",
+                assistant_content=None,
+                created_at="2026-07-18T00:00:00.100Z",
+                updated_at="2026-07-18T00:00:00.100Z",
+            ),
+        ),
+    )
+    running = client.get(f"/api/sessions/{conversation_id}")
+    assert running.status_code == 200
+    assert running.json()["session"]["state"] == "running"
+    assert running.json()["messages"] == [
+        {
+            "message_id": running.json()["messages"][0]["message_id"],
+            "role": "user",
+            "content": "第一轮",
+            "created_at": "2026-07-18T00:00:00.100Z",
+            "turn_id": "5" * 32,
+            "run_id": RUN_ID,
+            "turn_status": "running",
+        }
+    ]
+
+    service.conversations[conversation_id] = Conversation(
+        conversation_id=conversation_id,
+        agent_id=PROTOTYPE_AGENT_ID,
+        title="持续会话",
+        created_at="2026-07-18T00:00:00.000Z",
+        updated_at="2026-07-18T00:00:01.000Z",
+        revision=2,
+        active_run_id=None,
+        turns=(
+            ConversationTurn(
+                turn_id="5" * 32,
+                conversation_id=conversation_id,
+                run_id=RUN_ID,
+                position=1,
+                status="completed",
+                user_content="第一轮",
+                assistant_content="第一轮回答",
+                created_at="2026-07-18T00:00:00.100Z",
+                updated_at="2026-07-18T00:00:01.000Z",
+            ),
+        ),
+    )
+    restored = client.get(f"/api/sessions/{conversation_id}")
+    assert restored.status_code == 200
+    assert [message["role"] for message in restored.json()["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert restored.json()["messages"][1]["content"] == "第一轮回答"
+    assert {
+        message["turn_status"] for message in restored.json()["messages"]
+    } == {"completed"}
+
+    missing_csrf = client.delete(
+        f"/api/sessions/{conversation_id}", headers=SAME_ORIGIN
+    )
+    assert missing_csrf.status_code == 403
+    deleted = client.delete(
+        f"/api/sessions/{conversation_id}", headers=mutation_headers
+    )
+    assert deleted.status_code == 204
+    assert client.get(f"/api/sessions/{conversation_id}").status_code == 404
 
 
 def test_failed_login_rate_limit_is_bounded_per_client(

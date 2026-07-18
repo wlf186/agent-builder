@@ -1,210 +1,171 @@
 # Agent Builder repository guide
 
-Agent Builder is a local-first platform for composing and running AI agents. It
-includes a FastAPI backend, a Next.js frontend, MCP and skill execution, RAG,
-conversation persistence, and vendor-neutral local tracing.
+Agent Builder 是一个从零构建的、Claude Code 风格的本地智能体运行时。当前仓库只
+包含绿地原型和 Claude Code 研究资料；旧系统已经隔离到 `_legacy-reference/`，不再
+属于构建、启动、测试或设计边界。`AGENTS.md` 必须始终是指向本文件的符号链接。
 
-This file is the concise source of truth for coding agents. `AGENTS.md` is a
-symbolic link to this file so all supported agent tools receive identical rules.
+## 当前事实
 
-## Quick commands
+- Web Gateway 固定监听 `0.0.0.0:20815`，`GET /health` 是唯一无需登录的运行状态
+  入口。监听器目前没有 TLS，只能部署在受信、防火墙保护的网络。
+- 当前只有固定 demo Agent：`00000000-0000-4000-8000-000000000001`。
+- 真实模型固定为 `iollama:11434` 上的 `qwen3.5:2b`；端点、模型和参数不能由
+  浏览器或 Worker 覆盖。
+- 每个 Run 启动一个独立 Worker 进程。Worker 使用 Agent 专属虚拟环境，并强制
+  进入 Landlock、seccomp、rlimit、`no_new_privs` 和父进程死亡联动边界。
+- Worker 无网络、不能创建子进程、不能直接写文件。目前唯一工具是有界、只读的
+  `builtin/echo`；不得把原型描述为支持任意 Shell、Skill、MCP 或文件编辑。
+- LangGraph、LangChain 和旧系统均不在新运行时依赖图中。
 
-```bash
-./bootstrap.sh                         # install pinned, project-local toolchains
-./start.sh                             # bootstrap if needed, then start all services
-./stop.sh                              # stop every process started by this checkout
-./purge.sh cache --yes                 # remove only reproducible caches
-./purge.sh all --yes                   # remove all local runtime state (destructive)
-```
+权威架构见 [docs/design/architecture.md](docs/design/architecture.md)，安全边界见
+[SECURITY.md](SECURITY.md)，当前缺口见
+[docs/plans/runtime-rebuild.md](docs/plans/runtime-rebuild.md)。
 
-Lifecycle options:
-
-- `bootstrap.sh`: `--skip-node`, `--no-build`, `--rebuild`, `--offline`
-- `start.sh`: `--skip-bootstrap`, `--no-observability`, `--no-docs`
-- `stop.sh`: `--force`, `--service <backend|frontend|docs|phoenix>`
-- `purge.sh`: `--yes`; scopes are `cache`, `logs`, `observability`,
-  `environments`, `data`, `build`, `dependencies`, or `all`
-
-Default listeners are loopback-only:
-
-| Component | Address |
-| --- | --- |
-| Frontend | `http://127.0.0.1:20815` |
-| Backend API | `http://127.0.0.1:20881` |
-| Built-in MCP SSE | `http://127.0.0.1:20882` |
-| User guide | `http://127.0.0.1:4173` |
-| Local traces | `http://127.0.0.1:6006` |
-
-## Non-negotiable engineering rules
-
-1. Preserve streaming semantics. Thinking, tool calls, content chunks,
-   cancellation, and terminal events must remain incremental and ordered.
-2. Do not install project dependencies globally. Source `env.sh` and use the
-   checkout-local uv, Python, Node, npm caches, and virtual environments.
-3. Do not write runtime state outside this checkout. Persistent application
-   data belongs in `data/`; disposable state and managed Python belong in
-   `.runtime/`; uv and Node belong in `.tools/`; the root Python environment is
-   `.venv/`.
-4. Never commit credentials or put them in URLs, client-visible variables,
-   command arguments, logs, traces, or error responses.
-5. The backend remains loopback-bound and authenticated by default. New API
-   routes are protected unless they are explicitly documented health checks.
-6. Treat filenames, archive entries, agent names, MCP URLs, and model endpoints
-   as untrusted input. Preserve containment, upload limits, SSRF checks, and
-   subprocess resource limits.
-7. Do not add per-token disk writes or unbounded in-memory logs. Batch streaming
-   updates and telemetry; enforce rotation, retention, sampling, and size caps.
-8. Uploaded Skill execution is fail-closed. Preserve Linux Landlock filesystem
-   confinement, resource limits, and default seccomp network denial; never add
-   an unconfined fallback when the kernel cannot provide the sandbox.
-9. Treat local-process MCP as code execution. It remains disabled unless the
-   operator explicitly sets `AGENT_BUILDER_ALLOW_STDIO_MCP=1`; never enable it
-   from request data or pass the control-plane API token to a child process.
-
-## Local environment and isolation
-
-Run development commands after loading the same containment environment used by
-the lifecycle scripts:
+## 快速命令
 
 ```bash
-source ./env.sh
-./.tools/uv sync --frozen
-./.venv/bin/python -m pytest
-npm --prefix frontend run lint
-npm --prefix frontend run build
-npm run governance:check
+./bootstrap.sh                 # 安装固定版本、仅位于 checkout 内的 Python 工具链
+./bootstrap.sh --offline       # 只使用 checkout 内已有缓存
+./start.sh                     # 资格检查后启动整套当前系统
+./stop.sh                      # 停止受管 Gateway 和所有已验证 Worker
+./stop.sh --force              # 缩短优雅退出期限，仍执行进程身份校验
+./purge.sh --help              # 查看清理范围
+./governance.sh                # 文档、路径、依赖和仓库边界治理
 ```
 
-`env.sh` redirects `HOME`, `TMPDIR`/`TEMP`/`TMP`, every XDG directory,
-uv/pip/npm/model/compiler caches, Playwright browsers, and Python bytecode into
-`.runtime/`. It clears inherited Conda/venv and package-install destinations and
-must not modify a user's shell profile. Per-skill Python environments live
-under `.runtime/environments` and are created by uv.
+`purge.sh` 的范围是 `cache|logs|environments|data|dependencies|runtime|all`，执行
+删除必须显式传入 `--yes`。`data` 和 `all` 会删除不可重建的 Agent 状态；操作前必须
+确认目标和恢复方式。
 
-The supported deployment baseline is glibc 2.28+ GNU/Linux on `x86_64` or
-`aarch64`; [README.md](README.md) is authoritative for host packages, network
-access, capacity, platform qualification, first-use model setup, and operator
-troubleshooting. Do not claim another platform is supported without an
-equivalent cold-checkout lifecycle validation.
-
-Do not bypass these paths with system `pip`, global npm installs, Conda,
-containers, `/tmp`-based application state, or user-home caches.
-Per-agent package changes use uv with `--only-binary :all:` and the package
-allowlist; do not enable source distributions or PEP 517 build hooks.
-
-## Architecture boundaries
-
-- `backend.py`: HTTP/SSE boundary, request validation, authentication, and
-  orchestration only. Move reusable behavior into `src/`.
-- `src/agent_engine.py`: agent planning and streaming execution.
-- `src/observability/`: backend-neutral tracing API and OpenTelemetry exporter.
-- `src/execution_engine.py`: bounded subprocess execution and cancellation.
-- `src/*_manager.py`: project-local persistence and registries.
-- `frontend/src/app/api/`: server-only authenticated proxy to the backend. The
-  API token must never use a `NEXT_PUBLIC_` variable.
-- `frontend/src/components/`: UI and bilingual `@userGuide` source annotations.
-- `docs-site/`: generated component pages plus hand-written user documentation.
-
-Conversation messages use SQLite/WAL to avoid rewriting full histories.
-Knowledge-base clients and collections are reused. When adding persistence,
-prefer atomic replacement or transactional append/update over repeated complete
-file rewrites.
-
-## Security and privacy
-
-- `AGENT_BUILDER_API_TOKEN` is generated into `.runtime/secrets/api-token` with
-  restrictive permissions. The frontend server injects it when proxying `/api`.
-- Every non-preflight backend `/api/**` request requires the token through a
-  Bearer or `X-API-Key` header. `/health` is the unauthenticated health check;
-  browser code must use the same-origin frontend proxy and must never read the
-  token.
-- CORS origins are explicit and never wildcarded. Outbound URLs reject embedded
-  credentials, metadata targets, and unsafe resolution. Every DNS hostname
-  requires a narrow `AGENT_BUILDER_SSRF_ALLOWLIST` entry; custom private targets
-  should use a port-scoped IP literal. Do not broadly allow private networks.
-- Upload handling is streaming and bounded by compressed size, expanded size,
-  entry count, and path containment.
-- Skill subprocesses require Linux Landlock, have bounded resources and output,
-  and cannot create network sockets unless the operator sets
-  `AGENT_BUILDER_SKILL_NETWORK=allow` before startup.
-- Trace and debug serializers redact credential-like fields and cap depth,
-  collection count, and string size.
-- Local observability uses OpenTelemetry/OpenInference and a project-local
-  Phoenix SQLite store. Use `./start.sh --no-observability` for a no-op tracer
-  and no dashboard; `OBSERVABILITY_ENABLED=false` applies when the backend is
-  launched outside the lifecycle script.
-- Report suspected vulnerabilities according to [SECURITY.md](SECURITY.md), not
-  in a public issue containing exploit or credential details.
-
-## Testing policy
-
-Use the smallest relevant test first, then the full checks before handoff:
+开发和验证命令必须先加载受控环境：
 
 ```bash
 source ./env.sh
 ./.venv/bin/python -m pytest
-npm --prefix frontend run lint
-npm --prefix frontend run build
-npm run governance:check
+./governance.sh
 ```
 
-Playwright Test is the reproducible CI/regression harness. Interactive browser
-automation may use Playwright CLI for exploration, but it does not replace a
-committed regression test for a fixed defect. Browser tests must write artifacts
-under `.runtime/test-results` and must not assume a headed display.
+不得使用系统 `pip`、全局虚拟环境、Conda、用户目录缓存或 `/tmp` 保存项目状态。
 
-Tests must cover negative security cases when changing file paths, uploads,
-archives, URLs, authentication, subprocesses, or proxy behavior. Lifecycle
-changes require start/health/stop and stale-PID validation.
+## P1-P8：项目核心原则
 
-## Documentation governance
+- **P1 — 高质量运行手册。** `CLAUDE.md` 是编码智能体的简明事实源，并由可执行
+  文档治理保证持续准确；不能把易变细节复制到多个文档。
+- **P2 — 单一指令入口。** `AGENTS.md` 必须存在且只能是相对符号链接
+  `AGENTS.md -> CLAUDE.md`，两者不得形成可漂移副本。
+- **P3 — 完整生命周期。** 根目录 `start.sh` 和 `stop.sh` 一键启动、停止当前整套
+  服务；失败启动必须回滚，停止必须处理每个已验证 Worker，不能按端口误杀进程。
+- **P4 — 部署不出 checkout。** 源码、解释器、依赖、数据、日志、PID 和密钥全部
+  位于当前工作目录，不创建或依赖其它目录中的项目安装。
+- **P5 — 运行不污染主机。** HOME、TMP、XDG、Python/uv 缓存和 Agent 虚拟环境均
+  重定向到 `.runtime/` 或 `.tools/`；持久数据只进入 `data/`。
+- **P6 — 安全、稳定和 SSD 友好。** 所有输入均不可信；限制内存、进程、网络、
+  文件系统、事件和日志。禁止逐 token 落盘、无界日志、频繁全树扫描和不受控 sync。
+- **P7 — 固定 Web 入口。** 用户界面监听 `0.0.0.0:20815`，并有认证、CSRF、
+  Origin/Host 校验、请求上限和安全响应头；无 TLS 时不得暴露到不受信网络。
+- **P8 — Agent 强隔离和可清除。** 每个 Agent 拥有独立数据目录、运行目录和虚拟
+  环境；每个 Run 有独立沙箱目录和 Worker。未来删除 Agent 时必须完整清除其
+  Capsule 且无进程、文件、环境或状态残留；当前通用删除流程尚未实现。
 
-Documentation ownership and workflow are defined in
-[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md). The ownership summary is:
+更完整的验收解释见 [docs/PRINCIPLES.md](docs/PRINCIPLES.md)。任何设计如果与
+P1-P8 冲突，必须先记录决策并更新原则，而不是静默绕过。
 
-| Surface | Accountable owner | Required review trigger |
-| --- | --- | --- |
-| `CLAUDE.md` and linked `AGENTS.md` | repository maintainers | commands, global invariants, definition of done |
-| `README.md` and lifecycle help | runtime owners | platforms, dependencies, network/capacity, paths, flags, ports, start/stop/purge behavior |
-| `SECURITY.md` | security maintainers | auth, trust boundaries, allowlists, sandboxing, secret handling |
-| `docs/design-docs/`, `docs/references/` | affected component owner | architecture, protocol, API, storage, or configuration changes |
-| `docs/product-specs/`, `docs-site/` | feature owner | acceptance criteria or user-visible workflow changes |
-| `docs/exec-plans/` | plan owner | work starts, changes direction, completes, or is abandoned |
+## 目录所有权
 
-When behavior, flags, ports, APIs, configuration, security controls, or user
-flows change, update the authoritative document in the same change. Avoid
-duplicating rules across files; link to the source of truth. CI validates
-metadata, generated pages, Markdown, local links, documented lifecycle commands,
-the `AGENTS.md` symlink, generated-page drift, documented default ports, review
-freshness, dependency policy and vulnerability audits, the VitePress build,
-credential patterns, and a cold-checkout full-stack lifecycle smoke test.
+```text
+src/agent_builder_v2/       当前唯一运行时源码
+tests/                      当前运行时测试
+scripts/                    生命周期内部辅助程序
+data/agents/<agent-id>/     Agent 持久状态、workspace、artifacts、SQLite journal
+.runtime/control-plane/     Gateway PID、锁和有界轮转日志
+.runtime/secrets/           登录密钥
+.runtime/agents/<agent-id>/ Agent 虚拟环境和临时 Run 根
+.tools/                     checkout-local uv 引导工具
+.venv/                     控制面 Python 环境
+.runtime/python|cache/      managed Python 与 uv/pip/bytecode 缓存
+docs/                       原则、设计、治理和活动计划
+references/claude-code/     只读研究资料及来源说明
+_legacy-reference/          完全隔离的旧系统快照；非当前项目内容
+```
 
-Maintainers review active plans when their work changes and audit maintained
-design, reference, security, and operator documents at least quarterly and
-before a release. The audit result updates the document or records that it was
-reviewed in [the governance ledger](docs/DOCUMENTATION.md); obsolete detail is
-deleted and remains available through Git history.
+`.runtime/`、`.tools/`、`data/` 的生成状态和 `references/claude-code/materials/`
+不得提交。旧归档仅在用户明确要求历史调查时读取；当前源码、测试、脚本、文档和
+运行时不得 import、执行、扫描、链接或复制其中内容。
 
-Run the same local gates before handoff:
+## 架构边界
+
+- `web.py`：HTTP/SSE、认证调用、输入限制和响应安全头；不承载 Agent 循环。
+- `commands.py`：用户命令的类型化入口；不得让请求数据直接配置进程或模型。
+- `control.py`：Run 生命周期、Worker supervisor、Model Broker 调度、事件校验和
+  canonical sequencing；这是受信控制面。
+- `worker.py`：每 Run 进程入口；先完成 FD 清理、资源限制和沙箱握手，再读取消息。
+- `kernel.py`：唯一 Agent 主循环，拥有 context → model → tool → model 状态机。
+- `context.py`：确定性、带来源的 prompt section 编译。目前仍是固定原型上下文。
+- `ollama.py` / `model.py`：受信 Ollama 代理和有界 Worker IPC。Worker 不得知道
+  模型地址或自行联网。
+- `tools.py`：项目拥有的结构化工具契约。目前只允许 `builtin/echo`。
+- `contracts.py` / `state.py`：规范事件 envelope 与 Agent-scoped SQLite journal。
+- `capsule.py`：Agent/Run 路径、环境和生命周期所有权；路径必须保持 checkout 内。
+- `sandbox.py`：Linux fail-closed Worker confinement；不得添加未隔离降级路径。
+
+Worker 只能发出无身份的 `WorkerEvent`。只有受信控制面可以校验状态转换、补齐
+Agent/Conversation/Turn/Run 身份、分配单调 `seq` 并写入 durable journal。保持
+thinking/content、Tool、取消和终态事件的增量、有序语义；协议变更必须同步更新
+[docs/design/event-protocol.md](docs/design/event-protocol.md)。
+
+## 安全和资源规则
+
+1. 文件名、路径、Agent/Run ID、Host/Origin、JSON、模型帧和 Worker 帧均视为不可信。
+2. 不得把登录 token 放入 URL、前端可读变量、命令参数、日志、trace 或错误响应。
+3. 除 `/health` 和静态页面资源外，业务 API 必须维持会话认证；状态修改要求 CSRF。
+4. Model Broker 只连接固定、经资格检查的 Ollama 地址；不得接受请求级 endpoint。
+5. Worker 只有已继承的有界标准流 capability；不得重新开放 socket、fork、exec、
+   mount、namespace、持久 IPC 或直接文件写权限。
+6. 新能力必须通过受信 broker、显式 schema、最小权限、超时、字节/条目/并发上限和
+   负面安全测试；不能用“开发模式”绕过沙箱。
+7. durable 事件只在语义边界写 SQLite/WAL；`assistant.block.delta` 保持 ephemeral。
+   日志必须批量刷新、轮转并有总大小上限。
+8. 清理进程前校验 PID、PGID、启动 marker、cwd、解释器、模块、checkout 和记录权限；
+   端口占用不是杀进程权限。
+
+## 测试策略
+
+先运行最小相关测试，再运行完整门禁：
 
 ```bash
 source ./env.sh
-npm run governance:check
+./.venv/bin/python -m pytest tests/test_web.py
+./.venv/bin/python -m pytest tests/test_worker_integration.py
+./.venv/bin/python -m pytest
+./governance.sh
 ```
 
-## Definition of done
+改动认证、路径、事件、Worker、沙箱、生命周期或持久化时，必须增加失败路径测试。
+生命周期改动还要验证 cold start、`/health`、真实 `qwen3.5:2b` Run、正常/强制停止、
+stale/伪造 PID 记录以及无残留。测试产物只能写入 `.runtime/`。
 
-A change is complete only when:
+## 文档治理
 
-- implementation and migration/rollback behavior are present;
-- relevant unit, integration, and negative tests pass;
-- frontend and documentation builds pass when affected;
-- no new unbounded memory/disk growth, secret exposure, or outside-workspace
-  write is introduced;
-- generated artifacts and runtime state remain ignored;
-- documentation matches the final behavior.
+[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) 定义文档所有权、metadata、触发式
+更新、季度审查和废弃流程。行为、命令、端口、路径、协议、安全边界、资源上限或
+用户流程改变时，必须在同一个变更中更新对应权威文档。活动工作同步维护
+[docs/plans/runtime-rebuild.md](docs/plans/runtime-rebuild.md)。
 
-See [CONTRIBUTING.md](CONTRIBUTING.md),
-[project structure](docs/references/project-structure.md),
-[API reference](docs/references/api-reference.md), and
-[streaming protocol](docs/design-docs/streaming-protocol.md) for details.
+Claude Code 材料只能用于设计研究，必须先读
+[references/claude-code/README.md](references/claude-code/README.md) 和
+[references/claude-code/PROVENANCE.md](references/claude-code/PROVENANCE.md)；参考实现
+不是本项目的安全证明，也不是可直接复制的依赖。
+
+## DoD（完成定义）
+
+一个变更只有同时满足以下条件才算完成：
+
+- 实现、失败行为、必要的迁移/清理或回滚均已完成，且不依赖旧系统；
+- 最小相关测试、完整 `pytest` 和 `./governance.sh` 通过；
+- 对外行为、协议、架构、安全和活动计划文档与代码一致；
+- `AGENTS.md -> CLAUDE.md` 保持有效，P1-P8 没有被绕过；
+- 没有 checkout 外写入、秘密泄露、无界内存/磁盘增长、逐 token 落盘或明显 SSD
+  磨损路径；
+- 新的执行能力经过 fail-closed confinement、资源上限、取消、超时和负面测试；
+- 服务可由根脚本完整启动、健康检查、停止，且没有遗留受管进程或 Run 临时目录；
+- 未实现能力仍被明确标记，不能把 walking skeleton 宣称为生产就绪。

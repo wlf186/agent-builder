@@ -1,318 +1,344 @@
 #!/usr/bin/env bash
-# Start the complete Agent Builder stack using only project-managed processes.
+# Start the Agent Builder gateway and its managed runtime.
 
 set -Eeuo pipefail
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
 # shellcheck source=env.sh
 source "$ROOT/env.sh"
 cd "$ROOT"
+umask 077
 
-SKIP_BOOTSTRAP=false
-ENABLE_OBSERVABILITY=true
-ENABLE_DOCS=true
-STARTED_SERVICES=()
-ROLLING_BACK=false
+RUNTIME_ROOT="$AGENT_BUILDER_RUNTIME_DIR/control-plane"
+PID_FILE="$RUNTIME_ROOT/gateway.pid"
+LOG_FILE="$RUNTIME_ROOT/gateway.log"
+LOCK_FILE="$RUNTIME_ROOT/lifecycle.lock"
+LOG_SUPERVISOR="$ROOT/scripts/log_supervisor.py"
+SOURCE_ROOT="$ROOT/src"
+PYTHON="$ROOT/.venv/bin/python"
 STARTING_PID=""
 STARTING_PGID=""
+STARTING_MARKER=""
+LAUNCH_ATTEMPTED=false
+
+export HARNESS_V2_HOST=0.0.0.0
+export HARNESS_V2_PORT=20815
+HEALTH_URL="http://127.0.0.1:${HARNESS_V2_PORT}/health"
+export PYTHONPATH="$SOURCE_ROOT"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
 
 usage() {
     cat <<'EOF'
-Usage: ./start.sh [--skip-bootstrap] [--no-observability] [--no-docs]
+Usage: ./start.sh
 
-The default starts Phoenix, backend, production frontend, and documentation.
-Any failed health check rolls back every service started by this invocation.
+Starts Agent Builder on 0.0.0.0:20815 using only checkout-local state.
 EOF
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --skip-bootstrap) SKIP_BOOTSTRAP=true ;;
-        --no-observability) ENABLE_OBSERVABILITY=false ;;
-        --no-docs) ENABLE_DOCS=false ;;
+if (($#)); then
+    case "$1" in
         --help|-h) usage; exit 0 ;;
-        --force)
-            echo "Unsafe port-based force start was removed; run ./stop.sh --force first." >&2
-            exit 2
-            ;;
-        *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+        *) printf '[agent-builder start] ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
-done
+fi
 
-log() { printf '[start] %s\n' "$*"; }
-fail() { printf '[start] ERROR: %s\n' "$*" >&2; return 1; }
-
-pid_file() { printf '%s/%s.pid' "$AGENT_BUILDER_RUNTIME_DIR/pids" "$1"; }
+log() { printf '[agent-builder start] %s\n' "$*"; }
+fail() { printf '[agent-builder start] ERROR: %s\n' "$*" >&2; return 1; }
 
 process_marker() {
-    local stat
+    local process_stat marker
     if [[ -r "/proc/$1/stat" ]]; then
-        stat="$(<"/proc/$1/stat")"
-        stat="${stat##*) }"
-        printf 'linux:%s\n' "$(awk '{print $20}' <<<"$stat")"
+        process_stat="$(<"/proc/$1/stat")"
+        process_stat="${process_stat##*) }"
+        marker="$(awk '{print $20}' <<<"$process_stat")"
+        [[ "$marker" =~ ^[0-9]+$ ]] || return 1
+        printf 'linux:%s\n' "$marker"
     else
-        printf 'ps:%s\n' "$(ps -o lstart= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+        marker="$(ps -o lstart= -p "$1" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$marker" ]] || return 1
+        printf 'ps:%s\n' "$marker"
     fi
 }
 
-managed_running() {
-    local name="$1" file pid pgid recorded_marker recorded_root current_marker current_pgid command_line attempt
-    file="$(pid_file "$name")"
-    [[ -r "$file" && ! -L "$file" ]] || return 1
-    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
-    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
-    recorded_marker="$(awk -F= '$1 == "marker" {print $2}' "$file")"
-    recorded_root="$(awk -F= '$1 == "root" {sub(/^root=/, ""); print}' "$file")"
-    [[ "$pid" =~ ^[0-9]+$ && "$pgid" =~ ^[0-9]+$ && -n "$recorded_marker" ]] || return 1
+process_command() {
+    if [[ -r "/proc/$1/cmdline" ]]; then
+        tr '\0' ' ' < "/proc/$1/cmdline"
+    else
+        ps -o command= -p "$1" 2>/dev/null || true
+    fi
+}
+
+record_value() {
+    local key="$1"
+    awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}' "$PID_FILE"
+}
+
+safe_pid_record() {
+    local links size
+    [[ -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
+    links="$(stat -c '%h' -- "$PID_FILE" 2>/dev/null || true)"
+    size="$(stat -c '%s' -- "$PID_FILE" 2>/dev/null || true)"
+    [[ "$links" == 1 && "$size" =~ ^[0-9]+$ && "$size" -le 4096 ]]
+}
+
+GATEWAY_PID=""
+GATEWAY_PGID=""
+GATEWAY_MARKER=""
+gateway_identity_valid() {
+    local current_marker current_pgid command_line current_cwd
+    [[ "$GATEWAY_PID" =~ ^[0-9]+$ && "$GATEWAY_PID" -gt 1 ]] || return 1
+    kill -0 "$GATEWAY_PID" 2>/dev/null || return 1
+    current_marker="$(process_marker "$GATEWAY_PID" 2>/dev/null || true)"
+    current_pgid="$(ps -o pgid= -p "$GATEWAY_PID" 2>/dev/null | tr -d '[:space:]')"
+    command_line="$(process_command "$GATEWAY_PID")"
+    current_cwd="$(readlink -f -- "/proc/$GATEWAY_PID/cwd" 2>/dev/null || true)"
+    [[ "$current_marker" == "$GATEWAY_MARKER" \
+        && "$current_pgid" == "$GATEWAY_PGID" \
+        && "$current_cwd" == "$ROOT" \
+        && "$command_line" == *"$LOG_SUPERVISOR"* \
+        && "$command_line" == *"agent_builder_v2.web"* ]]
+}
+
+load_managed_gateway() {
+    local schema role recorded_root attempt
+    safe_pid_record || return 1
+    schema="$(record_value schema)"
+    role="$(record_value role)"
+    GATEWAY_PID="$(record_value pid)"
+    GATEWAY_PGID="$(record_value pgid)"
+    GATEWAY_MARKER="$(record_value marker)"
+    recorded_root="$(record_value root)"
+    [[ "$schema" == 1 && "$role" == gateway ]] || return 1
+    [[ "$GATEWAY_PID" =~ ^[0-9]+$ && "$GATEWAY_PID" -gt 1 ]] || return 1
+    [[ "$GATEWAY_PGID" == "$GATEWAY_PID" && -n "$GATEWAY_MARKER" ]] || return 1
     [[ "$recorded_root" == "$ROOT" ]] || return 1
-    kill -0 "$pid" 2>/dev/null || return 1
+    kill -0 "$GATEWAY_PID" 2>/dev/null || return 1
+
     for ((attempt = 0; attempt < 3; attempt++)); do
-        current_marker="$(process_marker "$pid")"
-        current_pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
-        command_line="$(ps -o command= -p "$pid" 2>/dev/null)"
-        if [[ "$current_marker" == "$recorded_marker" && "$current_pgid" == "$pgid" \
-            && "$command_line" == *"$ROOT/scripts/run_with_rotating_log.py"* ]]; then
-            return 0
-        fi
+        gateway_identity_valid && return 0
         sleep 0.1
     done
     return 1
 }
 
 tcp_open() {
-    local host="$1" port="$2"
-    (exec 9<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1
+    (exec 9<>"/dev/tcp/$1/$2") >/dev/null 2>&1
 }
 
 health_ok() {
-    local url="$1"
-    curl --noproxy '*' --fail --silent --show-error --max-time 2 "$url" >/dev/null 2>&1
+    curl --noproxy '*' --fail --silent --show-error --max-time 2 "$HEALTH_URL" \
+        >/dev/null 2>&1
 }
 
-wait_for_health() {
-    local name="$1" url="$2" timeout="$3" waited=0
-    while (( waited < timeout )); do
-        if health_ok "$url"; then
-            return 0
-        fi
-        if ! managed_running "$name"; then
-            fail "$name exited before becoming healthy; see .runtime/logs/$name.log"
-            return 1
-        fi
-        sleep 1
-        ((waited += 1))
-    done
-    fail "$name did not become healthy within ${timeout}s; see .runtime/logs/$name.log"
+group_alive() {
+    [[ "$1" =~ ^[0-9]+$ ]] && kill -0 -- "-$1" 2>/dev/null
 }
 
-check_observability_storage() {
-    local total=0 file size threshold="$OBSERVABILITY_STORAGE_WARN_BYTES"
-    local maximum="$OBSERVABILITY_STORAGE_MAX_BYTES"
-    [[ "$threshold" =~ ^[0-9]+$ ]] || fail "OBSERVABILITY_STORAGE_WARN_BYTES must be an integer"
-    [[ "$maximum" =~ ^[0-9]+$ && "$maximum" -gt 0 ]] || fail "OBSERVABILITY_STORAGE_MAX_BYTES must be a positive integer"
-    if [[ -n "$(find "$PHOENIX_WORKING_DIR" -type l -print -quit 2>/dev/null)" ]]; then
-        fail "Phoenix storage contains a symlink; refusing an unsafe working directory"
-        return 1
-    fi
-    while IFS= read -r -d '' file; do
-        size="$(wc -c < "$file")"
-        total=$((total + size))
-    done < <(find "$PHOENIX_WORKING_DIR" -type f -print0 2>/dev/null)
-    if ((total >= threshold)); then
-        log "WARNING: Phoenix storage is ${total} bytes (threshold ${threshold}); run ./purge.sh observability when retention data is no longer needed"
-    fi
-    if ((total >= maximum)); then
-        fail "Phoenix storage is ${total} bytes, at or above the hard startup limit ${maximum}; run ./purge.sh observability --yes"
-    fi
+starting_identity_valid() {
+    local current_marker current_pgid command_line current_cwd
+    [[ "$STARTING_PID" =~ ^[0-9]+$ && "$STARTING_PID" -gt 1 ]] || return 1
+    [[ "$STARTING_PGID" == "$STARTING_PID" && -n "$STARTING_MARKER" ]] || return 1
+    kill -0 "$STARTING_PID" 2>/dev/null || return 1
+    current_marker="$(process_marker "$STARTING_PID" 2>/dev/null || true)"
+    current_pgid="$(ps -o pgid= -p "$STARTING_PID" 2>/dev/null | tr -d '[:space:]')"
+    command_line="$(process_command "$STARTING_PID")"
+    current_cwd="$(readlink -f -- "/proc/$STARTING_PID/cwd" 2>/dev/null || true)"
+    [[ "$current_marker" == "$STARTING_MARKER" \
+        && "$current_pgid" == "$STARTING_PGID" \
+        && "$current_cwd" == "$ROOT" \
+        && "$command_line" == *"$LOG_SUPERVISOR"* \
+        && "$command_line" == *"agent_builder_v2.web"* ]]
 }
 
-stop_started_service() {
-    local name="$1" file pid pgid i
-    file="$(pid_file "$name")"
-    if ! managed_running "$name"; then
-        rm -f -- "$file"
+starting_direct_child_valid() {
+    local current_marker
+    [[ "$STARTING_PID" =~ ^[0-9]+$ && "$STARTING_PID" -gt 1 \
+        && -n "$STARTING_MARKER" ]] || return 1
+    kill -0 "$STARTING_PID" 2>/dev/null || return 1
+    current_marker="$(process_marker "$STARTING_PID" 2>/dev/null || true)"
+    [[ "$current_marker" == "$STARTING_MARKER" ]]
+}
+
+starting_child_reapable() {
+    local current_marker process_state
+    kill -0 "$STARTING_PID" 2>/dev/null || return 0
+    [[ -n "$STARTING_MARKER" ]] || return 1
+    current_marker="$(process_marker "$STARTING_PID" 2>/dev/null || true)"
+    [[ "$current_marker" == "$STARTING_MARKER" ]] || return 1
+    process_state="$(ps -o stat= -p "$STARTING_PID" 2>/dev/null | tr -d '[:space:]')"
+    [[ "$process_state" == Z* ]]
+}
+
+adopt_starting_record() {
+    if load_managed_gateway && [[ "$GATEWAY_PID" == "$STARTING_PID" ]]; then
+        STARTING_PGID="$GATEWAY_PGID"
+        STARTING_MARKER="$GATEWAY_MARKER"
         return 0
     fi
-    pid="$(awk -F= '$1 == "pid" {print $2}' "$file")"
-    pgid="$(awk -F= '$1 == "pgid" {print $2}' "$file")"
-    kill -TERM -- "-$pgid" 2>/dev/null || true
-    for ((i = 0; i < 30; i++)); do
-        kill -0 -- "-$pgid" 2>/dev/null || break
-        sleep 0.2
-    done
-    if kill -0 -- "-$pgid" 2>/dev/null; then
-        kill -KILL -- "-$pgid" 2>/dev/null || true
-        for ((i = 0; i < 25; i++)); do
-            kill -0 -- "-$pgid" 2>/dev/null || break
-            sleep 0.2
-        done
+    return 1
+}
+
+remove_own_pid_record() {
+    local recorded_pid recorded_pgid recorded_marker recorded_root
+    safe_pid_record || return 0
+    recorded_pid="$(record_value pid)"
+    recorded_pgid="$(record_value pgid)"
+    recorded_marker="$(record_value marker)"
+    recorded_root="$(record_value root)"
+    if [[ "$recorded_pid" == "$STARTING_PID" \
+        && "$recorded_pgid" == "$STARTING_PGID" \
+        && "$recorded_marker" == "$STARTING_MARKER" \
+        && "$recorded_root" == "$ROOT" ]]; then
+        rm -f -- "$PID_FILE"
     fi
-    wait "$pid" 2>/dev/null || true
-    if kill -0 -- "-$pgid" 2>/dev/null; then
-        log "WARNING: rollback could not stop $name process group $pgid; retaining its PID record"
-        return 1
-    fi
-    rm -f -- "$file"
 }
 
 rollback() {
-    local status="$1" index attempt
-    [[ "$ROLLING_BACK" == false ]] || exit "$status"
-    ROLLING_BACK=true
+    local status="$1" tick
     trap - ERR INT TERM
     if [[ "$STARTING_PID" =~ ^[0-9]+$ ]]; then
-        if [[ ! "$STARTING_PGID" =~ ^[0-9]+$ ]]; then
-            STARTING_PGID="$(ps -o pgid= -p "$STARTING_PID" 2>/dev/null | tr -d '[:space:]')"
+        if ! starting_identity_valid; then
+            for ((tick = 0; tick < 20; tick++)); do
+                adopt_starting_record && break
+                starting_direct_child_valid || break
+                sleep 0.05
+            done
         fi
-        if [[ "$STARTING_PGID" =~ ^[0-9]+$ && "$STARTING_PGID" == "$STARTING_PID" ]]; then
+        if starting_identity_valid; then
             kill -TERM -- "-$STARTING_PGID" 2>/dev/null || true
-            for ((attempt = 0; attempt < 30; attempt++)); do
-                kill -0 -- "-$STARTING_PGID" 2>/dev/null || break
-                sleep 0.1
-            done
-            if kill -0 -- "-$STARTING_PGID" 2>/dev/null; then
-                kill -KILL -- "-$STARTING_PGID" 2>/dev/null || true
-            fi
-        else
-            kill -TERM "$STARTING_PID" 2>/dev/null || true
-            for ((attempt = 0; attempt < 30; attempt++)); do
-                kill -0 "$STARTING_PID" 2>/dev/null || break
-                sleep 0.1
-            done
-            if kill -0 "$STARTING_PID" 2>/dev/null; then
-                kill -KILL "$STARTING_PID" 2>/dev/null || true
-            fi
+        elif starting_direct_child_valid; then
+            kill -TERM -- "$STARTING_PID" 2>/dev/null || true
+        elif group_alive "$STARTING_PGID"; then
+            printf '[agent-builder start] WARNING: startup process identity changed; refusing cached PGID signal\n' >&2
         fi
-        wait "$STARTING_PID" 2>/dev/null || true
-        STARTING_PID=""
-        STARTING_PGID=""
-    fi
-    if ((${#STARTED_SERVICES[@]} > 0)); then
-        log "startup failed; rolling back managed services"
-        for ((index=${#STARTED_SERVICES[@]} - 1; index >= 0; index--)); do
-            stop_started_service "${STARTED_SERVICES[$index]}" || true
+        for ((tick = 0; tick < 30; tick++)); do
+            starting_child_reapable && break
+            adopt_starting_record || true
+            sleep 0.1
         done
+        if starting_identity_valid; then
+            kill -KILL -- "-$STARTING_PGID" 2>/dev/null || true
+        elif starting_direct_child_valid; then
+            kill -KILL -- "$STARTING_PID" 2>/dev/null || true
+        fi
+        for ((tick = 0; tick < 20; tick++)); do
+            starting_child_reapable && break
+            sleep 0.05
+        done
+        if starting_child_reapable; then
+            wait "$STARTING_PID" 2>/dev/null || true
+        fi
+        if [[ -n "$STARTING_PGID" ]] && ! group_alive "$STARTING_PGID"; then
+            remove_own_pid_record
+        fi
+    fi
+    if [[ "$LAUNCH_ATTEMPTED" == true ]]; then
+        flock -u 8 2>/dev/null || true
+        exec 8>&-
+        "$ROOT/stop.sh" --force \
+            || printf '[agent-builder start] WARNING: residual Worker cleanup was incomplete\n' >&2
     fi
     exit "$status"
 }
 trap 'rollback $?' ERR
 trap 'rollback 130' INT TERM
 
-start_managed() {
-    local name="$1" host="$2" port="$3" health_url="$4" timeout="$5"
-    shift 5
-    local file pid pgid marker log_file temporary_file
-    file="$(pid_file "$name")"
-    log_file="$AGENT_BUILDER_RUNTIME_DIR/logs/$name.log"
-
-    if managed_running "$name"; then
-        health_ok "$health_url" || fail "$name is running but unhealthy"
-        log "$name is already running"
-        return 0
-    fi
-    rm -f -- "$file"
-    if tcp_open "$host" "$port"; then
-        fail "port $host:$port is occupied by a process not managed by this checkout"
-        return 1
-    fi
-
-    "$ROOT/.venv/bin/python" "$ROOT/scripts/run_with_rotating_log.py" \
-        --new-session --clean-env "$log_file" -- "$@" </dev/null >/dev/null 2>&1 &
-    pid=$!
-    STARTING_PID="$pid"
-    sleep 0.2
-    kill -0 "$pid" 2>/dev/null || fail "$name failed to launch; see $log_file"
-    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
-    STARTING_PGID="$pgid"
-    marker="$(process_marker "$pid")"
-    [[ "$pgid" == "$pid" && -n "$marker" ]] || {
-        kill -TERM "$pid" 2>/dev/null || true
-        fail "$name did not enter its own process group"
-    }
-    temporary_file="${file}.new.$$"
-    rm -f -- "$temporary_file"
-    {
-        printf 'pid=%s\n' "$pid"
-        printf 'pgid=%s\n' "$pgid"
-        printf 'marker=%s\n' "$marker"
-        printf 'root=%s\n' "$ROOT"
-    } > "$temporary_file"
-    chmod 0600 "$temporary_file"
-    mv -f -- "$temporary_file" "$file"
-    STARTED_SERVICES+=("$name")
-    STARTING_PID=""
-    STARTING_PGID=""
-    wait_for_health "$name" "$health_url" "$timeout"
-    log "$name is healthy (pid $pid)"
+wait_for_health() {
+    local tick
+    for ((tick = 0; tick < 150; tick++)); do
+        load_managed_gateway || fail "gateway exited before becoming healthy; see $LOG_FILE"
+        health_ok && return 0
+        sleep 0.2
+    done
+    fail "gateway did not become healthy within 30 seconds; see $LOG_FILE"
 }
 
-if [[ "$SKIP_BOOTSTRAP" == false ]]; then
-    "$ROOT/bootstrap.sh"
+[[ -f "$SOURCE_ROOT/agent_builder_v2/web.py" && ! -L "$SOURCE_ROOT/agent_builder_v2/web.py" ]] \
+    || fail "gateway module is missing: $SOURCE_ROOT/agent_builder_v2/web.py"
+[[ -f "$LOG_SUPERVISOR" && ! -L "$LOG_SUPERVISOR" ]] \
+    || fail "log supervisor is missing or unsafe: $LOG_SUPERVISOR"
+command -v ps >/dev/null 2>&1 || fail "ps is required for process validation"
+command -v flock >/dev/null 2>&1 || fail "flock is required for lifecycle serialization"
+command -v curl >/dev/null 2>&1 || fail "curl is required for the health check"
+[[ -x "$ROOT/bootstrap.sh" ]] || fail "bootstrap.sh is missing or not executable"
+
+agent_builder_reject_symlink_path "$RUNTIME_ROOT" || fail "control-plane runtime path is unsafe"
+agent_builder_ensure_directory "$RUNTIME_ROOT" || fail "cannot create control-plane runtime root"
+agent_builder_reject_symlink_path "$PID_FILE" || fail "gateway PID path is unsafe"
+agent_builder_reject_symlink_path "$LOG_FILE" || fail "gateway log path is unsafe"
+agent_builder_reject_symlink_path "$LOCK_FILE" || fail "lifecycle lock path is unsafe"
+if [[ -e "$LOCK_FILE" ]]; then
+    [[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" \
+        && "$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null || true)" == 1 ]] \
+        || fail "lifecycle lock is not a private regular file"
 fi
-# bootstrap may have generated the token after this script's first source.
+exec 8>>"$LOCK_FILE"
+chmod 0600 -- "$LOCK_FILE"
+[[ -f "$LOCK_FILE" && ! -L "$LOCK_FILE" \
+    && "$(stat -c '%h' -- "$LOCK_FILE" 2>/dev/null || true)" == 1 ]] \
+    || fail "lifecycle lock became unsafe while opening"
+flock -w 30 8 || fail "timed out waiting for another V2 lifecycle command"
+
+if load_managed_gateway; then
+    health_ok || fail "gateway is running but unhealthy; see $LOG_FILE"
+    log "gateway is already healthy (pid $GATEWAY_PID)"
+    trap - ERR INT TERM
+    exit 0
+fi
+
+log "checking the frozen checkout-local Python environment"
+"$ROOT/bootstrap.sh"
+# Bootstrap may have created the managed interpreter and environment paths.
 source "$ROOT/env.sh"
-[[ -x "$ROOT/.venv/bin/python" ]] || fail ".venv is missing; run ./bootstrap.sh"
-[[ -s "$AGENT_BUILDER_TOKEN_FILE" ]] || fail "local API token is missing; run ./bootstrap.sh"
-API_TOKEN="$(<"$AGENT_BUILDER_TOKEN_FILE")"
-[[ ${#API_TOKEN} -ge 32 ]] || fail "local API token is invalid; run ./purge.sh dependencies --yes and bootstrap again"
+export PYTHONPATH="$SOURCE_ROOT"
+[[ -x "$PYTHON" ]] || fail "checkout-local Python is missing after bootstrap"
 
-# Complete preflight before creating the first long-running process.
-command -v curl >/dev/null 2>&1 || fail "curl is required for health checks"
-for managed_path in \
-    "$ROOT/frontend/node_modules" "$ROOT/frontend/.next" \
-    "$ROOT/docs-site/node_modules" "$ROOT/docs-site/.vitepress/dist"; do
-    agent_builder_reject_symlink_path "$managed_path" \
-        || fail "managed dependency/build path contains a symlink"
-done
-unset managed_path
-[[ -x "$ROOT/frontend/node_modules/.bin/next" ]] || fail "frontend dependencies are missing"
-[[ -f "$ROOT/frontend/.next/BUILD_ID" ]] || fail "production frontend build is missing"
-if [[ "$ENABLE_DOCS" == true ]]; then
-    [[ -x "$ROOT/docs-site/node_modules/.bin/vitepress" ]] || fail "docs dependencies are missing"
-    [[ -f "$ROOT/docs-site/.vitepress/dist/index.html" ]] || fail "docs build is missing"
-fi
-if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
-    [[ -x "$ROOT/.venv/bin/phoenix" ]] || fail "Phoenix CLI is missing from .venv"
-    check_observability_storage
-fi
-
-if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
-    export OBSERVABILITY_ENABLED=true
-    export OBSERVABILITY_BACKEND=otlp
-    start_managed phoenix "$PHOENIX_HOST" "$PHOENIX_PORT" \
-        "http://${PHOENIX_HOST}:${PHOENIX_PORT}/healthz" 120 \
-        "$ROOT/.venv/bin/phoenix" serve
-else
-    export OBSERVABILITY_ENABLED=false
-    export OBSERVABILITY_BACKEND=noop
-    if managed_running phoenix; then
-        fail "Phoenix is already running; stop the existing stack before using --no-observability"
+if [[ -e "$PID_FILE" || -L "$PID_FILE" ]]; then
+    safe_pid_record || fail "refusing unsafe gateway PID record: $PID_FILE"
+    stale_pid="$(record_value pid)"
+    if [[ "$stale_pid" =~ ^[0-9]+$ ]] && kill -0 "$stale_pid" 2>/dev/null; then
+        fail "PID record names a live process that failed ownership validation; inspect $PID_FILE"
     fi
-    log "observability explicitly disabled"
+    log "removing stale gateway PID record"
+    rm -f -- "$PID_FILE"
 fi
 
-start_managed backend "$BACKEND_HOST" "$BACKEND_PORT" \
-    "http://${BACKEND_HOST}:${BACKEND_PORT}/health" 180 \
-    "$ROOT/start_backend.sh"
-
-start_managed frontend "$FRONTEND_HOST" "$FRONTEND_PORT" \
-    "http://${FRONTEND_HOST}:${FRONTEND_PORT}/" 120 \
-    "$ROOT/scripts/start_frontend.sh"
-
-if [[ "$ENABLE_DOCS" == true ]]; then
-    start_managed docs "$DOCS_HOST" "$DOCS_PORT" \
-        "http://${DOCS_HOST}:${DOCS_PORT}/docs/" 60 \
-        "$ROOT/docs-site/node_modules/.bin/vitepress" preview "$ROOT/docs-site" \
-        --host "$DOCS_HOST" --port "$DOCS_PORT"
+if tcp_open 127.0.0.1 "$HARNESS_V2_PORT"; then
+    fail "port 0.0.0.0:$HARNESS_V2_PORT conflicts with an unmanaged listener"
 fi
 
+"$PYTHON" "$LOG_SUPERVISOR" \
+    --new-session \
+    --clean-env \
+    --runtime-root "$RUNTIME_ROOT" \
+    --log-file "$LOG_FILE" \
+    --pid-file "$PID_FILE" \
+    --max-bytes 5242880 \
+    --backups 3 \
+    -- \
+    "$PYTHON" -m agent_builder_v2.web \
+    </dev/null >/dev/null 2>&1 8>&- &
+STARTING_PID=$!
+LAUNCH_ATTEMPTED=true
+STARTING_MARKER="$(process_marker "$STARTING_PID" 2>/dev/null || true)"
+record_ready=false
+for ((record_tick = 0; record_tick < 100; record_tick++)); do
+    kill -0 "$STARTING_PID" 2>/dev/null \
+        || fail "gateway failed to launch; see $LOG_FILE"
+    if adopt_starting_record; then
+        record_ready=true
+        break
+    fi
+    sleep 0.02
+done
+[[ "$record_ready" == true ]] \
+    || fail "gateway supervisor did not publish its identity; see $LOG_FILE"
+starting_identity_valid || fail "gateway identity changed during startup"
+wait_for_health
+
+log "gateway is healthy at http://0.0.0.0:$HARNESS_V2_PORT (pid $STARTING_PID)"
+STARTING_PID=""
+STARTING_PGID=""
 trap - ERR INT TERM
-printf '\nAgent Builder started successfully:\n'
-printf '  frontend:      http://%s:%s\n' "$FRONTEND_HOST" "$FRONTEND_PORT"
-printf '  backend:       http://%s:%s\n' "$BACKEND_HOST" "$BACKEND_PORT"
-if [[ "$ENABLE_DOCS" == true ]]; then
-    printf '  documentation: http://%s:%s/docs/\n' "$DOCS_HOST" "$DOCS_PORT"
-fi
-if [[ "$ENABLE_OBSERVABILITY" == true ]]; then
-    printf '  observability: http://%s:%s\n' "$PHOENIX_HOST" "$PHOENIX_PORT"
-fi
-printf '  logs:          %s/logs\n' "$AGENT_BUILDER_RUNTIME_DIR"

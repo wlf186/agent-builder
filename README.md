@@ -1,272 +1,163 @@
 # Agent Builder
 
-Agent Builder is a local-first web application for creating and running AI
-agents with model services, MCP tools, skills, streaming chat, conversation
-history, RAG knowledge bases, and local OpenTelemetry traces.
+Agent Builder 是一个从零构建的 Claude Code 风格智能体运行时。目前交付的是一条
+可实际体验的 greenfield walking skeleton：认证 Web UI、类型化命令、规范事件流、
+每 Run 独立强沙箱 Worker、受信模型代理和真实 Ollama 模型调用已经贯通。
 
-## Supported deployment
+它**不是生产就绪产品**。当前只有固定 demo Agent、固定模型和 `builtin/echo`；没有
+通用 Agent 管理、Shell、文件工具、Skill、MCP、RAG、子智能体或 TLS。原型适合在
+受信、防火墙保护的开发网络中验证架构，不应直接暴露到互联网。
 
-The secure, fully supported target is a writable GNU/Linux checkout on a local
-filesystem. The lifecycle scripts fail early outside this baseline.
+## 当前链路
 
-| Platform | Support |
-| --- | --- |
-| glibc 2.28+ Linux, x86_64 | supported and exercised by hosted CI |
-| glibc 2.28+ Linux, ARM64 | dependency artifacts are available; release validation on ARM hardware is still required |
-| recent WSL2 | conditional on glibc 2.28+, `/proc`, Landlock, and seccomp support |
-| Alpine or another musl distribution | unsupported |
-| native Windows or macOS | unsupported for the complete, sandboxed stack |
-
-Uploaded Skills additionally require Landlock ABI 1 or newer, a supported
-seccomp architecture, and a mounted Linux `/proc`. If those kernel controls are
-unavailable, Skill execution fails closed instead of running without a sandbox.
-
-The checkout must be on a filesystem that is writable, permits executable
-files, supports Unix permissions and symbolic links, and provides normal SQLite
-file locking. A `noexec` mount, FAT/NTFS share, or some network filesystems are
-not supported deployment locations.
-
-## Host prerequisites
-
-Install Git, CA certificates, Bash 4.2 or newer, `curl`, `tar`, a SHA-256
-utility, and standard Linux command-line tools (`awk`, `find`, `getconf`,
-`install`, `od`, `ps`, `tr`, and `wc`). For Ubuntu 22.04/24.04:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y \
-  bash ca-certificates coreutils curl findutils gawk git libc-bin procps tar
+```text
+Browser :20815
+    │ HTTP + SSE
+    ▼
+Authenticated Web Gateway / trusted Control Plane
+    ├── CommandBus → RunService → canonical sequencer → Agent SQLite journal
+    ├── trusted Ollama Broker ── TCP ──> iollama:11434 / qwen3.5:2b
+    └── bounded stdio IPC
+             ▼
+        one Worker per Run
+        Landlock + seccomp + rlimits
+             │
+             ▼
+        HarnessKernel
+        context → model → builtin/echo → model → terminal event
 ```
 
-For a RHEL-compatible distribution:
+Web 页面会增量显示回答、工具阶段和事件时间线。点击任一事件可查看未经界面截断的
+canonical event envelope；消息通过纯文本渲染，不会作为 HTML 执行。
+
+详细设计见 [architecture](docs/design/architecture.md)、
+[event protocol](docs/design/event-protocol.md) 和
+[Agent Capsule](docs/design/agent-capsule.md)。
+
+## 环境要求
+
+当前资格检查支持：
+
+- GNU/Linux，`x86_64` 或 `aarch64`；
+- 可用的 `/proc`、Landlock ABI 6+ 和 seccomp；
+- `bash`、`curl`、`flock`、`ps` 及基本 GNU 用户空间工具；
+- 可以解析并连接 `iollama:11434`；
+- Ollama 已安装具有 completion 与 Tool 能力的 `qwen3.5:2b`。
+
+其它平台没有经过等价的 cold-checkout 验证，不能视为受支持。Worker 沙箱资格或
+模型资格失败时启动会 fail closed，不会退回假模型或未隔离运行。
+
+## 一键启动与停止
 
 ```bash
-sudo dnf install -y \
-  bash ca-certificates coreutils curl findutils gawk git glibc-common procps-ng tar
-```
-
-No global Python, Node.js, npm, Conda, Docker, or Podman installation is
-required. After host packages are installed, bootstrap does not require root
-access and never modifies a shell profile.
-
-Check the two most important compatibility values with:
-
-```bash
-getconf GNU_LIBC_VERSION   # must report glibc 2.28 or newer
-uname -m                   # x86_64 or aarch64/arm64
-```
-
-## Network and capacity
-
-A cold bootstrap requires HTTPS access, directly or through the standard
-`HTTP_PROXY`/`HTTPS_PROXY` and CA environment variables, to:
-
-- `github.com` and GitHub release-asset hosts for uv and managed Python;
-- `nodejs.org` for the pinned Node.js archive;
-- `pypi.org` and `files.pythonhosted.org` for Python wheels;
-- `download.pytorch.org` and `download-r2.pytorch.org` for CPU-only PyTorch;
-- `registry.npmjs.org` for the three locked Node dependency trees.
-
-The first installation currently occupies roughly 3.3 GiB before user data;
-downloads and build caches temporarily require more. Reserve 8–10 GiB of free
-disk space. Use at least 4 GiB of RAM, with 8 GiB recommended when building the
-frontend or running resource-intensive Skills. The five default ports listed
-below must be free.
-
-`./bootstrap.sh --offline` is only for a checkout whose project-local caches and
-toolchains have already been populated; it cannot initialize a fresh clone.
-
-## Start the complete stack
-
-Clone the repository onto a supported host, then run the documented lifecycle:
-
-```bash
-git clone https://github.com/wlf186/agent-builder.git
-cd agent-builder
-./bootstrap.sh
 ./start.sh
 ```
 
-Bootstrap pins uv 0.11.7, Python 3.11.15, and Node.js 22.17.0 inside the
-checkout. Downloaded uv and Node archives are SHA-256 verified, Python
-dependencies come from `uv.lock`, and Node dependencies come from npm lockfiles.
-Source distributions are disabled for the root Python environment.
+冷 checkout 时，`start.sh` 会按需调用 checkout-local bootstrap。也可以提前执行：
 
-`start.sh` also runs bootstrap when needed, so subsequent starts need only that
-one command. Open `http://127.0.0.1:20815` after it reports success. It starts
-and health-checks Phoenix, FastAPI, Next.js, the built-in MCP service, and the
-user guide as one transaction; if any required service fails, it rolls back the
-processes it started.
+```bash
+./bootstrap.sh
+./bootstrap.sh --offline   # 仅使用已有的项目内缓存
+```
 
-Stop the complete stack with:
+Gateway 固定监听 `0.0.0.0:20815`。启动成功后访问：
+
+- Web UI：`http://<主机地址>:20815`
+- 健康检查：`http://127.0.0.1:20815/health`
+
+首次启动会生成权限为 `0600` 的登录 token：
+
+```text
+.runtime/secrets/web-bootstrap-token
+```
+
+把 token 内容输入登录页。不要把它放入 URL、shell 命令参数、日志、截图或提交。
+登录后使用 HttpOnly session cookie；修改状态的请求还需要 CSRF token。
+
+停止整个当前系统：
 
 ```bash
 ./stop.sh
+./stop.sh --force   # 缩短退出期限；仍校验进程身份
 ```
 
-The scripts are location-independent and only manage processes whose identity
-and checkout root match their PID metadata. Run `./start.sh --help`,
-`./stop.sh --help`, or `./purge.sh --help` for options.
+脚本只会停止由本 checkout 记录且重新验证过身份的 Gateway/Worker。它不会因为
+20815 被占用就杀死未知进程。启动失败会回滚已启动组件；停止会检查每个 Agent 的
+Run 记录并清除已确认没有进程占用的临时 Run 根。
 
-Basic health checks after startup are:
+## 项目内状态
+
+所有环境、缓存、密钥、进程记录、日志、临时文件和数据均在本 checkout：
+
+```text
+.tools/                         checkout-local uv 引导工具
+.venv/                         控制面 Python 环境
+.runtime/python|cache/          managed Python、uv/pip/bytecode 缓存
+.runtime/home|tmp/              被重定向的 HOME 与临时目录
+.runtime/config|share|state/    被重定向的 XDG 配置、数据与状态
+.runtime/xdg-runtime/           被重定向的 XDG runtime
+.runtime/control-plane/         Gateway PID、生命周期锁、有界轮转日志
+.runtime/secrets/               Web bootstrap token
+.runtime/agents/<agent-id>/     Agent worker-env、日志和临时 runs
+data/agents/<agent-id>/         manifest、workspace、artifacts、state.sqlite
+```
+
+`env.sh` 会清理继承的 Conda/virtualenv/package-install 变量，并把 HOME、TMP、XDG、
+uv、pip 和 Python bytecode 路径重定向到 checkout 内。不要使用系统 `pip`、全局 npm、
+用户 home 缓存或 `/tmp` 作为项目状态目录。
+
+查看可清理范围：
 
 ```bash
-curl --noproxy '*' --fail http://127.0.0.1:20815/
-curl --noproxy '*' --fail http://127.0.0.1:20881/health
-curl --noproxy '*' --fail http://127.0.0.1:20882/health
-curl --noproxy '*' --fail http://127.0.0.1:4173/docs/
-curl --noproxy '*' --fail http://127.0.0.1:6006/healthz
+./purge.sh --help
 ```
 
-## Local-only state
+可选范围为 `cache|logs|environments|data|dependencies|runtime|all`，实际删除必须带
+`--yes`。`data` 和 `all` 会删除不可重建的 Agent 持久状态。
 
-| Path | Contents | Reproducible? |
-| --- | --- | --- |
-| `.tools/` | downloaded uv and Node launchers/toolchains | yes |
-| `.venv/` | root Python environment | yes |
-| `.runtime/` | managed Python, PIDs, logs, caches, temporary files, Phoenix data, skill envs | mostly |
-| `frontend/node_modules/` | frontend dependencies | yes |
-| `docs-site/node_modules/` | documentation dependencies | yes |
-| `data/` | agents, registries, knowledge bases, conversations, uploads | no |
+## 数据与 SSD 边界
 
-No bootstrap step modifies a shell profile or installs a global package.
-Application processes receive project-local `HOME`, all temporary/XDG paths,
-package/model/compiler caches, npm configuration, and browser cache locations
-from `env.sh`. Inherited Conda/venv, pip/npm install destinations, `NODE_PATH`,
-and uv workspace selectors are cleared. Bootstrap also re-executes with an
-exact environment allowlist, so unrelated caller credentials are not exposed to
-uv, npm, or download subprocesses.
+- SQLite 使用 WAL，`journal_size_limit` 为 16 MiB，只持久化 durable 语义事件。
+- `assistant.block.delta` 只在内存和 SSE 中流动，不逐 token 写盘。
+- 每 Run 最多 512 个 live event、1 MiB live event bytes、256 KiB durable bytes。
+- 最多 4 个 active Run、内存保留 64 个近期 Run、journal 保留 256 个近期 Run。
+- 每个 Run 有 60 秒 wall deadline；Run 树最多 1,024 项、16 MiB 逻辑数据、32 MiB
+  实际分配数据，并以不高于每秒一次的频率检查。
+- Gateway 日志单段 5 MiB，保留 3 个备份，总上界 20 MiB；写入批量刷新。
 
-Dynamic packages for per-agent environments must be allowlisted and available
-as wheels. uv runs with `--only-binary :all:`; source distributions and their
-PEP 517 build hooks are refused.
+这些是当前代码的硬边界，不代表完成了长期生产 soak 或所有硬件磨损验证。
 
-Use the explicit purge interface instead of deleting ad hoc paths:
-
-```bash
-./purge.sh cache --yes
-./purge.sh logs --yes
-./purge.sh observability --yes
-./purge.sh all --yes       # includes user data; destructive
-```
-
-## Services and security
-
-The managed lifecycle restricts every listener to `127.0.0.1` or `localhost`:
-
-| Service | Port |
-| --- | --- |
-| Web application | 20815 |
-| Authenticated backend | 20881 |
-| Built-in MCP SSE | 20882 |
-| User guide | 4173 |
-| Phoenix trace dashboard | 6006 |
-
-Bootstrap generates a high-entropy API token at
-`.runtime/secrets/api-token`. It is used only by the frontend server and backend;
-it is never exposed as a browser-visible environment variable. To expose the
-application, keep managed services on loopback and place an authenticated,
-deployment-reviewed reverse proxy in front of them.
-
-Every non-preflight backend `/api/**` request is authenticated. Browser code
-uses the same-origin Next.js proxy, which injects the token server-side. Direct
-backend clients must use `Authorization: Bearer ...` or `X-API-Key`; `/health`
-is the documented unauthenticated health endpoint.
-
-Uploaded Skill processes run fail-closed on Linux: Landlock confines reads to
-explicit runtime paths and writes to the execution workspace, resource limits
-cap CPU, per-process and aggregate memory, files, process-group size,
-descriptors, and output, and a seccomp filter blocks network socket creation by
-default. Process-group accounting polls Linux's virtual `/proc` filesystem and
-does not write to disk. If Landlock is unavailable, Skill execution is refused.
-Network access is an explicit operator decision via
-`AGENT_BUILDER_SKILL_NETWORK=allow`.
-
-Local-process MCP (`stdio`) can execute a trusted command and is therefore
-disabled by default. Enable it only for reviewed commands with
-`AGENT_BUILDER_ALLOW_STDIO_MCP=1`. Remote model and MCP URLs reject credentials,
-cloud metadata targets, and unsafe resolution. Every DNS hostname must be
-listed in `AGENT_BUILDER_SSRF_ALLOWLIST`; startup supplies only the exact
-built-in model/MCP hostnames and local service ports. Add custom names
-explicitly—hostname wildcards are rejected—and express private destinations as
-narrowly scoped, port-specific IP literals rather than broad networks.
-
-Tracing is vendor-neutral OpenTelemetry/OpenInference over OTLP/HTTP. Phoenix is
-the default local viewer and keeps SQLite data under `.runtime/phoenix`. Disable
-both the viewer and trace export with:
-
-```bash
-./start.sh --no-observability
-```
-
-The supported lifecycle deliberately forces that endpoint to local Phoenix.
-An independently managed backend can set `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
-to another compatible collector because application code does not depend on
-the local viewer. Trace values are redacted and bounded, normal successful
-traces are sampled, critical traces use an independent bounded batch queue, and
-Phoenix enforces retention plus a managed storage ceiling.
-
-## First use
-
-Bootstrap installs the Agent Builder application, not an LLM or a cloud-model
-credential. Opening the web interface therefore confirms deployment but does
-not by itself make an Agent able to answer prompts.
-
-Before creating an Agent, open the model-service settings and configure either:
-
-- a supported cloud provider with its API key; or
-- an independently installed local Ollama service, normally at
-  `http://127.0.0.1:11434`.
-
-Cloud API keys entered in the password field are submitted through the
-authenticated same-origin proxy, stored only by the server, and never returned
-in plaintext. Ollama is not installed or started by Agent Builder. See the
-[model-service guide](docs-site/en/advanced/model-service-dialog.md) for the
-complete workflow.
-
-The managed outbound allowlist already contains the built-in provider endpoints
-and local Ollama port. A custom model or MCP hostname must be added narrowly to
-`AGENT_BUILDER_SSRF_ALLOWLIST` before startup, as described in
-[SECURITY.md](SECURITY.md).
-
-## Troubleshooting
-
-- **A port is occupied:** `start.sh` refuses to take over an unmanaged process.
-  Stop that process or set a different `*_PORT` value consistently before
-  running `start.sh`; managed service hosts remain loopback-only.
-- **A download fails:** confirm the domains under *Network and capacity* are
-  reachable. Export corporate proxy and CA variables before bootstrap; the
-  clean bootstrap environment passes through only the reviewed proxy/CA keys.
-- **Startup fails:** inspect bounded logs under `.runtime/logs/`. A failed
-  transactional start rolls back services it created.
-- **A Skill is unavailable:** verify the host kernel exposes Landlock,
-  seccomp, and `/proc`. The application deliberately has no unconfined fallback.
-- **Dependencies are damaged:** stop the stack, run
-  `./purge.sh dependencies --yes`, then run `./bootstrap.sh` again. User data is
-  not part of the `dependencies` purge scope.
-- **Disk use grows:** use `./purge.sh cache --yes` for reproducible caches,
-  `./purge.sh logs --yes` for rotated logs, or
-  `./purge.sh observability --yes` for Phoenix data.
-
-The supported scripts bind only to loopback. Remote access requires a separately
-reviewed authenticated reverse proxy; do not change managed hosts to `0.0.0.0`.
-
-## Development
+## 验证
 
 ```bash
 source ./env.sh
-./.tools/uv sync --frozen
 ./.venv/bin/python -m pytest
-npm --prefix frontend run lint
-npm --prefix frontend run build
-npm run governance:check
+./governance.sh
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow,
-[CLAUDE.md](CLAUDE.md) for repository invariants, and the
-[user guide](docs-site/en/getting-started.md) for product usage.
+真实端到端验收还应执行 `./start.sh`、检查 `/health`、通过 Web 发起一次 Run，确认
+模型为 `qwen3.5:2b`、事件到达唯一终态，再执行 `./stop.sh` 并检查无受管进程残留。
 
-## License
+## 仓库结构
 
-No license file is currently included. Treat the repository as all-rights
-reserved until the maintainers add an explicit license.
+```text
+src/agent_builder_v2/       当前唯一运行时
+tests/                      当前运行时的单元、集成和安全回归测试
+scripts/                    生命周期辅助程序
+docs/                       原则、治理、设计和活动计划
+references/claude-code/     Claude Code 研究资料及来源记录
+_legacy-reference/          旧系统只读快照，不属于当前运行时
+```
+
+旧系统归档仅供用户明确要求时做历史调查；当前代码、脚本、测试和文档不得依赖或扫描
+它。Claude Code 材料也是只读设计输入，不是运行时依赖，使用前请阅读
+[reference guide](references/claude-code/README.md) 和
+[provenance](references/claude-code/PROVENANCE.md)。
+
+## 文档入口
+
+- [项目原则](docs/PRINCIPLES.md)
+- [文档治理](docs/DOCUMENTATION.md)
+- [安全边界](SECURITY.md)
+- [运行时重建计划](docs/plans/runtime-rebuild.md)
+- [编码智能体指南](CLAUDE.md)

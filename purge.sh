@@ -1,131 +1,112 @@
 #!/usr/bin/env bash
-# Deliberately remove selected project-local runtime state.
+# Remove explicitly selected checkout-local state after a verified shutdown.
 
 set -Eeuo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+ROOT="$SCRIPT_DIR"
 # shellcheck source=env.sh
 source "$ROOT/env.sh"
 cd "$ROOT"
 
-SCOPE=""
-YES=false
-
 usage() {
     cat <<'EOF'
-Usage: ./purge.sh <scope> [--yes]
+Usage: ./purge.sh <scope> --yes
 
 Scopes:
-  cache           Download caches and temporary execution directories
-  logs            Rotated service logs
-  observability   Phoenix SQLite data only
-  environments    Per-agent uv environments and their metadata
-  data            Application/user data (destructive)
-  build           Frontend and documentation build outputs
-  dependencies    .venv, local uv/Python, and Node dependencies
-  all             Every generated file above, including local secrets
+  cache         Reproducible package and Python caches
+  logs          Rotated gateway logs
+  environments  Agent runtime roots, including reusable Worker environments
+  data          Persistent Agent data and event journals (destructive)
+  dependencies  .venv, .tools, managed Python and caches
+  runtime       All disposable runtime state, including the login token
+  all           Runtime, dependencies and persistent Agent data (destructive)
 
-The stack must be fully stopped. --yes is required in non-interactive use.
+The private _legacy-reference archive is never a purge target.
 EOF
 }
 
-while (($#)); do
-    case "$1" in
-        --yes|-y) YES=true; shift ;;
-        --help|-h) usage; exit 0 ;;
-        cache|logs|observability|environments|data|build|dependencies|all)
-            [[ -z "$SCOPE" ]] || { echo "Only one scope may be selected" >&2; exit 2; }
-            SCOPE="$1"; shift
-            ;;
-        *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
-    esac
-done
-[[ -n "$SCOPE" ]] || { usage >&2; exit 2; }
+[[ $# -eq 2 ]] || { usage >&2; exit 2; }
+PURGE_SCOPE="$1"
+[[ "$2" == --yes ]] || { printf '[purge] ERROR: --yes is required\n' >&2; exit 2; }
+case "$PURGE_SCOPE" in
+    cache|logs|environments|data|dependencies|runtime|all) ;;
+    *) printf '[purge] ERROR: unknown scope: %s\n' "$PURGE_SCOPE" >&2; usage >&2; exit 2 ;;
+esac
 
-if [[ "$YES" == false ]]; then
-    if [[ ! -t 0 ]]; then
-        echo "Refusing non-interactive purge without --yes" >&2
-        exit 2
+[[ "$ROOT" != / && -n "$ROOT" && -d "$ROOT/.git" ]] \
+    || { printf '[purge] ERROR: invalid checkout root\n' >&2; exit 1; }
+
+"$ROOT/stop.sh" --force
+
+safe_remove_tree() {
+    local target="$1"
+    case "$target" in
+        "$ROOT/.runtime"|"$ROOT/.runtime/cache"|"$ROOT/.runtime/python"|\
+        "$ROOT/.runtime/agents"|"$ROOT/.venv"|"$ROOT/.tools"|\
+        "$ROOT/data/agents") ;;
+        *) printf '[purge] ERROR: refused unapproved target: %s\n' "$target" >&2; return 1 ;;
+    esac
+    agent_builder_reject_symlink_path "$target" || return 1
+    if [[ -L "$target" ]]; then
+        printf '[purge] ERROR: refused symlink target: %s\n' "$target" >&2
+        return 1
     fi
-    printf "Permanently purge '%s' state from %s? Type '%s' to continue: " \
-        "$SCOPE" "$ROOT" "$SCOPE"
-    read -r confirmation
-    [[ "$confirmation" == "$SCOPE" ]] || { echo "Purge cancelled"; exit 1; }
-fi
+    if [[ -e "$target" ]]; then
+        rm -rf --one-file-system -- "$target"
+        printf '[purge] removed %s\n' "${target#"$ROOT"/}"
+    fi
+}
 
-if ! "$ROOT/stop.sh" --force; then
-    echo "Refusing to purge while managed or conflicting services remain" >&2
-    exit 1
-fi
-
-safe_remove() {
-    local requested="$1" parent resolved_parent
-    case "$requested" in
-        "$ROOT"/*) ;;
-        *) echo "Refusing to remove path outside project: $requested" >&2; exit 1 ;;
+safe_remove_log() {
+    local target="$1"
+    case "$target" in
+        "$ROOT/.runtime/control-plane/gateway.log"|\
+        "$ROOT/.runtime/control-plane/gateway.log.1"|\
+        "$ROOT/.runtime/control-plane/gateway.log.2"|\
+        "$ROOT/.runtime/control-plane/gateway.log.3") ;;
+        *) printf '[purge] ERROR: refused unapproved log target\n' >&2; return 1 ;;
     esac
-    parent="$(dirname -- "$requested")"
-    [[ -d "$parent" ]] || {
-        echo "Refusing to remove path with a missing parent: $requested" >&2
-        exit 1
-    }
-    resolved_parent="$(cd "$parent" && pwd -P)"
-    case "$resolved_parent" in
-        "$ROOT"|"$ROOT"/*) rm -rf -- "$requested" ;;
-        *) echo "Refusing to remove path through an external parent: $requested" >&2; exit 1 ;;
-    esac
+    agent_builder_reject_symlink_path "$target" || return 1
+    [[ ! -L "$target" ]] || { printf '[purge] ERROR: refused log symlink\n' >&2; return 1; }
+    rm -f -- "$target"
 }
 
-purge_cache() {
-    safe_remove "$AGENT_BUILDER_RUNTIME_DIR/cache"
-    safe_remove "$AGENT_BUILDER_RUNTIME_DIR/tmp"
-}
-
-purge_logs() { safe_remove "$AGENT_BUILDER_RUNTIME_DIR/logs"; }
-purge_observability() { safe_remove "$AGENT_BUILDER_RUNTIME_DIR/phoenix"; }
-
-purge_environments() {
-    safe_remove "$AGENT_BUILDER_ENVIRONMENTS_DIR"
-    safe_remove "$ROOT/data/environments"
-}
-
-purge_data() {
-    safe_remove "$ROOT/data"
-}
-
-purge_build() {
-    safe_remove "$ROOT/frontend/.next"
-    safe_remove "$ROOT/docs-site/.vitepress/dist"
-}
-
-purge_dependencies() {
-    safe_remove "$ROOT/.venv"
-    safe_remove "$ROOT/.tools"
-    safe_remove "$AGENT_BUILDER_RUNTIME_DIR/python"
-    safe_remove "$AGENT_BUILDER_RUNTIME_DIR/tools"
-    safe_remove "$AGENT_BUILDER_RUNTIME_DIR/bin"
-    safe_remove "$ROOT/node_modules"
-    safe_remove "$ROOT/frontend/node_modules"
-    safe_remove "$ROOT/docs-site/node_modules"
-}
-
-case "$SCOPE" in
-    cache) purge_cache ;;
-    logs) purge_logs ;;
-    observability) purge_observability ;;
-    environments) purge_environments ;;
-    data) purge_data ;;
-    build) purge_build ;;
-    dependencies) purge_dependencies ;;
+case "$PURGE_SCOPE" in
+    cache)
+        safe_remove_tree "$ROOT/.runtime/cache"
+        ;;
+    logs)
+        for log_path in \
+            "$ROOT/.runtime/control-plane/gateway.log" \
+            "$ROOT/.runtime/control-plane/gateway.log.1" \
+            "$ROOT/.runtime/control-plane/gateway.log.2" \
+            "$ROOT/.runtime/control-plane/gateway.log.3"; do
+            safe_remove_log "$log_path"
+        done
+        printf '[purge] removed managed gateway logs\n'
+        ;;
+    environments)
+        safe_remove_tree "$ROOT/.runtime/agents"
+        ;;
+    data)
+        safe_remove_tree "$ROOT/data/agents"
+        ;;
+    dependencies)
+        safe_remove_tree "$ROOT/.venv"
+        safe_remove_tree "$ROOT/.tools"
+        safe_remove_tree "$ROOT/.runtime/python"
+        safe_remove_tree "$ROOT/.runtime/cache"
+        ;;
+    runtime)
+        safe_remove_tree "$ROOT/.runtime"
+        ;;
     all)
-        purge_cache
-        purge_logs
-        purge_observability
-        purge_environments
-        purge_data
-        purge_build
-        purge_dependencies
-        safe_remove "$AGENT_BUILDER_RUNTIME_DIR"
+        safe_remove_tree "$ROOT/.runtime"
+        safe_remove_tree "$ROOT/.venv"
+        safe_remove_tree "$ROOT/.tools"
+        safe_remove_tree "$ROOT/data/agents"
         ;;
 esac
 
-printf '[purge] removed %s state\n' "$SCOPE"
+printf '[purge] scope %s complete\n' "$PURGE_SCOPE"

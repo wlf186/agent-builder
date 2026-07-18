@@ -1,120 +1,41 @@
-# Dependencies
-node_modules/
+# Checkout-local dependencies and runtime state
 .venv/
 .tools/
 .runtime/
-.superpowers/
-.playwright-cli/
-docs-site/.playwright-cli/
-docs-site/.vitepress/cache/
+data/*
+!data/.gitkeep
 
-# Build outputs
-frontend/.next/
-frontend/out/
-frontend/build/
-dist/
+# Private historical and third-party research material
+_legacy-reference/
+references/claude-code/materials/
 
-# Python
+# Python and test artifacts
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 *.egg-info/
-.eggs/
-*.egg
 .pytest_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+test-results/
 
-# Environment
+# Secrets and local configuration
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-*.env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# Encrypted secrets files (optional - uncomment to exclude encrypted files)
-# data/.secrets.json.enc
-# data/*_secrets.json
-
-# IDE
+# Editor and operating-system files
+.claude/
 .idea/
 .vscode/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Logs
-logs/
+# Logs and process records
 *.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-
-# Runtime data
-data/*
-!data/.gitkeep
-
-# Temporary files
-.tmp/
-.webapp-tester/
-tmp/
-temp/
-
-# Screenshots
-*.png
-*.jpg
-*.jpeg
-*.gif
-screenshots/
-
-# Debug files
-debug_*.py
-test_*.py
-!tests/
-!tests/**/*.py
-
-# Bug reports
-bug/
-
-# Build artifacts
-*.tsbuildinfo
-
-# Misc
-.claude/
-
-# Test Data
-test/
-
-# Per-agent uv environments
-environments/
-
-# PID files
 *.pid
-
-# Test results
-test-results/
-frontend/test-results/
-
-# Team iteration artifacts (screenshots)
-frontend/teams/
-
-# Demo resources and artifacts
-resources/
-routine-uat-demo/
-
-# pip installation error artifacts
-=*
-
-# Temporary debug scripts (should be in scripts/ or tests/)
-quick_*.py
-network_debug*.py
-screenshot*.py
-*_debug.py
-
-# Manual test artifacts
-manual-test-*.png

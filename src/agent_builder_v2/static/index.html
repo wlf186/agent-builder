@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>Harness V2 · Qwen + Sandbox</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/assets/styles.css" />
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">AGENT BUILDER / GREENFIELD</p>
+          <h1>Harness V2</h1>
+          <p class="subtitle">Qwen3.5 真实推理 · 可信模型 Broker · Landlock/seccomp Worker</p>
+        </div>
+        <div class="status-line">
+          <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+          <span id="status-text">尚未认证</span>
+          <button id="logout-button" class="quiet" type="button" hidden>退出</button>
+        </div>
+      </header>
+
+      <section id="login-panel" class="panel login-panel">
+        <div>
+          <p class="section-label">LOCAL ACCESS</p>
+          <h2>连接本地控制面</h2>
+          <p>输入项目运行目录中生成的访问令牌。令牌只用于本次登录，不会写入浏览器存储。</p>
+        </div>
+        <form id="login-form">
+          <label for="token-input">访问令牌</label>
+          <div class="inline-form">
+            <input
+              id="token-input"
+              name="token"
+              type="password"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+            <button type="submit">连接</button>
+          </div>
+          <p id="login-error" class="error" role="alert"></p>
+        </form>
+      </section>
+
+      <section id="workspace" class="workspace" hidden>
+        <section class="panel composer-panel">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">COMMAND SYSTEM</p>
+              <h2>启动一次 Run</h2>
+            </div>
+            <code id="agent-id"></code>
+          </div>
+          <form id="run-form">
+            <label for="message-input">用户消息</label>
+            <textarea id="message-input" maxlength="8192" required>请简要介绍当前 Harness，并验证 Echo 工具链路。</textarea>
+            <div class="actions">
+              <button id="run-button" type="submit">运行</button>
+              <button id="cancel-button" class="danger" type="button" disabled>停止 Run</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="panel output-panel">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">CANONICAL EVENT STREAM</p>
+              <h2>实时输出</h2>
+            </div>
+            <code id="run-id">等待运行</code>
+          </div>
+          <div id="assistant-output" class="assistant-output" aria-live="polite"></div>
+        </section>
+
+        <section class="panel timeline-panel">
+          <div class="section-heading">
+            <div>
+              <p class="section-label">RUNTIME TRACE</p>
+              <h2>事件时间线</h2>
+              <p class="timeline-hint">点击任一事件查看完整消息体</p>
+            </div>
+            <span id="event-count">0 events</span>
+          </div>
+          <ol id="event-list" class="event-list"></ol>
+        </section>
+      </section>
+    </main>
+
+    <dialog
+      id="event-detail-dialog"
+      class="event-detail-dialog"
+      aria-labelledby="event-detail-title"
+    >
+      <section class="event-detail-card">
+        <header class="event-detail-heading">
+          <div>
+            <p class="section-label">CANONICAL EVENT</p>
+            <h2 id="event-detail-title">完整事件消息</h2>
+          </div>
+          <button
+            id="event-detail-close"
+            class="quiet"
+            type="button"
+            aria-label="关闭事件详情"
+          >
+            关闭
+          </button>
+        </header>
+        <p id="event-detail-summary" class="event-detail-summary"></p>
+        <pre id="event-detail-json" class="event-detail-json"></pre>
+      </section>
+    </dialog>
+  </body>
+</html>

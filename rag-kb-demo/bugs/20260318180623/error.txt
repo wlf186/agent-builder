@@ -1,6 +1,0 @@
-步骤: 异常
-错误: locator.waitFor: Timeout 5000ms exceeded.
-Call log:
-[2m  - waiting for locator('input[type="text"]').first() to be visible[22m
-
-时间: 2026-03-18T10:06:25.659Z

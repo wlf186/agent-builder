@@ -50,6 +50,42 @@ def test_host_qualifies_for_complete_worker_policy() -> None:
     assert qualification.machine in {"x86_64", "aarch64"}
 
 
+def test_checkout_confinement_denies_outside_writes_but_preserves_exec(
+    tmp_path: Path,
+) -> None:
+    checkout = _private_directory(tmp_path / "checkout")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("unchanged", encoding="utf-8")
+    code = (
+        "from pathlib import Path; import subprocess,sys; "
+        "from agent_builder_v2.sandbox import apply_checkout_write_confinement; "
+        "root=Path(sys.argv[1]); outside=Path(sys.argv[2]); "
+        "apply_checkout_write_confinement(root); "
+        "(root/'inside.txt').write_text('inside',encoding='utf-8'); "
+        "subprocess.run(['/usr/bin/true'],check=True); "
+        "\ntry: outside.write_text('changed',encoding='utf-8')\n"
+        "except PermissionError: print('denied',flush=True)\n"
+        "else: raise SystemExit('outside write escaped confinement')"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(checkout), str(outside)],
+        env={
+            "PATH": "/usr/bin",
+            "PYTHONPATH": str(SOURCE_ROOT),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "denied"
+    assert (checkout / "inside.txt").read_text(encoding="utf-8") == "inside"
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
 def test_both_architecture_policies_block_persistence_and_cross_process_controls() -> None:
     x86 = sandbox_module._SECCOMP_ARCHITECTURES["x86_64"][2]
     arm = sandbox_module._SECCOMP_ARCHITECTURES["aarch64"][2]

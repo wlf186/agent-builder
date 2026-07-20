@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -16,6 +17,7 @@ from typing import Any, AsyncIterator
 from .capsule import AgentCapsule, CapsuleManager
 from .context import ConversationMessage, ContextCompiler, ContextPlan
 from .contracts import (
+    RUN_CURSOR_RESERVED_THROUGH,
     TERMINAL_KINDS,
     EventEnvelope,
     StartRunCommand,
@@ -28,9 +30,11 @@ from .ollama import (
     OllamaBrokerError,
     OllamaCancelledError,
     OllamaQualification,
+    OllamaRequestMetadata,
     OllamaRunSession,
     OllamaToolResult,
 )
+from .replay import DurableReplay, RunIdentity
 from .sandbox import HostQualification, require_qualified_host
 from .sessions import (
     Conversation,
@@ -39,7 +43,12 @@ from .sessions import (
     ConversationStore,
     ConversationSummary,
 )
-from .state import EventJournal
+from .state import (
+    EventJournal,
+    JournalCorruptionError,
+    JournalUnavailableError,
+)
+from .sync_counter import qualification_environment
 from .tools import ToolSpec, prototype_tool_specs, toolset_digest
 
 
@@ -57,7 +66,7 @@ WORKER_EVENT_KINDS = frozenset(
         "run.cancelled",
     }
 )
-MAX_LIVE_EVENTS = 512
+MAX_LIVE_EVENTS = RUN_CURSOR_RESERVED_THROUGH
 MAX_WORKER_EVENT_BYTES = 65_536
 MAX_ACTIVE_RUNS = 4
 MAX_RETAINED_RUNS = 64
@@ -386,6 +395,7 @@ class RunRecord:
     ] = field(default_factory=dict)
     broker_tool_results: list[OllamaToolResult] = field(default_factory=list)
     model_request_count: int = 0
+    model_response_count: int = 0
     broker_stop_iteration: int | None = None
     final_assistant_content: str | None = field(default=None, repr=False)
     model_failure: tuple[str, bool] | None = None
@@ -435,6 +445,12 @@ class RunService:
     ) -> None:
         self.repository_root = repository_root.resolve(strict=True)
         self.source_root = source_root.resolve(strict=True)
+        self._worker_qualification_environment = qualification_environment(
+            self.repository_root,
+            os.environ,
+            expected_role="gateway",
+            child_role="worker",
+        )
         self.capsules = CapsuleManager(self.repository_root)
         self.capsule: AgentCapsule | None = None
         self.journal: EventJournal | None = None
@@ -860,6 +876,7 @@ class RunService:
                     "visible_tools": [
                         spec.tool_id for spec in record.effective_tools
                     ],
+                    "protocol_features": ["model-call-boundaries-v1"],
                     "sandbox": SANDBOX_POLICY,
                     "context_plan": context_plan.public_metadata(),
                 },
@@ -903,6 +920,43 @@ class RunService:
             return self.runs[run_id]
         except KeyError as exc:
             raise KeyError("run not found") from exc
+
+    async def resolve_run_identity(self, run_id: str) -> RunIdentity:
+        """Resolve an owned Run from durable state, independent of RAM retention."""
+
+        return await asyncio.to_thread(
+            self._conversation_store().resolve_run_identity,
+            run_id,
+        )
+
+    async def replay_run(
+        self,
+        run_id: str,
+        *,
+        after: int,
+        limit: int,
+        expected_identity: RunIdentity,
+    ) -> DurableReplay:
+        """Return a bounded, identity-bound durable replay or retained snapshot."""
+
+        if self.journal is None:
+            raise JournalUnavailableError("journal is unavailable")
+        store = self._conversation_store()
+        identity = await asyncio.to_thread(store.resolve_run_identity, run_id)
+        if identity != expected_identity:
+            raise KeyError("Run identity changed during replay")
+        replay = await asyncio.to_thread(
+            self.journal.replay,
+            run_id,
+            after=after,
+            limit=limit,
+            expected_identity=identity,
+        )
+        if replay is None:
+            raise JournalCorruptionError(
+                "owned Run has no durable replay metadata"
+            )
+        return replay
 
     async def cancel(self, run_id: str) -> None:
         try:
@@ -1107,6 +1161,7 @@ class RunService:
                 or not isinstance(payload.get("model_iterations"), int)
                 or isinstance(payload.get("model_iterations"), bool)
                 or payload["model_iterations"] != record.model_request_count
+                or record.model_response_count != record.model_request_count
                 or record.broker_stop_iteration != record.model_request_count
                 or not 1 <= record.model_request_count <= 3
                 or record.open_blocks
@@ -1117,7 +1172,7 @@ class RunService:
         elif kind == "run.failed":
             if (
                 keys != {"code", "message", "retryable"}
-                or not self._bounded_worker_text(payload.get("code"), 128)
+                or not self._worker_id(payload.get("code"))
                 or not self._bounded_worker_text(payload.get("message"), 512)
                 or not isinstance(payload.get("retryable"), bool)
                 or record.open_blocks
@@ -1347,6 +1402,8 @@ class RunService:
         payload: dict[str, Any],
         *,
         recovery: bool = False,
+        provider_usage_start: dict[str, Any] | None = None,
+        provider_usage_complete: dict[str, Any] | None = None,
     ) -> EventEnvelope:
         # Managed terminal commits, RunRecord state, and Conversation deletion
         # share this fence.  A successful DELETE can therefore retire every
@@ -1358,6 +1415,8 @@ class RunService:
                 durability,
                 payload,
                 recovery=recovery,
+                provider_usage_start=provider_usage_start,
+                provider_usage_complete=provider_usage_complete,
             )
 
     async def _publish_locked(
@@ -1368,6 +1427,8 @@ class RunService:
         payload: dict[str, Any],
         *,
         recovery: bool = False,
+        provider_usage_start: dict[str, Any] | None = None,
+        provider_usage_complete: dict[str, Any] | None = None,
     ) -> EventEnvelope:
         """Validate and publish one event under the Control-plane state fence."""
 
@@ -1375,6 +1436,25 @@ class RunService:
             raise ConversationNotFoundError("conversation was deleted")
         if record.terminal_kind is not None:
             raise RuntimeError("attempted event after terminal")
+        if provider_usage_start is not None and provider_usage_complete is not None:
+            raise RuntimeError("provider boundary cannot start and complete together")
+        if record.conversation_managed and (
+            (kind == "model.request.started" and provider_usage_start is None)
+            or (
+                kind == "model.response.finished"
+                and payload.get("usage_complete") is True
+                and provider_usage_complete is None
+            )
+            or (
+                provider_usage_start is not None
+                and kind != "model.request.started"
+            )
+            or (
+                provider_usage_complete is not None
+                and kind != "model.response.finished"
+            )
+        ):
+            raise RuntimeError("provider usage boundary persistence is invalid")
         if kind in TERMINAL_KINDS:
             payload = {**payload, "usage": dict(record.model_usage)}
             # A failed/cancelled Worker may stop after receiving a broker-owned
@@ -1437,6 +1517,24 @@ class RunService:
                     expected_revision=record.conversation_revision,
                     started_event=envelope,
                 )
+            elif record.conversation_managed and provider_usage_start is not None:
+                if self.conversations is None:
+                    raise RuntimeError("conversation store is unavailable")
+                await asyncio.to_thread(
+                    self.conversations.start_provider_usage_with_event,
+                    record.run_id,
+                    boundary_event=envelope,
+                    **provider_usage_start,
+                )
+            elif record.conversation_managed and provider_usage_complete is not None:
+                if self.conversations is None:
+                    raise RuntimeError("conversation store is unavailable")
+                await asyncio.to_thread(
+                    self.conversations.complete_provider_usage_with_event,
+                    record.run_id,
+                    boundary_event=envelope,
+                    **provider_usage_complete,
+                )
             elif record.conversation_managed and kind in TERMINAL_KINDS:
                 if self.conversations is None:
                     raise RuntimeError("conversation store is unavailable")
@@ -1481,6 +1579,8 @@ class RunService:
     ) -> None:
         if record.terminal_kind is not None:
             return
+        if not self._worker_id(code):
+            raise ValueError("invalid failure code")
         if forced_terminal not in {None, "run.failed", "run.cancelled"}:
             raise ValueError("invalid forced terminal kind")
         terminal = forced_terminal or (
@@ -1504,7 +1604,7 @@ class RunService:
         await self._publish(record, terminal, "durable", payload)
 
     def _worker_environment(self, run_root: Path, capsule: AgentCapsule) -> dict[str, str]:
-        return {
+        environment = {
             "PATH": str(capsule.interpreter.parent),
             "HOME": str(run_root / "home"),
             "TMPDIR": str(run_root / "tmp"),
@@ -1522,6 +1622,8 @@ class RunService:
             "HARNESS_V2_ENVIRONMENT_ROOT": str(capsule.interpreter.parent.parent),
             "HARNESS_V2_SOURCE_ROOT": str(self.source_root),
         }
+        environment.update(self._worker_qualification_environment)
+        return environment
 
     async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
         """Drain without retaining data so a noisy Worker cannot deadlock on stderr."""
@@ -1609,10 +1711,112 @@ class RunService:
         ):
             raise ValueError("Worker model request is invalid")
         assert isinstance(request_id, str)
-        record.model_request_count = expected_iteration
-        record.broker_stop_iteration = None
-        record.model_failure = None
-        record.model_usage["complete"] = False
+        if self.conversations is None:
+            raise RuntimeError("conversation store is unavailable")
+        profile_payload = json.dumps(
+            context_plan.model_profile.canonical_manifest(),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        profile_digest = hashlib.sha256(
+            b"agent-builder-model-profile-v1\0" + profile_payload
+        ).hexdigest()
+
+        request_started = False
+        response_finished = False
+
+        async def observe_request(metadata: OllamaRequestMetadata) -> None:
+            nonlocal request_started
+            if (
+                not isinstance(metadata, OllamaRequestMetadata)
+                or request_started
+                or metadata.iteration != expected_iteration
+                or not 1 <= metadata.message_count <= 256
+                or not 0 <= metadata.tool_count <= len(record.effective_tools)
+                or not 1
+                <= metadata.estimated_input_tokens
+                <= context_plan.policy.hard_input_tokens
+                or not 1
+                <= metadata.request_bytes
+                <= context_plan.model_profile.request_byte_budget
+                or re.fullmatch(r"[a-f0-9]{64}", metadata.request_digest) is None
+                or (
+                    expected_iteration == 1
+                    and metadata.tool_count != len(context_plan.tools)
+                )
+                or (expected_iteration > 1 and metadata.tool_count != 0)
+            ):
+                raise RuntimeError("trusted model request metadata is invalid")
+            await self._publish(
+                record,
+                "model.request.started",
+                "durable",
+                {
+                    "request_id": request_id,
+                    "iteration": expected_iteration,
+                    "context_plan_id": context_plan.reference.plan_id,
+                    "context_plan_digest": context_plan.reference.digest,
+                    "request_digest": metadata.request_digest,
+                    "request_bytes": metadata.request_bytes,
+                    "estimated_input_tokens": metadata.estimated_input_tokens,
+                    "message_count": metadata.message_count,
+                    "tool_count": metadata.tool_count,
+                    "tool_result_call_ids": list(trusted_result_call_ids),
+                },
+                provider_usage_start={
+                    "call_index": expected_iteration,
+                    "provider": context_plan.model_profile.provider,
+                    "model": context_plan.model_profile.model,
+                    "profile_digest": profile_digest,
+                    "context_plan_id": context_plan.reference.plan_id,
+                    "estimated_input_tokens": metadata.estimated_input_tokens,
+                    "hard_input_tokens": context_plan.policy.hard_input_tokens,
+                },
+            )
+            request_started = True
+            record.model_request_count = expected_iteration
+            record.broker_stop_iteration = None
+            record.model_failure = None
+            record.model_usage["complete"] = False
+
+        async def finish_response(
+            outcome: str,
+            *,
+            input_tokens: int,
+            output_tokens: int,
+            usage_complete: bool,
+            error_code: str | None,
+        ) -> None:
+            nonlocal response_finished
+            if not request_started or response_finished:
+                raise RuntimeError("model response boundary is out of sequence")
+            await self._publish(
+                record,
+                "model.response.finished",
+                "durable",
+                {
+                    "request_id": request_id,
+                    "iteration": expected_iteration,
+                    "outcome": outcome,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "usage_complete": usage_complete,
+                    "error_code": error_code,
+                },
+                provider_usage_complete=(
+                    {
+                        "call_index": expected_iteration,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                    if usage_complete
+                    else None
+                ),
+            )
+            response_finished = True
+            record.model_response_count = expected_iteration
 
         saw_terminal_frame = False
         trusted_content: list[str] = []
@@ -1622,6 +1826,7 @@ class RunService:
                 user_message,
                 tuple(record.broker_tool_results),
                 lambda: record.cancel_requested,
+                observe_request,
             )
             async for frame in model_frames:
                 if frame.kind == "content":
@@ -1670,7 +1875,19 @@ class RunService:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Invalid normalized Tool call."
                         )
-                    self._apply_model_usage(record, frame.payload["usage"])
+                    prompt_tokens, output_tokens = self._validated_model_usage(
+                        record, frame.payload["usage"]
+                    )
+                    await finish_response(
+                        "tool_use",
+                        input_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        usage_complete=True,
+                        error_code=None,
+                    )
+                    self._apply_validated_model_usage(
+                        record, prompt_tokens, output_tokens
+                    )
                     assert isinstance(call_id, str)
                     record.broker_pending_tool_calls[call_id] = (
                         spec.tool_id,
@@ -1690,7 +1907,19 @@ class RunService:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Invalid normalized stop frame."
                         )
-                    self._apply_model_usage(record, frame.payload["usage"])
+                    prompt_tokens, output_tokens = self._validated_model_usage(
+                        record, frame.payload["usage"]
+                    )
+                    await finish_response(
+                        "end_turn",
+                        input_tokens=prompt_tokens,
+                        output_tokens=output_tokens,
+                        usage_complete=True,
+                        error_code=None,
+                    )
+                    self._apply_validated_model_usage(
+                        record, prompt_tokens, output_tokens
+                    )
                     record.broker_stop_iteration = expected_iteration
                     record.final_assistant_content = "".join(trusted_content)
                     saw_terminal_frame = True
@@ -1710,6 +1939,16 @@ class RunService:
                 )
         except (OllamaCancelledError, OllamaBrokerError) as exc:
             record.model_failure = (exc.code, exc.retryable)
+            if request_started and not response_finished:
+                await finish_response(
+                    "cancelled"
+                    if isinstance(exc, OllamaCancelledError)
+                    else "error",
+                    input_tokens=0,
+                    output_tokens=0,
+                    usage_complete=False,
+                    error_code=exc.code,
+                )
             await self._write_model_response(
                 stream,
                 request_id,
@@ -1721,7 +1960,9 @@ class RunService:
                 await model_frames.aclose()
 
     @staticmethod
-    def _apply_model_usage(record: RunRecord, value: object) -> None:
+    def _validated_model_usage(
+        record: RunRecord, value: object
+    ) -> tuple[int, int]:
         if not isinstance(value, dict) or set(value) != {
             "prompt_eval_count",
             "eval_count",
@@ -1767,10 +2008,40 @@ class RunService:
             raise OllamaBrokerError(
                 "model_protocol_error", "Model usage exceeded its bound."
             )
+        return prompt_tokens, output_tokens
+
+    @staticmethod
+    def _apply_validated_model_usage(
+        record: RunRecord, prompt_tokens: int, output_tokens: int
+    ) -> None:
+        current_input = record.model_usage["input_tokens"]
+        current_output = record.model_usage["output_tokens"]
+        if (
+            not isinstance(current_input, int)
+            or isinstance(current_input, bool)
+            or not isinstance(current_output, int)
+            or isinstance(current_output, bool)
+        ):
+            raise OllamaBrokerError(
+                "model_protocol_error", "Invalid accumulated model usage."
+            )
+        input_total = current_input + prompt_tokens
+        output_total = current_output + output_tokens
+        if input_total > 1_000_000_000 or output_total > 1_000_000_000:
+            raise OllamaBrokerError(
+                "model_protocol_error", "Model usage exceeded its bound."
+            )
         record.model_usage["input_tokens"] = input_total
         record.model_usage["output_tokens"] = output_total
         record.model_usage["last_input_tokens"] = prompt_tokens
         record.model_usage["complete"] = True
+
+    @classmethod
+    def _apply_model_usage(cls, record: RunRecord, value: object) -> None:
+        """Validate and apply one usage frame (kept for focused unit tests)."""
+
+        prompt_tokens, output_tokens = cls._validated_model_usage(record, value)
+        cls._apply_validated_model_usage(record, prompt_tokens, output_tokens)
 
     async def _run_worker(self, record: RunRecord, message: str) -> None:
         assert self.capsule is not None

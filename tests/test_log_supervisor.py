@@ -139,14 +139,21 @@ def test_supervisor_record_precedes_child_and_term_reaps_both(tmp_path: Path) ->
     try:
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            if pid_file.is_file() and child_pid_file.is_file():
+            if (
+                pid_file.is_file()
+                and child_pid_file.is_file()
+                and "web_pid=" in pid_file.read_text(encoding="utf-8")
+            ):
                 child_pid = int(child_pid_file.read_text(encoding="utf-8"))
                 break
             if process.poll() is not None:
                 break
             time.sleep(0.02)
         assert child_pid is not None
-        assert f"pid={process.pid}" in pid_file.read_text(encoding="utf-8")
+        pid_record = pid_file.read_text(encoding="utf-8")
+        assert f"pid={process.pid}" in pid_record
+        assert f"web_pid={child_pid}" in pid_record
+        assert "web_marker=linux:" in pid_record
 
         ticks_before = _cpu_ticks(process.pid)
         time.sleep(1.0)

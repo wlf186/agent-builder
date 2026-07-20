@@ -12,6 +12,10 @@ from uuid import uuid4
 SCHEMA_VERSION = "2.2-prototype"
 TERMINAL_KINDS = frozenset({"run.completed", "run.failed", "run.cancelled"})
 MAX_MESSAGE_BYTES = 8_192
+# The Control Plane reserves this complete live sequence band before releasing
+# a Worker. Persisted managed-Run metadata must bind to this exact protocol
+# value so recovery cannot reuse a cursor already observed by an SSE client.
+RUN_CURSOR_RESERVED_THROUGH = 512
 RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
 Durability = Literal["durable", "ephemeral"]
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import hmac
 import json
 
 import pytest
@@ -142,6 +144,94 @@ def test_context_plan_is_ordered_reproducible_and_provider_renderable() -> None:
     assert "[agent.instructions]" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "请回显这一条"}
     assert "请回显这一条" not in repr(first.sections[-1])
+
+
+def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> None:
+    history = (
+        ConversationMessage("a" * 32, "user", "history-user-secret-47"),
+        ConversationMessage("b" * 32, "assistant", "history-answer-secret-53"),
+    )
+    plan = ContextCompiler().compile(
+        "current-user-secret-59",
+        history=history,
+        model_profile=_profile(),
+        tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+
+    inspection_key = bytes(range(32))
+    inspection = plan.operator_inspection(inspection_key)
+    payload = inspection.to_dict()
+    sections = payload["sections"]
+    assert isinstance(sections, list)
+    assert [section["id"] for section in sections] == [
+        "platform.contract",
+        "agent.instructions",
+        "conversation.0000.user",
+        "conversation.0001.assistant",
+        "turn.user",
+    ]
+    assert [section["role"] for section in sections] == [
+        "system",
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert payload["provider_message_count"] == len(plan.provider_messages())
+    assert "provider_messages" not in payload
+    assert payload["renderer"] == {
+        "version": "ordered-sections-v1",
+        "leading_system_sections_merged": True,
+        "leading_system_section_count": 2,
+        "description": payload["renderer"]["description"],
+    }
+    assert payload["content_exposure"] == "withheld"
+    for section, source in zip(sections, plan.sections, strict=True):
+        encoded = source.content.encode("utf-8")
+        assert set(section) == {
+            "id",
+            "role",
+            "trust",
+            "provenance",
+            "cache",
+            "truncation",
+            "estimated_tokens",
+            "content_bytes",
+            "content_digest",
+        }
+        assert "content" not in section
+        assert section["content_bytes"] == len(encoded)
+        assert section["content_digest"] == hmac.new(
+            inspection_key,
+            b"agent-builder-context-section-inspection-v1\0" + encoded,
+            hashlib.sha256,
+        ).hexdigest()
+        assert section["content_digest"] != hashlib.sha256(
+            b"agent-builder-context-section-inspection-v1\0" + encoded
+        ).hexdigest()
+
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert all(section.content not in serialized for section in plan.sections)
+
+    payload["context_plan"]["plan_id"] = "changed"
+    payload["renderer"]["version"] = "changed"
+    sections[0]["id"] = "changed"
+    fresh = inspection.to_dict()
+    assert fresh["context_plan"]["plan_id"] == plan.reference.plan_id
+    assert fresh["renderer"]["version"] == "ordered-sections-v1"
+    assert fresh["sections"][0]["id"] == "platform.contract"
+    same_key = plan.operator_inspection(inspection_key)
+    different_key = plan.operator_inspection(b"z" * 32)
+    assert same_key is not inspection
+    assert same_key.to_dict()["sections"] == inspection.to_dict()["sections"]
+    assert (
+        different_key.to_dict()["sections"][0]["content_digest"]
+        != same_key.to_dict()["sections"][0]["content_digest"]
+    )
+    with pytest.raises(ContextPlanError, match="digest key"):
+        plan.operator_inspection(b"short")
 
 
 def test_plan_digest_covers_message_generation_profile_and_tool_contract() -> None:

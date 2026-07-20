@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import threading
@@ -33,7 +34,12 @@ from agent_builder_v2.control import (
     _marker_from_proc_stat,
 )
 from agent_builder_v2.ollama import OllamaBrokerError, OllamaQualification
-from agent_builder_v2.sessions import ConversationNotFoundError, ConversationStore
+from agent_builder_v2.sessions import (
+    ConversationNotFoundError,
+    ConversationStore,
+    ConversationStoreUnavailableError,
+)
+from agent_builder_v2.state import EventJournal, JournalCorruptionError
 from agent_builder_v2.tools import prototype_tool_specs
 
 
@@ -78,6 +84,32 @@ class _FailingJournal(_MemoryJournal):
         super().append(event)
 
 
+class _FailingDelegatingJournal:
+    def __init__(self, journal: EventJournal, successful_appends: int) -> None:
+        self.journal = journal
+        self.successful_appends = successful_appends
+        self.append_count = 0
+
+    def append(self, event: EventEnvelope) -> None:
+        if self.append_count >= self.successful_appends:
+            raise OSError("simulated durable storage failure")
+        self.journal.append(event)
+        self.append_count += 1
+
+    def prune_to_recent_runs(
+        self,
+        maximum_runs: int,
+        protected_run_ids: tuple[str, ...] = (),
+    ) -> int:
+        return self.journal.prune_to_recent_runs(
+            maximum_runs,
+            protected_run_ids,
+        )
+
+    def close(self) -> None:
+        self.journal.close()
+
+
 class _UnusedModelBroker:
     def new_run(self, _context_plan: object) -> object:
         return object()
@@ -102,6 +134,18 @@ def _record(run_id: str = "1" * 32) -> RunRecord:
         context_plan=context_plan,
         effective_tools=prototype_tool_specs(),
     )
+
+
+def _started_payload(record: RunRecord) -> dict[str, object]:
+    assert record.context_plan is not None
+    return {
+        "prototype": True,
+        "model": TEST_PROFILE.model,
+        "visible_tools": [spec.tool_id for spec in record.effective_tools],
+        "protocol_features": ["model-call-boundaries-v1"],
+        "sandbox": "harness-v2-worker-v1",
+        "context_plan": record.context_plan.public_metadata(),
+    }
 
 
 def _service(tmp_path: Path) -> tuple[RunService, _MemoryJournal]:
@@ -147,6 +191,126 @@ def _placeholder_event() -> EventEnvelope:
         durability="durable",
         payload={},
     )
+
+
+def test_atomic_provider_response_failure_does_not_advance_live_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        conversation = await service.create_conversation("atomic response failure")
+        assert service.conversations is not None
+        snapshot = await asyncio.to_thread(
+            service.conversations.snapshot_for_turn,
+            conversation.conversation_id,
+        )
+        record = _record()
+        record.conversation_id = conversation.conversation_id
+        record.conversation_managed = True
+        record.conversation_revision = snapshot.revision
+        record.user_message = "atomic response failure"
+        service.runs[record.run_id] = record
+        await service._publish(
+            record,
+            "run.started",
+            "durable",
+            _started_payload(record),
+        )
+        plan = record.context_plan
+        assert plan is not None
+        await service._publish(
+            record,
+            "model.request.started",
+            "durable",
+            {
+                "request_id": "model-1",
+                "iteration": 1,
+                "context_plan_id": plan.reference.plan_id,
+                "context_plan_digest": plan.reference.digest,
+                "request_digest": "b" * 64,
+                "request_bytes": 512,
+                "estimated_input_tokens": plan.estimated_input_tokens,
+                "message_count": len(plan.provider_messages()),
+                "tool_count": len(plan.tools),
+                "tool_result_call_ids": [],
+            },
+            provider_usage_start={
+                "call_index": 1,
+                "provider": plan.model_profile.provider,
+                "model": plan.model_profile.model,
+                "profile_digest": "c" * 64,
+                "context_plan_id": plan.reference.plan_id,
+                "estimated_input_tokens": plan.estimated_input_tokens,
+                "hard_input_tokens": plan.policy.hard_input_tokens,
+            },
+        )
+        original_insert = service.conversations._insert_boundary_event
+
+        def fail_response_insert(event: EventEnvelope, encoded: str) -> None:
+            if event.kind == "model.response.finished":
+                raise sqlite3.OperationalError("simulated boundary failure")
+            original_insert(event, encoded)
+
+        monkeypatch.setattr(
+            service.conversations,
+            "_insert_boundary_event",
+            fail_response_insert,
+        )
+        live_bytes = record.live_event_bytes
+        durable_bytes = record.durable_event_bytes
+        with pytest.raises(
+            ConversationStoreUnavailableError,
+            match="provider response boundary",
+        ):
+            await service._publish(
+                record,
+                "model.response.finished",
+                "durable",
+                {
+                    "request_id": "model-1",
+                    "iteration": 1,
+                    "outcome": "end_turn",
+                    "input_tokens": 23,
+                    "output_tokens": 4,
+                    "usage_complete": True,
+                    "error_code": None,
+                },
+                provider_usage_complete={
+                    "call_index": 1,
+                    "input_tokens": 23,
+                    "output_tokens": 4,
+                },
+            )
+
+        assert record.journal_failed is True
+        assert [event.kind for event in record.events] == [
+            "run.started",
+            "model.request.started",
+        ]
+        assert [event.seq for event in record.events] == [1, 2]
+        assert record.live_event_bytes == live_bytes
+        assert record.durable_event_bytes == durable_bytes
+        usage = service.conversations.provider_usage_for_run(record.run_id)
+        assert len(usage) == 1
+        assert usage[0].status == "started"
+        assert usage[0].input_tokens is None
+        assert service.conversations._connection.execute(
+            "SELECT kind FROM events WHERE run_id = ? ORDER BY seq",
+            (record.run_id,),
+        ).fetchall() == [
+            ("run.started",),
+            ("model.request.started",),
+        ]
+        state = service.conversations.get_run_journal_state(record.run_id)
+        assert (state.latest_durable_seq, state.event_count) == (2, 2)
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
 
 
 def _install_fake_capsule_io(
@@ -268,7 +432,7 @@ def test_delete_is_fenced_until_terminal_record_is_retired(
         record.user_message = "race"
         service.runs[record.run_id] = record
         await service._publish(
-            record, "run.started", "durable", {"prototype": True}
+            record, "run.started", "durable", _started_payload(record)
         )
 
         original_finalize = service.conversations.finalize_noncompleted
@@ -346,7 +510,7 @@ def test_cancelled_delete_still_retires_committed_run_records(
         record.user_message = "delete me"
         service.runs[record.run_id] = record
         await service._publish(
-            record, "run.started", "durable", {"prototype": True}
+            record, "run.started", "durable", _started_payload(record)
         )
         await service._publish(
             record,
@@ -696,6 +860,7 @@ def test_completed_terminal_requires_a_control_observed_model_stop(
         )
 
     record.model_request_count = 1
+    record.model_response_count = 1
     record.broker_stop_iteration = 1
     service._validate_worker_event(record, "run.completed", "durable", completed)
     with pytest.raises(ValueError, match="invalid completed terminal"):
@@ -712,6 +877,22 @@ def test_completed_terminal_requires_a_control_observed_model_stop(
     with pytest.raises(ValueError, match="invalid completed terminal"):
         service._validate_worker_event(
             record, "run.completed", "durable", completed
+        )
+
+
+def test_failed_terminal_code_must_be_a_safe_identifier(tmp_path: Path) -> None:
+    service, _journal = _service(tmp_path)
+
+    with pytest.raises(ValueError, match="invalid failed terminal"):
+        service._validate_worker_event(
+            _record(),
+            "run.failed",
+            "durable",
+            {
+                "code": "not a safe identifier",
+                "message": "unsafe failure code",
+                "retryable": False,
+            },
         )
 
 
@@ -938,7 +1119,7 @@ def test_worker_wall_deadline_kills_reaps_and_publishes_one_failure(
             record,
             "run.started",
             "durable",
-            {"prototype": True},
+            _started_payload(record),
         )
         record.deadline_at = asyncio.get_running_loop().time() + 0.2
         await asyncio.wait_for(service._run_worker(record, "hang"), timeout=2.0)
@@ -995,7 +1176,9 @@ exit 7
             {"text": "hello"},
         )
         service.runs[record.run_id] = record
-        await service._publish(record, "run.started", "durable", {"prototype": True})
+        await service._publish(
+            record, "run.started", "durable", _started_payload(record)
+        )
         await service._run_worker(record, "crash")
         return record
 
@@ -1051,7 +1234,7 @@ exit 7
         )
         service.runs[record.run_id] = record
         await service._publish(
-            record, "run.started", "durable", {"prototype": True}
+            record, "run.started", "durable", _started_payload(record)
         )
         await service._run_worker(record, "crash before Tool start")
         return record
@@ -1112,7 +1295,9 @@ exit 0
     async def exercise() -> RunRecord:
         record = _record()
         service.runs[record.run_id] = record
-        await service._publish(record, "run.started", "durable", {"prototype": True})
+        await service._publish(
+            record, "run.started", "durable", _started_payload(record)
+        )
         await service._run_worker(record, "invalid terminal")
         return record
 
@@ -1154,7 +1339,9 @@ printf '%s\n' '{"kind":"tool.call.requested","durability":"durable","payload":{"
     async def exercise() -> tuple[RunRecord, bool]:
         record = _record()
         service.runs[record.run_id] = record
-        await service._publish(record, "run.started", "durable", {"prototype": True})
+        await service._publish(
+            record, "run.started", "durable", _started_payload(record)
+        )
         await service._run_worker(record, "journal failure")
         _events, done = await record.events_after(0, timeout=0.01)
         return record, done
@@ -1178,3 +1365,133 @@ printf '%s\n' '{"kind":"tool.call.requested","durability":"durable","payload":{"
         "run.started",
         "assistant.block.started",
     ]
+
+
+def test_managed_journal_failure_reopens_as_bounded_unavailable_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _memory_journal = _service(tmp_path)
+    assert service.conversations is not None
+    database = service.conversations.database_path
+    durable_journal = EventJournal(database)
+    service.journal = _FailingDelegatingJournal(  # type: ignore[assignment]
+        durable_journal,
+        successful_appends=1,
+    )
+    fake_interpreter = tmp_path / "managed-journal-failure-worker"
+    fake_interpreter.write_text(
+        """#!/bin/sh
+printf '%s\n' '{"internal":"sandbox.ready"}'
+IFS= read -r _command
+printf '%s\n' '{"kind":"assistant.block.started","durability":"durable","payload":{"block_id":"open-block","block_type":"content"}}'
+printf '%s\n' '{"kind":"tool.call.requested","durability":"durable","payload":{"call_id":"not-published","tool_id":"builtin/echo","arguments":{"text":"hello"}}}'
+/bin/sleep 1
+""",
+        encoding="utf-8",
+    )
+    fake_interpreter.chmod(0o700)
+    service.capsule = AgentCapsule(
+        agent_id=PROTOTYPE_AGENT_ID,
+        data_root=tmp_path / "data",
+        runtime_root=tmp_path / "runtime",
+        interpreter=fake_interpreter,
+    )
+    _install_fake_capsule_io(service, monkeypatch)
+
+    async def exercise() -> RunRecord:
+        conversation = await service.create_conversation("degraded journal")
+        assert service.conversations is not None
+        snapshot = await asyncio.to_thread(
+            service.conversations.snapshot_for_turn,
+            conversation.conversation_id,
+        )
+        record = _record()
+        record.conversation_id = conversation.conversation_id
+        record.conversation_managed = True
+        record.conversation_revision = snapshot.revision
+        record.user_message = "force a durable failure"
+        service.runs[record.run_id] = record
+        await service._publish(
+            record,
+            "run.started",
+            "durable",
+            _started_payload(record),
+        )
+        await asyncio.to_thread(
+            service.conversations.start_provider_usage,
+            record.run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="a" * 64,
+            context_plan_id="degraded-test-plan",
+            estimated_input_tokens=32,
+            hard_input_tokens=1024,
+        )
+        await asyncio.to_thread(
+            service.conversations.record_operation_intent,
+            operation_id="d" * 32,
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="b" * 64,
+            request_digest="c" * 64,
+            conversation_id=record.conversation_id,
+            turn_id=record.turn_id,
+            run_id=record.run_id,
+            call_id="degraded-call",
+        )
+        await asyncio.to_thread(
+            service.conversations.mark_operation_dispatched,
+            "d" * 32,
+            executor_kind="sandbox-runner",
+            executor_identity_digest="e" * 64,
+        )
+        await service._run_worker(record, "journal failure")
+        return record
+
+    record = asyncio.run(exercise())
+    durable_journal.close()
+    service.conversations.close()
+
+    reopened_store = ConversationStore(database, PROTOTYPE_AGENT_ID)
+    reopened_journal = EventJournal(database)
+    try:
+        restored = reopened_store.get_conversation(record.conversation_id)
+        assert restored.active_run_id is None
+        assert restored.turns[-1].status == "failed"
+        state = reopened_store.get_run_journal_state(record.run_id)
+        assert state.availability == "pruned"
+        assert state.event_count == 0
+        assert state.durable_bytes == 0
+        assert state.terminal_seq is None
+        assert state.terminal_kind is None
+        assert state.usage_complete is False
+        usage = reopened_store.provider_usage_for_run(record.run_id)
+        assert len(usage) == 1
+        assert usage[0].status == "incomplete"
+        assert usage[0].completed_at is not None
+        operation = reopened_store.record_operation_intent(
+            operation_id="f" * 32,
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="b" * 64,
+            request_digest="c" * 64,
+            conversation_id=record.conversation_id,
+            turn_id=record.turn_id,
+            run_id=record.run_id,
+            call_id="degraded-call",
+        )
+        assert operation.changed is False
+        assert operation.record.operation_id == "d" * 32
+        assert operation.record.status == "outcome_unknown"
+        assert reopened_journal.events_for_run(record.run_id) == []
+        assert reopened_store.read_run_snapshot(record.run_id) is None
+        with pytest.raises(JournalCorruptionError, match="unavailable"):
+            reopened_journal.replay(
+                record.run_id,
+                expected_identity=reopened_store.resolve_run_identity(record.run_id),
+            )
+        assert reopened_journal.prune_to_recent_runs(1) == 0
+    finally:
+        reopened_journal.close()
+        reopened_store.close()

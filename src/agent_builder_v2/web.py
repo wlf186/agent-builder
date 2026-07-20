@@ -31,6 +31,15 @@ from .capsule import PROTOTYPE_AGENT_ID
 from .commands import RUN_ID, CommandBus
 from .contracts import StartRunCommand
 from .control import RunService
+from .query_engine import (
+    QueryContextUnavailableError,
+    QueryEngineOwnershipError,
+    QueryEngineRegistry,
+    QueryReplayCursorError,
+    QueryReplayUnavailableError,
+    QueryRunNotRetainedError,
+)
+from .replay import DurableReplay, MAX_REPLAY_PAGE, MAX_REPLAY_SEQUENCE
 from .sessions import (
     Conversation,
     ConversationConflictError,
@@ -56,6 +65,29 @@ SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
 }
+STREAM_CONTROL_VERSION = "stream-control-v1"
+_CONTEXT_METADATA_FIELDS = frozenset(
+    {
+        "plan_id",
+        "digest",
+        "toolset_digest",
+        "section_count",
+        "history_message_count",
+        "included_history_message_count",
+        "omitted_history_message_count",
+        "history_source_digest",
+        "windowing_strategy",
+        "estimated_input_tokens",
+        "native_context_tokens",
+        "operational_context_tokens",
+        "input_budget_tokens",
+        "compact_at_tokens",
+        "compact_target_tokens",
+        "output_reserve_tokens",
+        "template_reserve_tokens",
+        "estimator",
+    }
+)
 
 
 class LoginLimiter:
@@ -322,6 +354,197 @@ def _conversation_response(value: Conversation) -> dict[str, object]:
     return {"session": _summary_response(value), "messages": messages}
 
 
+def _replay_query_integer(
+    request: Request,
+    name: str,
+    *,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    values = request.query_params.getlist(name)
+    if not values:
+        return default
+    raw = values[0]
+    if (
+        len(values) != 1
+        or not raw
+        or len(raw) > len(str(maximum))
+        or not raw.isascii()
+        or not raw.isdigit()
+    ):
+        raise HTTPException(400, f"invalid {name}")
+    value = int(raw)
+    if not minimum <= value <= maximum:
+        raise HTTPException(400, f"invalid {name}")
+    return value
+
+
+def _event_cursor(request: Request) -> int:
+    raw = request.headers.get("last-event-id", "0")
+    if (
+        not raw
+        or len(raw) > len(str(MAX_REPLAY_SEQUENCE))
+        or not raw.isascii()
+        or not raw.isdigit()
+    ):
+        raise HTTPException(400, "invalid event cursor")
+    cursor = int(raw)
+    if cursor > MAX_REPLAY_SEQUENCE:
+        raise HTTPException(400, "invalid event cursor")
+    return cursor
+
+
+def _replay_response(value: DurableReplay) -> dict[str, object]:
+    return {
+        "identity": {
+            "agent_id": value.identity.agent_id,
+            "conversation_id": value.identity.conversation_id,
+            "turn_id": value.identity.turn_id,
+            "run_id": value.identity.run_id,
+        },
+        "availability": value.availability,
+        "oldest_cursor": value.oldest_cursor,
+        "latest_cursor": value.latest_cursor,
+        "next_cursor": value.next_cursor,
+        "has_more": value.has_more,
+        "events": [event.to_dict() for event in value.events],
+        "gaps": [gap.to_dict() for gap in value.gaps],
+        "snapshot": value.snapshot.to_dict(),
+    }
+
+
+def _summary_context_response(value: DurableReplay) -> dict[str, object]:
+    """Project only the public run.started metadata from validated replay."""
+
+    try:
+        document = value.snapshot.document
+    except (AssertionError, json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("durable context summary is invalid") from exc
+    started = document.get("started")
+    context_plan = (
+        started.get("context_plan") if isinstance(started, dict) else None
+    )
+    if (
+        not isinstance(context_plan, dict)
+        or set(context_plan) != _CONTEXT_METADATA_FIELDS
+        or any(
+            not isinstance(key, str)
+            or not isinstance(item, (str, int))
+            or isinstance(item, bool)
+            for key, item in context_plan.items()
+        )
+    ):
+        raise ValueError("durable context summary is invalid")
+    return {
+        "identity": {
+            "agent_id": value.identity.agent_id,
+            "conversation_id": value.identity.conversation_id,
+            "turn_id": value.identity.turn_id,
+            "run_id": value.identity.run_id,
+        },
+        "availability": "summary_only",
+        "context_plan": dict(context_plan),
+        "renderer": {
+            "version": None,
+            "leading_system_sections_merged": None,
+            "leading_system_section_count": None,
+            "description": (
+                "Exact renderer and section metadata are not retained in the "
+                "durable run.started summary."
+            ),
+        },
+        "provider_message_count": None,
+        "sections": [],
+        "content_exposure": "unavailable",
+        "notice": (
+            "The exact ContextPlan and section content are no longer resident; "
+            "only validated public metadata from durable run.started is available."
+        ),
+    }
+
+
+def _sse_frame(
+    event: str,
+    data: dict[str, object],
+    *,
+    event_id: int | None = None,
+) -> str:
+    encoded = json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    prefix = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{prefix}event: {event}\ndata: {encoded}\n\n"
+
+
+def _canonical_sse_frame(event: Any) -> str:
+    return _sse_frame(event.kind, event.to_dict(), event_id=event.seq)
+
+
+def _durable_replay_frames(
+    value: DurableReplay,
+    *,
+    after: int,
+) -> tuple[str, ...]:
+    """Interleave explicit gap controls with canonical events by sequence."""
+
+    ordered: list[tuple[int, int, object]] = []
+    for gap in value.gaps:
+        effective_from = max(after + 1, gap.from_seq)
+        if effective_from <= gap.to_seq:
+            ordered.append((effective_from, 0, gap))
+    ordered.extend((event.seq, 1, event) for event in value.events)
+    ordered.sort(key=lambda item: (item[0], item[1]))
+
+    frames: list[str] = []
+    for _sequence, item_type, item in ordered:
+        if item_type == 0:
+            gap = item
+            frames.append(
+                _sse_frame(
+                    "stream.gap",
+                    {
+                        "control_version": STREAM_CONTROL_VERSION,
+                        "run_id": value.identity.run_id,
+                        "from_seq": max(after + 1, gap.from_seq),
+                        "to_seq": gap.to_seq,
+                        "reason": gap.reason,
+                        "resume_cursor": gap.to_seq,
+                    },
+                    # A retention gap is followed by the authoritative
+                    # snapshot at the same cursor.  Only that snapshot may
+                    # acknowledge the cursor; otherwise a disconnect between
+                    # the two controls could make a reconnect skip it.
+                    event_id=(
+                        None if gap.reason == "retention" else gap.to_seq
+                    ),
+                )
+            )
+        else:
+            frames.append(_canonical_sse_frame(item))
+
+    if (
+        value.availability == "snapshot_only"
+        and after < value.snapshot.through_seq
+    ):
+        frames.append(
+            _sse_frame(
+                "stream.snapshot",
+                {
+                    "control_version": STREAM_CONTROL_VERSION,
+                    "run_id": value.identity.run_id,
+                    "cursor": value.snapshot.through_seq,
+                    "availability": value.availability,
+                    "snapshot": value.snapshot.to_dict(),
+                },
+                event_id=value.snapshot.through_seq,
+            )
+        )
+    return tuple(frames)
+
+
 def create_app(repository_root: Path | None = None) -> FastAPI:
     root = (repository_root or _repository_root()).resolve(strict=True)
     source = _source_root().resolve(strict=True)
@@ -339,15 +562,18 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         sessions = SessionService(project_token, ttl_seconds=SESSION_SECONDS)
         run_service = RunService(root, source)
         await run_service.initialize()
+        query_engines = QueryEngineRegistry(run_service, PROTOTYPE_AGENT_ID)
         app.state.sessions = sessions
         app.state.run_service = run_service
-        app.state.commands = CommandBus(run_service)
+        app.state.query_engines = query_engines
+        app.state.commands = CommandBus(query_engines)
         app.state.login_limiter = LoginLimiter()
         app.state.cookie_secure = cookie_secure
         try:
             yield
         finally:
             sessions.revoke_all()
+            await query_engines.close()
             await run_service.close()
 
     app = FastAPI(
@@ -508,7 +734,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
     async def list_conversations(request: Request) -> dict[str, object]:
         _require_session(request)
         try:
-            conversations = await request.app.state.run_service.list_conversations()
+            conversations = await request.app.state.query_engines.list_conversations()
         except ConversationStoreUnavailableError as exc:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return {
@@ -525,7 +751,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if not isinstance(title, str):
             raise HTTPException(400, "title must be a string")
         try:
-            conversation = await request.app.state.run_service.create_conversation(
+            conversation = await request.app.state.query_engines.create_conversation(
                 title
             )
         except ValueError as exc:
@@ -544,7 +770,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
         try:
-            conversation = await request.app.state.run_service.get_conversation(
+            conversation = await request.app.state.query_engines.get_conversation(
                 conversation_id
             )
         except ConversationNotFoundError as exc:
@@ -561,7 +787,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
         try:
-            result = await request.app.state.run_service.delete_conversation(
+            result = await request.app.state.query_engines.delete_conversation(
                 conversation_id
             )
         except ConversationConflictError as exc:
@@ -636,29 +862,111 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         _require_session(request)
         if not RUN_ID.fullmatch(run_id):
             raise HTTPException(404, "run not found")
+        cursor = _event_cursor(request)
+        replay_page: DurableReplay | None = None
         try:
-            request.app.state.run_service.get(run_id)
-        except KeyError as exc:
-            raise HTTPException(404, "run not found") from exc
-        raw_cursor = request.headers.get("last-event-id", "0")
-        try:
-            cursor = int(raw_cursor)
-        except ValueError as exc:
-            raise HTTPException(400, "invalid event cursor") from exc
-        if cursor < 0 or cursor > 1_000_000:
-            raise HTTPException(400, "invalid event cursor")
+            await request.app.state.query_engines.get_run(run_id)
+            stream_source = "live"
+        except QueryEngineOwnershipError:
+            stream_source = "durable"
+            try:
+                replay_page = await request.app.state.query_engines.replay(
+                    run_id,
+                    after=cursor,
+                    limit=MAX_REPLAY_PAGE,
+                )
+            except QueryEngineOwnershipError as exc:
+                raise HTTPException(404, "run not found") from exc
+            except ConversationConflictError as exc:
+                raise HTTPException(409, "run replay is unavailable") from exc
+            except QueryReplayCursorError as exc:
+                raise HTTPException(
+                    416, "replay cursor is outside the durable Run"
+                ) from exc
+            except (
+                ConversationStoreUnavailableError,
+                QueryReplayUnavailableError,
+            ) as exc:
+                raise HTTPException(
+                    503, "durable replay is unavailable"
+                ) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run stream is unavailable") from exc
 
         async def stream() -> AsyncIterator[str]:
-            async for envelope in request.app.state.run_service.stream(run_id, cursor):
-                if await request.is_disconnected():
+            if stream_source == "live":
+                try:
+                    async for envelope in request.app.state.query_engines.stream(
+                        run_id, cursor
+                    ):
+                        if await request.is_disconnected():
+                            return
+                        if envelope is None:
+                            yield ": heartbeat\n\n"
+                            continue
+                        yield _canonical_sse_frame(envelope)
+                except (KeyError, ConversationNotFoundError):
+                    # The source was fixed to live during preflight.  A
+                    # retention/delete race ends this stream; it never switches
+                    # to replay and therefore cannot double-publish events.
                     return
-                if envelope is None:
-                    yield ": heartbeat\n\n"
-                    continue
-                encoded = json.dumps(
-                    envelope.to_dict(), ensure_ascii=False, separators=(",", ":")
-                )
-                yield f"id: {envelope.seq}\nevent: {envelope.kind}\ndata: {encoded}\n\n"
+                return
+
+            assert replay_page is not None
+            expected_identity = replay_page.identity
+            page = replay_page
+            page_after = cursor
+            while True:
+                try:
+                    handle = (
+                        await request.app.state.query_engines.resolve_run_identity(
+                            run_id
+                        )
+                    )
+                except (
+                    KeyError,
+                    ConversationNotFoundError,
+                    ConversationConflictError,
+                    ConversationStoreUnavailableError,
+                    QueryReplayUnavailableError,
+                ):
+                    # Revalidate immediately before publishing a prefetched
+                    # durable page so a delete race does not leak stale state.
+                    return
+                if (
+                    handle.agent_id != expected_identity.agent_id
+                    or handle.conversation_id
+                    != expected_identity.conversation_id
+                    or handle.turn_id != expected_identity.turn_id
+                    or handle.run_id != expected_identity.run_id
+                ):
+                    return
+
+                for frame in _durable_replay_frames(page, after=page_after):
+                    if await request.is_disconnected():
+                        return
+                    yield frame
+                if not page.has_more:
+                    return
+                next_cursor = page.next_cursor
+                try:
+                    page = await request.app.state.query_engines.replay(
+                        run_id,
+                        after=next_cursor,
+                        limit=MAX_REPLAY_PAGE,
+                    )
+                except (
+                    KeyError,
+                    ConversationNotFoundError,
+                    ConversationConflictError,
+                    ConversationStoreUnavailableError,
+                    QueryReplayCursorError,
+                    QueryReplayUnavailableError,
+                ):
+                    return
+                if page.identity != expected_identity:
+                    return
+                page_after = next_cursor
 
         return StreamingResponse(
             stream(),
@@ -669,16 +977,105 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             },
         )
 
+    @app.get("/api/runs/{run_id}/context")
+    async def inspect_run_context(run_id: str, request: Request) -> Response:
+        """Return a no-store, content-withholding operator context view."""
+
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if request.query_params:
+            raise HTTPException(400, "unsupported context query parameter")
+        try:
+            exact = await request.app.state.query_engines.inspect_retained_context(
+                run_id
+            )
+        except QueryRunNotRetainedError:
+            exact = None
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run context is unavailable") from exc
+        except QueryContextUnavailableError as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        if exact is not None:
+            return JSONResponse(
+                exact.to_dict(), headers={"Cache-Control": "no-store"}
+            )
+
+        try:
+            replay = await request.app.state.query_engines.replay(
+                run_id,
+                after=0,
+                limit=1,
+            )
+            summary = _summary_context_response(replay)
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run context is unavailable") from exc
+        except (
+            ConversationStoreUnavailableError,
+            QueryReplayCursorError,
+            QueryReplayUnavailableError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        return JSONResponse(summary, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/runs/{run_id}/replay")
+    async def replay_run(run_id: str, request: Request) -> dict[str, object]:
+        """Return one bounded page from the durable semantic Run journal."""
+
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if set(request.query_params.keys()) - {"after", "limit"}:
+            raise HTTPException(400, "unsupported replay query parameter")
+        after = _replay_query_integer(
+            request,
+            "after",
+            default=0,
+            minimum=0,
+            maximum=MAX_REPLAY_SEQUENCE,
+        )
+        limit = _replay_query_integer(
+            request,
+            "limit",
+            default=MAX_REPLAY_PAGE,
+            minimum=1,
+            maximum=MAX_REPLAY_PAGE,
+        )
+        try:
+            value = await request.app.state.query_engines.replay(
+                run_id,
+                after=after,
+                limit=limit,
+            )
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run replay is unavailable") from exc
+        except QueryReplayCursorError as exc:
+            raise HTTPException(
+                416, "replay cursor is outside the durable Run"
+            ) from exc
+        except (
+            ConversationStoreUnavailableError,
+            QueryReplayUnavailableError,
+        ) as exc:
+            raise HTTPException(503, "durable replay is unavailable") from exc
+        return _replay_response(value)
+
     @app.post("/api/runs/{run_id}/cancel", status_code=202)
     async def cancel_run(run_id: str, request: Request) -> dict[str, bool]:
         _require_csrf(request)
         if not RUN_ID.fullmatch(run_id):
             raise HTTPException(404, "run not found")
         try:
-            request.app.state.run_service.get(run_id)
+            await request.app.state.commands.cancel(run_id)
         except KeyError as exc:
             raise HTTPException(404, "run not found") from exc
-        await request.app.state.commands.cancel(run_id)
         return {"accepted": True}
 
     return app

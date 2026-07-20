@@ -20,6 +20,12 @@ dev = [
 package = false
 default-groups = ["dev"]
 
+# Make this checkout an explicit workspace root.  Without the empty workspace
+# marker, uv can adopt a nested cold-checkout into an unrelated parent project
+# and read or write outside the checkout selected by --project.
+[tool.uv.workspace]
+members = []
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 asyncio_mode = "auto"

@@ -15,6 +15,20 @@ import stat
 import subprocess
 import sys
 import time
+from typing import Sequence
+
+_SOURCE_ROOT = Path(__file__).resolve().parent.parent / "src"
+try:
+    sys.path.remove(str(_SOURCE_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(_SOURCE_ROOT))
+
+from agent_builder_v2.sync_counter import (
+    COUNTER_ABI,
+    SyncCounterError,
+    qualification_environment,
+)
 
 
 _CAPTURE_FLUSH_INTERVAL_SECONDS = 0.75
@@ -24,6 +38,7 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--new-session", action="store_true")
     parser.add_argument("--clean-env", action="store_true")
+    parser.add_argument("--qualification-sync-counter", action="store_true")
     parser.add_argument("--runtime-root", required=True)
     parser.add_argument("--log-file", required=True)
     parser.add_argument("--pid-file", required=True)
@@ -142,6 +157,28 @@ def _process_marker(pid: int) -> str:
     return f"linux:{fields[19]}"
 
 
+def _process_parent_and_group(pid: int) -> tuple[int, int]:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    closing = raw.rfind(")")
+    fields = raw[closing + 1 :].split() if closing >= 0 else []
+    if len(fields) < 3 or not fields[1].isdigit() or not fields[2].isdigit():
+        raise ValueError("process stat has no valid parent/group identity")
+    return int(fields[1]), int(fields[2])
+
+
+def _process_argv(pid: int) -> tuple[str, ...]:
+    raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    if not raw or len(raw) > 4096 or not raw.endswith(b"\0"):
+        raise ValueError("process command line is invalid")
+    try:
+        values = tuple(part.decode() for part in raw[:-1].split(b"\0"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("process command line is not UTF-8") from exc
+    if not values or len(values) > 32 or any(not value for value in values):
+        raise ValueError("process command line is invalid")
+    return values
+
+
 def _write_all(descriptor: int, payload: bytes) -> None:
     view = memoryview(payload)
     while view:
@@ -151,7 +188,12 @@ def _write_all(descriptor: int, payload: bytes) -> None:
         view = view[written:]
 
 
-def _publish_gateway_pid_record(path: Path, checkout: Path) -> None:
+def _publish_gateway_pid_record(
+    path: Path,
+    checkout: Path,
+    *,
+    qualification_sync_counter: bool = False,
+) -> None:
     pid = os.getpid()
     pgid = os.getpgrp()
     if pgid != pid:
@@ -163,6 +205,7 @@ def _publish_gateway_pid_record(path: Path, checkout: Path) -> None:
         f"pgid={pgid}\n"
         f"marker={_process_marker(pid)}\n"
         f"root={checkout}\n"
+        + (f"sync_counter={COUNTER_ABI}\n" if qualification_sync_counter else "")
     ).encode("utf-8")
     temporary = path.parent / f".gateway.pid.{pid}.{time.monotonic_ns()}.tmp"
     no_follow = getattr(os, "O_NOFOLLOW", None)
@@ -200,6 +243,115 @@ def _publish_gateway_pid_record(path: Path, checkout: Path) -> None:
         or stat.S_IMODE(metadata.st_mode) != 0o600
     ):
         raise RuntimeError("gateway PID record publication was unsafe")
+    directory = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _publish_gateway_child_identity(
+    path: Path,
+    checkout: Path,
+    child_pid: int,
+    expected_argv: Sequence[str],
+    *,
+    qualification_sync_counter: bool = False,
+) -> None:
+    """Atomically add the real Web process identity after successful exec.
+
+    The supervisor remains the process-group authority used by start/stop.
+    Qualification needs the child identity as well because application SQLite
+    and broker I/O are charged to that process, not to the log supervisor.
+    """
+
+    supervisor_pid = os.getpid()
+    supervisor_pgid = os.getpgrp()
+    child_parent, child_pgid = _process_parent_and_group(child_pid)
+    if (
+        supervisor_pgid != supervisor_pid
+        or child_parent != supervisor_pid
+        or child_pgid != supervisor_pgid
+        or _process_argv(child_pid) != tuple(expected_argv)
+        or Path(os.readlink(f"/proc/{child_pid}/cwd")) != checkout
+    ):
+        raise RuntimeError("gateway child escaped its managed process group")
+    existing = path.lstat()
+    if (
+        not stat.S_ISREG(existing.st_mode)
+        or existing.st_uid != os.getuid()
+        or existing.st_nlink != 1
+        or stat.S_IMODE(existing.st_mode) != 0o600
+        or existing.st_size > 4096
+    ):
+        raise RuntimeError("gateway PID record changed before child publication")
+    expected = (
+        "schema=1\n"
+        "role=gateway\n"
+        f"pid={supervisor_pid}\n"
+        f"pgid={supervisor_pgid}\n"
+        f"marker={_process_marker(supervisor_pid)}\n"
+        f"root={checkout}\n"
+        + (f"sync_counter={COUNTER_ABI}\n" if qualification_sync_counter else "")
+    ).encode("utf-8")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        current = os.read(descriptor, 4097)
+        current_metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if (
+        current != expected
+        or current_metadata.st_dev != existing.st_dev
+        or current_metadata.st_ino != existing.st_ino
+    ):
+        raise RuntimeError("gateway PID record identity changed before child publication")
+
+    payload = expected + (
+        f"web_pid={child_pid}\n"
+        f"web_marker={_process_marker(child_pid)}\n"
+    ).encode("utf-8")
+    temporary = path.parent / (
+        f".gateway.pid.{supervisor_pid}.{time.monotonic_ns()}.tmp"
+    )
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        raise RuntimeError("secure PID records require O_NOFOLLOW")
+    temporary_descriptor: int | None = None
+    try:
+        temporary_descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | no_follow,
+            0o600,
+        )
+        os.fchmod(temporary_descriptor, 0o600)
+        _write_all(temporary_descriptor, payload)
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+        os.replace(temporary, path)
+    finally:
+        if temporary_descriptor is not None:
+            os.close(temporary_descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+    published = path.lstat()
+    if (
+        not stat.S_ISREG(published.st_mode)
+        or published.st_uid != os.getuid()
+        or published.st_nlink != 1
+        or stat.S_IMODE(published.st_mode) != 0o600
+        or published.st_size != len(payload)
+    ):
+        raise RuntimeError("gateway child identity publication was unsafe")
     directory = os.open(
         path.parent,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
@@ -451,10 +603,29 @@ def main() -> int:
     if args.new_session and os.name != "nt" and os.getpid() != os.getsid(0):
         os.setsid()
 
+    qualification_values: dict[str, str] = {}
+    if args.qualification_sync_counter:
+        try:
+            qualification_root = Path(
+                os.environ["AGENT_BUILDER_ROOT"]
+            ).resolve(strict=True)
+            qualification_values = qualification_environment(
+                qualification_root,
+                os.environ,
+                expected_role="supervisor",
+            )
+        except (KeyError, OSError, SyncCounterError):
+            print(
+                "agent-builder log supervisor: invalid qualification counter configuration",
+                file=sys.stderr,
+            )
+            return 2
+
     child_environment = os.environ.copy()
     if args.clean_env:
         already_clean = os.environ.get("_HARNESS_V2_CLEAN_ENV") == "1"
         child_environment = _sanitised_environment(os.environ)
+        child_environment.update(qualification_values)
         child_environment["_HARNESS_V2_CLEAN_ENV"] = "1"
         if not already_clean:
             os.execve(
@@ -499,7 +670,11 @@ def main() -> int:
         signal.signal(signum, forward)
 
     try:
-        _publish_gateway_pid_record(pid_path, checkout)
+        _publish_gateway_pid_record(
+            pid_path,
+            checkout,
+            qualification_sync_counter=args.qualification_sync_counter,
+        )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"agent-builder log supervisor: {exc}", file=sys.stderr)
         handler.close()
@@ -510,14 +685,40 @@ def main() -> int:
         return 128 + stop_requested
 
     try:
+        gateway_environment = child_environment
+        if args.qualification_sync_counter:
+            try:
+                gateway_environment = {
+                    **child_environment,
+                    **qualification_environment(
+                        checkout,
+                        child_environment,
+                        expected_role="supervisor",
+                        child_role="gateway",
+                    ),
+                }
+            except SyncCounterError:
+                _write(handler, "gateway qualification counter validation failed\n")
+                return 2
         child = subprocess.Popen(
             args.command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env=child_environment,
+            env=gateway_environment,
             bufsize=0,
         )
+        try:
+            _publish_gateway_child_identity(
+                pid_path,
+                checkout,
+                child.pid,
+                args.command,
+                qualification_sync_counter=args.qualification_sync_counter,
+            )
+        except (OSError, RuntimeError, ValueError):
+            _write(handler, "gateway child identity publication failed\n")
+            return 127
         if stop_requested is not None and child.poll() is None:
             child.send_signal(stop_requested)
 

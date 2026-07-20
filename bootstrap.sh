@@ -144,7 +144,10 @@ install_uv() {
 }
 
 install_python_environment() {
-    local sync_arguments=(sync --frozen --managed-python --no-build --python "$PYTHON_VERSION")
+    local sync_arguments=(
+        sync --project "$ROOT" --frozen --managed-python --no-build
+        --python "$PYTHON_VERSION"
+    )
     [[ -f "$ROOT/uv.lock" ]] || fail "uv.lock is missing"
     [[ "$OFFLINE" == false ]] || sync_arguments+=(--offline)
     log "syncing the frozen minimal Python environment"

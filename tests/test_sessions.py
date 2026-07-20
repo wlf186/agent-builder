@@ -7,12 +7,16 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 from threading import Event
+import time
 
 import pytest
 
 import agent_builder_v2.sessions as sessions_module
-from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.contracts import RUN_CURSOR_RESERVED_THROUGH, EventEnvelope
+from agent_builder_v2.replay import PROJECTION_VERSION
 from agent_builder_v2.sessions import (
     DATABASE_NAME,
     MAX_ASSISTANT_CONTENT_BYTES,
@@ -26,9 +30,12 @@ from agent_builder_v2.sessions import (
     conversation_message_id,
 )
 from agent_builder_v2.state import EventJournal
+from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
 
 
 AGENT_ID = "00000000-0000-4000-8000-000000000001"
+PLAN_DIGEST = "a" * 64
+SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
 def _id(value: int) -> str:
@@ -39,6 +46,147 @@ def _database(tmp_path: Path) -> Path:
     root = tmp_path / "data" / "agents" / AGENT_ID
     root.mkdir(parents=True, mode=0o700)
     return root / DATABASE_NAME
+
+
+def _started_payload() -> dict[str, object]:
+    return {
+        "prototype": True,
+        "model": "qwen3.5:2b",
+        "visible_tools": ["builtin/echo"],
+        "sandbox": "harness-v2-worker-v1",
+        "context_plan": {
+            "plan_id": f"context-{PLAN_DIGEST[:24]}",
+            "digest": PLAN_DIGEST,
+            "toolset_digest": toolset_digest(prototype_tool_specs()),
+            "section_count": 3,
+            "history_message_count": 0,
+            "included_history_message_count": 0,
+            "omitted_history_message_count": 0,
+            "history_source_digest": "b" * 64,
+            "windowing_strategy": "full",
+            "estimated_input_tokens": 1_024,
+            "native_context_tokens": 262_144,
+            "operational_context_tokens": 32_768,
+            "input_budget_tokens": 30_720,
+            "compact_at_tokens": 24_576,
+            "compact_target_tokens": 18_432,
+            "output_reserve_tokens": 2_048,
+            "template_reserve_tokens": 256,
+            "estimator": "utf8-bytes-upper-bound-v1",
+        },
+    }
+
+
+def _boundary_started_payload() -> dict[str, object]:
+    return {
+        **_started_payload(),
+        "protocol_features": ["model-call-boundaries-v1"],
+    }
+
+
+def _model_request_payload(
+    iteration: int = 1,
+    *,
+    estimated_input_tokens: int = 1_024,
+) -> dict[str, object]:
+    return {
+        "request_id": f"model-{iteration}",
+        "iteration": iteration,
+        "context_plan_id": f"context-{PLAN_DIGEST[:24]}",
+        "context_plan_digest": PLAN_DIGEST,
+        "request_digest": f"{iteration:x}" * 64,
+        "request_bytes": 512,
+        "estimated_input_tokens": estimated_input_tokens,
+        "message_count": 2,
+        "tool_count": 1 if iteration == 1 else 0,
+        "tool_result_call_ids": [],
+    }
+
+
+def _model_response_payload(
+    iteration: int = 1,
+    *,
+    input_tokens: int = 23,
+    output_tokens: int = 4,
+) -> dict[str, object]:
+    return {
+        "request_id": f"model-{iteration}",
+        "iteration": iteration,
+        "outcome": "end_turn",
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "usage_complete": True,
+        "error_code": None,
+    }
+
+
+def _usage(*, complete: bool = True) -> dict[str, object]:
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "last_input_tokens": 0,
+        "complete": complete,
+    }
+
+
+def _canonical_payload(kind: str) -> dict[str, object]:
+    if kind == "run.started":
+        return _started_payload()
+    if kind == "run.completed":
+        return {
+            "reason": "end_turn",
+            "model_iterations": 1,
+            "usage": _usage(),
+        }
+    if kind == "run.failed":
+        return {
+            "code": "worker_failure",
+            "message": "The prototype Worker stopped unexpectedly.",
+            "retryable": False,
+            "usage": _usage(),
+        }
+    if kind == "run.cancelled":
+        return {"reason": "cancelled", "usage": _usage()}
+    return {"kind": kind}
+
+
+def _kill_child_after_marker(
+    tmp_path: Path,
+    name: str,
+    source: str,
+    *arguments: str,
+) -> None:
+    marker = tmp_path / f"{name}.ready"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            source,
+            *arguments,
+            str(marker),
+            str(SOURCE_ROOT),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline and not marker.is_file():
+        if process.poll() is not None:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise AssertionError(
+                f"crash child exited before its marker: {stderr[-2000:]}"
+            )
+        time.sleep(0.01)
+    if not marker.is_file():
+        process.kill()
+        process.wait(timeout=5.0)
+        raise AssertionError("crash child did not reach its failpoint")
+    process.kill()
+    assert process.wait(timeout=5.0) < 0
 
 
 def _event(
@@ -60,7 +208,7 @@ def _event(
         occurred_at=f"2026-07-18T00:00:{seq:02d}.000Z",
         kind=kind,
         durability="durable",
-        payload=payload if payload is not None else {"kind": kind},
+        payload=payload if payload is not None else _canonical_payload(kind),
     )
 
 
@@ -240,12 +388,869 @@ def test_begin_and_finalize_atomically_persist_canonical_boundary_events(
         assert [event["kind"] for event in journal.events_for_run(run_id)] == [
             "run.started"
         ]
+        started_state = store.get_run_journal_state(run_id)
+        assert started_state.reserved_through == RUN_CURSOR_RESERVED_THROUGH
+        assert started_state.latest_durable_seq == 1
+        assert started_state.terminal_seq is None
 
         store.finalize_completed(run_id, "done", terminal)
         assert [event["kind"] for event in journal.events_for_run(run_id)] == [
             "run.started",
             "run.completed",
         ]
+        terminal_state = store.get_run_journal_state(run_id)
+        assert terminal_state.terminal_seq == 2
+        assert terminal_state.terminal_kind == "run.completed"
+        assert terminal_state.event_count == 2
+        identity = store.resolve_run_identity(run_id)
+        assert identity.agent_id == AGENT_ID
+        assert identity.conversation_id == conversation_id
+        assert identity.turn_id == turn_id
+        snapshot = store.read_run_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.version == PROJECTION_VERSION
+        assert snapshot.identity == identity
+        assert snapshot.through_seq == 2
+        assert snapshot.complete is True
+        assert snapshot.document == {
+            "blocks": [],
+            "model_calls": [],
+            "started": _started_payload(),
+            "terminal": {
+                "kind": "run.completed",
+                "payload": {
+                    "reason": "end_turn",
+                    "model_iterations": 1,
+                    "usage": _usage(),
+                },
+            },
+            "tools": [],
+        }
+        assert store.get_run_snapshot(run_id) == snapshot.to_dict()
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_late_sqlite_faults_roll_back_turn_and_terminal_transactions(
+    tmp_path: Path,
+) -> None:
+    """A failure at each transaction tail must expose no semantic prefix."""
+
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    conversation_id, turn_id, run_id = _id(401), _id(402), _id(403)
+    started = _started(conversation_id, turn_id, run_id)
+    terminal = _completed(conversation_id, turn_id, run_id)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store._connection.executescript(
+            """
+            CREATE TRIGGER qualification_abort_begin_tail
+            BEFORE INSERT ON run_journal_state
+            BEGIN
+                SELECT RAISE(ABORT, 'qualification begin fault');
+            END;
+            """
+        )
+
+        with pytest.raises(ConversationConflictError):
+            store.begin_turn(
+                conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                user_content="must roll back",
+                expected_revision=0,
+                started_event=started,
+            )
+
+        after_begin_fault = store.get_conversation(conversation_id)
+        assert after_begin_fault.revision == 0
+        assert after_begin_fault.active_run_id is None
+        assert after_begin_fault.turns == ()
+        assert journal.events_for_run(run_id) == []
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM run_journal_state WHERE run_id = ?", (run_id,)
+        ).fetchone() == (0,)
+
+        store._connection.execute("DROP TRIGGER qualification_abort_begin_tail")
+        store._connection.commit()
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="retry after rollback",
+            expected_revision=0,
+            started_event=started,
+        )
+        store._connection.executescript(
+            """
+            CREATE TRIGGER qualification_abort_terminal_tail
+            BEFORE INSERT ON run_snapshots
+            BEGIN
+                SELECT RAISE(ABORT, 'qualification terminal fault');
+            END;
+            """
+        )
+
+        with pytest.raises(ConversationConflictError):
+            store.finalize_completed(run_id, "must not commit", terminal)
+
+        after_terminal_fault = store.get_conversation(conversation_id)
+        assert after_terminal_fault.revision == 1
+        assert after_terminal_fault.active_run_id == run_id
+        assert len(after_terminal_fault.turns) == 1
+        assert after_terminal_fault.turns[0].status == "running"
+        assert after_terminal_fault.turns[0].assistant_content is None
+        assert [event["kind"] for event in journal.events_for_run(run_id)] == [
+            "run.started"
+        ]
+        state = store.get_run_journal_state(run_id)
+        assert state.latest_durable_seq == 1
+        assert state.terminal_seq is None
+        assert store.read_run_snapshot(run_id) is None
+
+        store._connection.execute("DROP TRIGGER qualification_abort_terminal_tail")
+        store._connection.commit()
+        completed = store.finalize_completed(run_id, "committed once", terminal)
+        assert completed.status == "completed"
+        assert [event["kind"] for event in journal.events_for_run(run_id)] == [
+            "run.started",
+            "run.completed",
+        ]
+        assert store.get_run_journal_state(run_id).terminal_seq == 2
+        assert store.read_run_snapshot(run_id) is not None
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_late_tombstone_fault_rolls_back_every_degraded_run_mutation(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    conversation_id, turn_id, run_id = _id(420), _id(421), _id(422)
+    operation_id = _id(423)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="atomically tombstone a degraded Run",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        journal.append(
+            _event(
+                kind="assistant.block.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload={"block_id": "degraded-block", "block_type": "content"},
+            )
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="d" * 64,
+            context_plan_id="degraded-plan",
+            estimated_input_tokens=8,
+            hard_input_tokens=128,
+        )
+        store.record_operation_intent(
+            operation_id=operation_id,
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="e" * 64,
+            request_digest="f" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="degraded-call",
+        )
+        store.mark_operation_dispatched(
+            operation_id,
+            executor_kind="sandbox-runner",
+            executor_identity_digest="1" * 64,
+        )
+        before = store.get_run_journal_state(run_id)
+        store._connection.executescript(
+            f"""
+            CREATE TRIGGER qualification_abort_tombstone_tail
+            BEFORE UPDATE OF availability ON run_journal_state
+            WHEN OLD.run_id = '{run_id}' AND NEW.availability = 'pruned'
+            BEGIN
+                SELECT RAISE(ABORT, 'qualification tombstone fault');
+            END;
+            """
+        )
+
+        with pytest.raises(
+            ConversationStoreUnavailableError,
+            match="unavailable Run tombstone",
+        ):
+            store.finalize_noncompleted(run_id, "failed")
+
+        restored = store.get_conversation(conversation_id)
+        assert restored.active_run_id == run_id
+        assert restored.turns[0].status == "running"
+        assert [
+            event["kind"] for event in journal.events_for_run(run_id)
+        ] == ["run.started", "assistant.block.started"]
+        assert store.provider_usage_for_run(run_id)[0].status == "started"
+        duplicate = store.record_operation_intent(
+            operation_id=_id(424),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="e" * 64,
+            request_digest="f" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="degraded-call",
+        )
+        assert duplicate.changed is False
+        assert duplicate.record.status == "dispatched"
+        assert store.get_run_journal_state(run_id) == before
+
+        store._connection.execute("DROP TRIGGER qualification_abort_tombstone_tail")
+        store._connection.commit()
+        store.finalize_noncompleted(run_id, "failed")
+
+        terminal = store.get_conversation(conversation_id)
+        assert terminal.active_run_id is None
+        assert terminal.turns[0].status == "failed"
+        assert journal.events_for_run(run_id) == []
+        assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+        operation = store.record_operation_intent(
+            operation_id=_id(425),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="e" * 64,
+            request_digest="f" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="degraded-call",
+        )
+        assert operation.changed is False
+        assert operation.record.status == "outcome_unknown"
+        state = store.get_run_journal_state(run_id)
+        assert state.availability == "pruned"
+        assert state.event_count == state.durable_bytes == 0
+        assert state.terminal_seq is None
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_operation_and_provider_ledgers_are_idempotent_and_recover_unknown(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    conversation_id, turn_id, run_id = _id(43), _id(44), _id(45)
+    store.create_conversation(conversation_id=conversation_id)
+    store.begin_turn(
+        conversation_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        user_content="recover durable ledgers",
+        expected_revision=0,
+        started_event=_started(conversation_id, turn_id, run_id),
+    )
+    try:
+        intent = store.record_operation_intent(
+            operation_id=_id(46),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="a" * 64,
+            request_digest="b" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="call-1",
+        )
+        assert intent.changed is True
+        duplicate = store.record_operation_intent(
+            operation_id=_id(47),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="a" * 64,
+            request_digest="b" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="call-1",
+        )
+        assert duplicate.changed is False
+        assert duplicate.record.operation_id == _id(46)
+        with pytest.raises(ConversationConflictError, match="different operation"):
+            store.record_operation_intent(
+                operation_id=_id(48),
+                capability_id="builtin/test-mutation",
+                policy_revision="policy-v1",
+                idempotency_key_hash="a" * 64,
+                request_digest="c" * 64,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                call_id="call-1",
+            )
+        dispatched = store.mark_operation_dispatched(
+            _id(46),
+            executor_kind="sandbox-runner",
+            executor_identity_digest="d" * 64,
+        )
+        assert dispatched.changed is True
+        assert store.mark_operation_dispatched(
+            _id(46),
+            executor_kind="sandbox-runner",
+            executor_identity_digest="d" * 64,
+        ).changed is False
+
+        first_usage = store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="e" * 64,
+            context_plan_id="context-plan-1",
+            estimated_input_tokens=6,
+            hard_input_tokens=100,
+        )
+        assert first_usage.changed is True
+        completed_usage = store.complete_provider_usage(
+            run_id, 1, input_tokens=7, output_tokens=3
+        )
+        assert completed_usage.record.cost_minor_units is None
+        assert completed_usage.record.currency is None
+        assert store.complete_provider_usage(
+            run_id, 1, input_tokens=7, output_tokens=3
+        ).changed is False
+        store.start_provider_usage(
+            run_id,
+            2,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="e" * 64,
+            context_plan_id="context-plan-1",
+            estimated_input_tokens=10,
+            hard_input_tokens=100,
+        )
+
+        recovered = store.recover_running_as_interrupted()
+
+        assert [turn.status for turn in recovered] == ["interrupted"]
+        usages = store.provider_usage_for_run(run_id)
+        assert [item.status for item in usages] == ["complete", "incomplete"]
+        state = store.get_run_journal_state(run_id)
+        assert state.terminal_seq == 513
+        assert state.input_tokens == 7
+        assert state.output_tokens == 3
+        assert state.last_input_tokens == 7
+        assert state.usage_complete is False
+        recovered_operation = store.record_operation_intent(
+            operation_id=_id(49),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="a" * 64,
+            request_digest="b" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="call-1",
+        )
+        assert recovered_operation.changed is False
+        assert recovered_operation.record.status == "outcome_unknown"
+        assert store._connection.execute(
+            "SELECT ephemeral_loss FROM run_snapshots WHERE run_id = ?", (run_id,)
+        ).fetchone() == (1,)
+        snapshot = store.read_run_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.version == PROJECTION_VERSION
+        assert snapshot.through_seq == 513
+    finally:
+        store.close()
+
+
+def test_recovery_closes_an_inflight_model_boundary_before_terminal(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    conversation_id, turn_id, run_id = _id(301), _id(302), _id(303)
+    started_payload = {
+        **_started_payload(),
+        "protocol_features": ["model-call-boundaries-v1"],
+    }
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="recover provider stream",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=started_payload,
+            ),
+        )
+        journal.append(
+            _event(
+                kind="model.request.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload={
+                    "request_id": "model-1",
+                    "iteration": 1,
+                    "context_plan_id": f"context-{PLAN_DIGEST[:24]}",
+                    "context_plan_digest": PLAN_DIGEST,
+                    "request_digest": "c" * 64,
+                    "request_bytes": 512,
+                    "estimated_input_tokens": 1_024,
+                    "message_count": 2,
+                    "tool_count": 1,
+                    "tool_result_call_ids": [],
+                },
+            )
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+        )
+
+        recovered = store.recover_running_as_interrupted()
+
+        assert [item.status for item in recovered] == ["interrupted"]
+        events = journal.events_for_run(run_id)
+        assert [item["kind"] for item in events] == [
+            "run.started",
+            "model.request.started",
+            "model.response.finished",
+            "run.failed",
+        ]
+        assert events[-2]["payload"] == {
+            "request_id": "model-1",
+            "iteration": 1,
+            "outcome": "error",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "usage_complete": False,
+            "error_code": "control_restarted",
+        }
+        snapshot = store.read_run_snapshot(run_id)
+        assert snapshot is not None
+        model_calls = snapshot.document["model_calls"]
+        assert isinstance(model_calls, list)
+        assert model_calls[0]["state"] == "finished"
+        assert model_calls[0]["outcome"] == "error"
+        assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_provider_usage_boundaries_roll_back_as_one_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    conversation_id, turn_id, run_id = _id(330), _id(331), _id(332)
+    request_event = _event(
+        kind="model.request.started",
+        seq=2,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        payload=_model_request_payload(),
+    )
+    original_insert = store._insert_boundary_event
+
+    def fail_request_insert(event: EventEnvelope, encoded: str) -> None:
+        if event.kind == "model.request.started":
+            raise sqlite3.OperationalError("simulated request boundary failure")
+        original_insert(event, encoded)
+
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="provider boundary atomicity",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_boundary_started_payload(),
+            ),
+        )
+        monkeypatch.setattr(store, "_insert_boundary_event", fail_request_insert)
+        with pytest.raises(
+            ConversationStoreUnavailableError,
+            match="provider request boundary",
+        ):
+            store.start_provider_usage_with_event(
+                run_id,
+                1,
+                provider="ollama",
+                model="qwen3.5:2b",
+                profile_digest="d" * 64,
+                context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+                estimated_input_tokens=1_024,
+                hard_input_tokens=30_720,
+                boundary_event=request_event,
+            )
+
+        assert store.provider_usage_for_run(run_id) == ()
+        assert store._connection.execute(
+            "SELECT kind FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
+        ).fetchall() == [("run.started",)]
+        state = store.get_run_journal_state(run_id)
+        assert (state.latest_durable_seq, state.event_count) == (1, 1)
+
+        monkeypatch.setattr(store, "_insert_boundary_event", original_insert)
+        store.start_provider_usage_with_event(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+            boundary_event=request_event,
+        )
+        mismatched_response = _event(
+            kind="model.response.finished",
+            seq=3,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            payload=_model_response_payload(input_tokens=24),
+        )
+        with pytest.raises(ValueError, match="response boundary disagrees"):
+            store.complete_provider_usage_with_event(
+                run_id,
+                1,
+                input_tokens=23,
+                output_tokens=4,
+                boundary_event=mismatched_response,
+            )
+
+        def fail_response_insert(event: EventEnvelope, encoded: str) -> None:
+            if event.kind == "model.response.finished":
+                raise sqlite3.OperationalError(
+                    "simulated response boundary failure"
+                )
+            original_insert(event, encoded)
+
+        monkeypatch.setattr(store, "_insert_boundary_event", fail_response_insert)
+        with pytest.raises(
+            ConversationStoreUnavailableError,
+            match="provider response boundary",
+        ):
+            store.complete_provider_usage_with_event(
+                run_id,
+                1,
+                input_tokens=23,
+                output_tokens=4,
+                boundary_event=replace(
+                    mismatched_response,
+                    payload=_model_response_payload(),
+                ),
+            )
+
+        usage = store.provider_usage_for_run(run_id)
+        assert len(usage) == 1
+        assert usage[0].status == "started"
+        assert usage[0].input_tokens is None
+        assert usage[0].output_tokens is None
+        assert store._connection.execute(
+            "SELECT kind FROM events WHERE run_id = ? ORDER BY seq", (run_id,)
+        ).fetchall() == [
+            ("run.started",),
+            ("model.request.started",),
+        ]
+        state = store.get_run_journal_state(run_id)
+        assert (state.latest_durable_seq, state.event_count) == (2, 2)
+    finally:
+        store.close()
+
+
+def test_operation_capacity_failure_has_no_partial_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    monkeypatch.setattr(sessions_module, "MAX_OPERATION_RECORDS_PER_AGENT", 1)
+    try:
+        store.record_operation_intent(
+            operation_id=_id(53),
+            capability_id="lifecycle/test",
+            policy_revision="policy-v1",
+            idempotency_key_hash="1" * 64,
+            request_digest="2" * 64,
+        )
+        with pytest.raises(ConversationConflictError, match="capacity"):
+            store.record_operation_intent(
+                operation_id=_id(54),
+                capability_id="lifecycle/test",
+                policy_revision="policy-v1",
+                idempotency_key_hash="3" * 64,
+                request_digest="4" * 64,
+            )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM operation_ledger"
+        ).fetchone() == (1,)
+    finally:
+        store.close()
+
+
+def test_terminal_usage_must_match_provider_aggregate_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(55), _id(56), _id(57)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="usage consistency",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="5" * 64,
+            context_plan_id="context-plan-usage",
+            estimated_input_tokens=6,
+            hard_input_tokens=100,
+        )
+        store.complete_provider_usage(
+            run_id, 1, input_tokens=7, output_tokens=3
+        )
+        mismatched = _event(
+            kind="run.completed",
+            seq=2,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            payload={
+                "reason": "end_turn",
+                "model_iterations": 1,
+                "usage": {
+                    "input_tokens": 8,
+                    "output_tokens": 3,
+                    "last_input_tokens": 8,
+                    "complete": True,
+                }
+            },
+        )
+        with pytest.raises(ConversationConflictError, match="provider ledger"):
+            store.finalize_completed(run_id, "must roll back", mismatched)
+        assert store.get_conversation(conversation_id).turns[0].status == "running"
+        assert store.get_run_journal_state(run_id).terminal_seq is None
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone() == (1,)
+
+        usage = {
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "last_input_tokens": 7,
+            "complete": True,
+        }
+        terminal = replace(
+            mismatched, payload={**mismatched.payload, "usage": usage}
+        )
+        store.finalize_completed(run_id, "committed", terminal)
+        state = store.get_run_journal_state(run_id)
+        assert state.usage_complete is True
+        assert (state.input_tokens, state.output_tokens) == (7, 3)
+        snapshot = store.read_run_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.document["terminal"] == {
+            "kind": "run.completed",
+            "payload": {
+                "reason": "end_turn",
+                "model_iterations": 1,
+                "usage": usage,
+            },
+        }
+    finally:
+        store.close()
+
+
+def test_terminal_marks_started_provider_usage_incomplete_atomically(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(58), _id(59), _id(60)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="provider failed",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="6" * 64,
+            context_plan_id="context-plan-failed",
+            estimated_input_tokens=6,
+            hard_input_tokens=100,
+        )
+        usage = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "last_input_tokens": 0,
+            "complete": False,
+        }
+        store.finalize_noncompleted(
+            run_id,
+            "failed",
+            _event(
+                kind="run.failed",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload={
+                    "code": "provider_failed",
+                    "message": "failed",
+                    "retryable": False,
+                    "usage": usage,
+                },
+            ),
+        )
+        assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+        assert store.get_run_journal_state(run_id).usage_complete is False
+        snapshot = store.read_run_snapshot(run_id)
+        assert snapshot is not None
+        assert snapshot.document["terminal"]["payload"]["usage"] == usage  # type: ignore[index]
+    finally:
+        store.close()
+
+
+def test_strict_snapshot_read_detects_digest_and_identity_drift(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(61), _id(62), _id(63)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="strict snapshot",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        store.finalize_completed(
+            run_id, "done", _completed(conversation_id, turn_id, run_id)
+        )
+        original_digest = store._connection.execute(
+            "SELECT source_digest FROM run_snapshots WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        store._connection.execute(
+            "UPDATE run_snapshots SET source_digest = ? WHERE run_id = ?",
+            ("0" * 64, run_id),
+        )
+        with pytest.raises(ConversationConflictError, match="digest"):
+            store.read_run_snapshot(run_id)
+        store._connection.execute(
+            "UPDATE run_snapshots SET source_digest = ? WHERE run_id = ?",
+            (original_digest, run_id),
+        )
+
+        foreign_conversation = _id(64)
+        store.create_conversation(conversation_id=foreign_conversation)
+        store._connection.execute(
+            "UPDATE conversation_turns SET conversation_id = ? WHERE run_id = ?",
+            (foreign_conversation, run_id),
+        )
+        assert store.resolve_run_identity(run_id).conversation_id == foreign_conversation
+        with pytest.raises(ConversationConflictError, match="invalid"):
+            store.read_run_snapshot(run_id)
+    finally:
+        store.close()
+
+
+def test_snapshot_format_remains_readable_across_atomic_journal_prune(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    first_ids = (_id(71), _id(72), _id(73))
+    second_ids = (_id(74), _id(75), _id(76))
+    try:
+        for conversation_id, turn_id, run_id in (first_ids, second_ids):
+            store.create_conversation(conversation_id=conversation_id)
+            store.begin_turn(
+                conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                user_content="snapshot retention",
+                expected_revision=0,
+                started_event=_started(conversation_id, turn_id, run_id),
+            )
+            store.finalize_completed(
+                run_id,
+                "done",
+                _completed(conversation_id, turn_id, run_id),
+            )
+
+        before = store.read_run_snapshot(first_ids[2])
+        assert before is not None
+        assert journal.prune_to_recent_runs(1) == 2
+        after = store.read_run_snapshot(first_ids[2])
+        assert after == before
+        assert store.get_run_journal_state(first_ids[2]).availability == "snapshot_only"
+        replay = journal.replay(
+            first_ids[2], expected_identity=store.resolve_run_identity(first_ids[2])
+        )
+        assert replay is not None
+        assert replay.availability == "snapshot_only"
+        assert replay.snapshot == before
     finally:
         journal.close()
         store.close()
@@ -472,6 +1477,720 @@ def test_history_existence_and_rows_share_a_snapshot_during_delete(
         reader.close()
 
 
+def test_sigkill_cannot_commit_complete_usage_without_response_boundary(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    conversation_id, turn_id, run_id = _id(740), _id(741), _id(742)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="crash inside provider response commit",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_boundary_started_payload(),
+            ),
+        )
+        store.start_provider_usage_with_event(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+            boundary_event=_event(
+                kind="model.request.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_model_request_payload(),
+            ),
+        )
+    finally:
+        store.close()
+
+    completion_child = r"""
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[-1])
+from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.sessions import ConversationStore
+database, agent_id, conversation_id, turn_id, run_id, marker = sys.argv[1:-1]
+store = ConversationStore(Path(database), agent_id)
+original = store._insert_boundary_event
+def failpoint(event, encoded):
+    if event.kind == 'model.response.finished':
+        Path(marker).write_text('usage-updated-inside-transaction', encoding='utf-8')
+        time.sleep(30)
+    original(event, encoded)
+store._insert_boundary_event = failpoint
+store.complete_provider_usage_with_event(
+    run_id,
+    1,
+    input_tokens=23,
+    output_tokens=4,
+    boundary_event=EventEnvelope(
+        event_id='d' * 32,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        seq=3,
+        occurred_at='2026-07-19T00:00:03.000Z',
+        kind='model.response.finished',
+        durability='durable',
+        payload={
+            'request_id': 'model-1',
+            'iteration': 1,
+            'outcome': 'end_turn',
+            'input_tokens': 23,
+            'output_tokens': 4,
+            'usage_complete': True,
+            'error_code': None,
+        },
+    ),
+)
+"""
+    _kill_child_after_marker(
+        tmp_path,
+        "provider-response-transaction",
+        completion_child,
+        str(database),
+        AGENT_ID,
+        conversation_id,
+        turn_id,
+        run_id,
+    )
+
+    reopened = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    try:
+        usage_before_recovery = reopened.provider_usage_for_run(run_id)
+        assert len(usage_before_recovery) == 1
+        assert usage_before_recovery[0].status == "started"
+        assert usage_before_recovery[0].input_tokens is None
+        assert usage_before_recovery[0].output_tokens is None
+        assert [
+            event["kind"] for event in journal.events_for_run(run_id)
+        ] == ["run.started", "model.request.started"]
+        state = reopened.get_run_journal_state(run_id)
+        assert (state.latest_durable_seq, state.event_count) == (2, 2)
+
+        recovered = reopened.recover_running_as_interrupted()
+
+        assert [turn.run_id for turn in recovered] == [run_id]
+        assert reopened.recover_running_as_interrupted() == ()
+        final_events = journal.events_for_run(run_id)
+        assert [event["kind"] for event in final_events] == [
+            "run.started",
+            "model.request.started",
+            "model.response.finished",
+            "run.failed",
+        ]
+        assert final_events[-2]["payload"] == {
+            "request_id": "model-1",
+            "iteration": 1,
+            "outcome": "error",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "usage_complete": False,
+            "error_code": "control_restarted",
+        }
+        recovered_usage = reopened.provider_usage_for_run(run_id)
+        assert recovered_usage[0].status == "incomplete"
+        snapshot = reopened.read_run_snapshot(run_id)
+        assert snapshot is not None
+        model_calls = snapshot.document["model_calls"]
+        terminal = snapshot.document["terminal"]
+        assert isinstance(model_calls, list)
+        assert isinstance(terminal, dict)
+        assert model_calls[0]["outcome"] == "error"
+        assert terminal["payload"]["usage"] == {  # type: ignore[index]
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "last_input_tokens": 0,
+            "complete": False,
+        }
+    finally:
+        journal.close()
+        reopened.close()
+
+
+def test_sigkill_after_complete_response_commit_recovers_exact_usage(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    conversation_id, turn_id, run_id = _id(750), _id(751), _id(752)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="crash after provider response commit",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_boundary_started_payload(),
+            ),
+        )
+        store.start_provider_usage_with_event(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+            boundary_event=_event(
+                kind="model.request.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_model_request_payload(),
+            ),
+        )
+    finally:
+        store.close()
+
+    committed_child = r"""
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[-1])
+from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.sessions import ConversationStore
+database, agent_id, conversation_id, turn_id, run_id, marker = sys.argv[1:-1]
+store = ConversationStore(Path(database), agent_id)
+store.complete_provider_usage_with_event(
+    run_id,
+    1,
+    input_tokens=23,
+    output_tokens=4,
+    boundary_event=EventEnvelope(
+        event_id='e' * 32,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        seq=3,
+        occurred_at='2026-07-19T00:00:03.000Z',
+        kind='model.response.finished',
+        durability='durable',
+        payload={
+            'request_id': 'model-1',
+            'iteration': 1,
+            'outcome': 'end_turn',
+            'input_tokens': 23,
+            'output_tokens': 4,
+            'usage_complete': True,
+            'error_code': None,
+        },
+    ),
+)
+Path(marker).write_text('response-transaction-committed', encoding='utf-8')
+time.sleep(30)
+"""
+    _kill_child_after_marker(
+        tmp_path,
+        "provider-response-committed",
+        committed_child,
+        str(database),
+        AGENT_ID,
+        conversation_id,
+        turn_id,
+        run_id,
+    )
+
+    reopened = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    try:
+        committed_usage = reopened.provider_usage_for_run(run_id)
+        assert len(committed_usage) == 1
+        assert committed_usage[0].status == "complete"
+        assert (
+            committed_usage[0].input_tokens,
+            committed_usage[0].output_tokens,
+        ) == (23, 4)
+        assert [
+            event["kind"] for event in journal.events_for_run(run_id)
+        ] == [
+            "run.started",
+            "model.request.started",
+            "model.response.finished",
+        ]
+        assert reopened.get_run_journal_state(run_id).terminal_seq is None
+
+        recovered = reopened.recover_running_as_interrupted()
+
+        assert [turn.run_id for turn in recovered] == [run_id]
+        final_events = journal.events_for_run(run_id)
+        assert [event["kind"] for event in final_events] == [
+            "run.started",
+            "model.request.started",
+            "model.response.finished",
+            "run.failed",
+        ]
+        assert final_events[-2]["payload"] == _model_response_payload()
+        assert final_events[-1]["payload"]["usage"] == {
+            "input_tokens": 23,
+            "output_tokens": 4,
+            "last_input_tokens": 23,
+            "complete": True,
+        }
+        state = reopened.get_run_journal_state(run_id)
+        assert (state.input_tokens, state.output_tokens) == (23, 4)
+        assert state.last_input_tokens == 23
+        assert state.usage_complete is True
+        assert reopened.provider_usage_for_run(run_id)[0].status == "complete"
+        snapshot = reopened.read_run_snapshot(run_id)
+        assert snapshot is not None
+        model_calls = snapshot.document["model_calls"]
+        terminal = snapshot.document["terminal"]
+        assert isinstance(model_calls, list)
+        assert isinstance(terminal, dict)
+        assert model_calls[0]["outcome"] == "end_turn"
+        assert model_calls[0]["usage_complete"] is True
+        assert terminal["payload"] == final_events[-1]["payload"]
+    finally:
+        journal.close()
+        reopened.close()
+
+
+def test_sigkill_boundaries_recover_once_without_reusing_side_effects(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    first_conversation, first_turn, first_run = _id(700), _id(701), _id(702)
+    second_conversation, second_turn, second_run = _id(703), _id(704), _id(705)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=first_conversation)
+        store.begin_turn(
+            first_conversation,
+            turn_id=first_turn,
+            run_id=first_run,
+            user_content="crash after durable append",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                    conversation_id=first_conversation,
+                    turn_id=first_turn,
+                    run_id=first_run,
+                    payload=_started_payload(),
+            ),
+        )
+        store.start_provider_usage(
+            first_run,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="7" * 64,
+            context_plan_id="sigkill-plan",
+            estimated_input_tokens=8,
+            hard_input_tokens=128,
+        )
+        store.record_operation_intent(
+            operation_id=_id(706),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="8" * 64,
+            request_digest="9" * 64,
+            conversation_id=first_conversation,
+            turn_id=first_turn,
+            run_id=first_run,
+            call_id="sigkill-call",
+        )
+        store.mark_operation_dispatched(
+            _id(706),
+            executor_kind="sandbox-runner",
+            executor_identity_digest="a" * 64,
+        )
+
+        store.create_conversation(conversation_id=second_conversation)
+        store.begin_turn(
+            second_conversation,
+            turn_id=second_turn,
+            run_id=second_run,
+            user_content="crash after terminal commit",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                    conversation_id=second_conversation,
+                    turn_id=second_turn,
+                    run_id=second_run,
+                    payload=_started_payload(),
+            ),
+        )
+    finally:
+        store.close()
+
+    append_child = r"""
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[-1])
+from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.state import EventJournal
+database, agent_id, conversation_id, turn_id, run_id, marker = sys.argv[1:-1]
+journal = EventJournal(Path(database))
+journal.append(EventEnvelope(
+    event_id='b' * 32,
+    agent_id=agent_id,
+    conversation_id=conversation_id,
+    turn_id=turn_id,
+    run_id=run_id,
+    seq=2,
+    occurred_at='2026-07-19T00:00:02.000Z',
+    kind='assistant.block.started',
+    durability='durable',
+    payload={'block_id': 'sigkill-block', 'block_type': 'content'},
+))
+Path(marker).write_text('committed', encoding='utf-8')
+time.sleep(30)
+"""
+    _kill_child_after_marker(
+        tmp_path,
+        "append-commit",
+        append_child,
+        str(database),
+        AGENT_ID,
+        first_conversation,
+        first_turn,
+        first_run,
+    )
+
+    terminal_child = r"""
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[-1])
+from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.sessions import ConversationStore
+database, agent_id, conversation_id, turn_id, run_id, marker = sys.argv[1:-1]
+store = ConversationStore(Path(database), agent_id)
+store.finalize_noncompleted(run_id, 'failed', EventEnvelope(
+    event_id='c' * 32,
+    agent_id=agent_id,
+    conversation_id=conversation_id,
+    turn_id=turn_id,
+    run_id=run_id,
+    seq=2,
+    occurred_at='2026-07-19T00:00:02.000Z',
+    kind='run.failed',
+    durability='durable',
+    payload={
+        'code': 'simulated_failure',
+        'message': 'terminal committed before process death',
+        'retryable': False,
+        'usage': {
+            'input_tokens': 0,
+            'output_tokens': 0,
+            'last_input_tokens': 0,
+            'complete': True,
+        },
+    },
+))
+Path(marker).write_text('committed', encoding='utf-8')
+time.sleep(30)
+"""
+    _kill_child_after_marker(
+        tmp_path,
+        "terminal-commit",
+        terminal_child,
+        str(database),
+        AGENT_ID,
+        second_conversation,
+        second_turn,
+        second_run,
+    )
+
+    recovery_child = r"""
+import sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[-1])
+from agent_builder_v2.sessions import ConversationStore
+database, agent_id, marker = sys.argv[1:-1]
+store = ConversationStore(Path(database), agent_id)
+original = store._insert_boundary_event
+tripped = False
+def failpoint(event, encoded):
+    global tripped
+    original(event, encoded)
+    if not tripped and event.kind == 'assistant.block.discarded':
+        tripped = True
+        Path(marker).write_text('inside-transaction', encoding='utf-8')
+        time.sleep(30)
+store._insert_boundary_event = failpoint
+store.recover_running_as_interrupted()
+"""
+    _kill_child_after_marker(
+        tmp_path,
+        "recovery-transaction",
+        recovery_child,
+        str(database),
+        AGENT_ID,
+    )
+
+    reopened = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    try:
+        first_before = reopened.get_conversation(first_conversation)
+        assert first_before.active_run_id == first_run
+        assert first_before.turns[0].status == "running"
+        assert [
+            event["kind"] for event in journal.events_for_run(first_run)
+        ] == ["run.started", "assistant.block.started"]
+        assert reopened.provider_usage_for_run(first_run)[0].status == "started"
+        duplicate = reopened.record_operation_intent(
+            operation_id=_id(707),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="8" * 64,
+            request_digest="9" * 64,
+            conversation_id=first_conversation,
+            turn_id=first_turn,
+            run_id=first_run,
+            call_id="sigkill-call",
+        )
+        assert duplicate.changed is False
+        assert duplicate.record.status == "dispatched"
+
+        second = reopened.get_conversation(second_conversation)
+        assert second.active_run_id is None
+        assert second.turns[0].status == "failed"
+        assert [
+            event["kind"] for event in journal.events_for_run(second_run)
+        ] == ["run.started", "run.failed"]
+
+        recovered = reopened.recover_running_as_interrupted()
+        assert [turn.run_id for turn in recovered] == [first_run]
+        assert reopened.recover_running_as_interrupted() == ()
+        final_events = journal.events_for_run(first_run)
+        assert [event["kind"] for event in final_events] == [
+            "run.started",
+            "assistant.block.started",
+            "assistant.block.discarded",
+            "run.failed",
+        ]
+        assert len(
+            [event for event in final_events if event["kind"] == "run.failed"]
+        ) == 1
+        assert len({event["seq"] for event in final_events}) == len(final_events)
+        assert reopened.provider_usage_for_run(first_run)[0].status == "incomplete"
+        recovered_operation = reopened.record_operation_intent(
+            operation_id=_id(708),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="8" * 64,
+            request_digest="9" * 64,
+            conversation_id=first_conversation,
+            turn_id=first_turn,
+            run_id=first_run,
+            call_id="sigkill-call",
+        )
+        assert recovered_operation.changed is False
+        assert recovered_operation.record.status == "outcome_unknown"
+    finally:
+        journal.close()
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "replacement"),
+    (
+        ("oldest_available_seq", 2),
+        ("latest_durable_seq", 99),
+        ("reserved_through", 513),
+        ("availability", "pruned"),
+        ("event_count", 99),
+        ("durable_bytes", 99),
+        ("input_tokens", 1),
+    ),
+)
+def test_recovery_rejects_inconsistent_running_journal_metadata_atomically(
+    tmp_path: Path,
+    column: str,
+    replacement: object,
+) -> None:
+    database = _database(tmp_path)
+    conversation_id, turn_id, run_id = _id(720), _id(721), _id(722)
+    operation_id = _id(723)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="reject inconsistent recovery metadata",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        journal.append(
+            _event(
+                kind="assistant.block.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload={"block_id": "metadata-block", "block_type": "content"},
+            )
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qualified-model",
+            profile_digest="2" * 64,
+            context_plan_id="metadata-plan",
+            estimated_input_tokens=8,
+            hard_input_tokens=128,
+        )
+        store.record_operation_intent(
+            operation_id=operation_id,
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="3" * 64,
+            request_digest="4" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="metadata-call",
+        )
+        store.mark_operation_dispatched(
+            operation_id,
+            executor_kind="sandbox-runner",
+            executor_identity_digest="5" * 64,
+        )
+        before = store.get_run_journal_state(run_id)
+        allowed_columns = {
+            "oldest_available_seq",
+            "latest_durable_seq",
+            "reserved_through",
+            "availability",
+            "event_count",
+            "durable_bytes",
+            "input_tokens",
+        }
+        assert column in allowed_columns
+        store._connection.execute(
+            f"UPDATE run_journal_state SET {column} = ? WHERE run_id = ?",
+            (replacement, run_id),
+        )
+        store._connection.commit()
+        corrupted = store.get_run_journal_state(run_id)
+        assert corrupted != before
+
+        with pytest.raises(
+            ConversationConflictError,
+            match="journal metadata is inconsistent",
+        ):
+            store.recover_running_as_interrupted()
+
+        restored = store.get_conversation(conversation_id)
+        assert restored.active_run_id == run_id
+        assert restored.turns[0].status == "running"
+        assert [
+            event["kind"] for event in journal.events_for_run(run_id)
+        ] == ["run.started", "assistant.block.started"]
+        assert store.provider_usage_for_run(run_id)[0].status == "started"
+        operation = store.record_operation_intent(
+            operation_id=_id(724),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="3" * 64,
+            request_digest="4" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="metadata-call",
+        )
+        assert operation.changed is False
+        assert operation.record.status == "dispatched"
+        assert store.get_run_journal_state(run_id) == corrupted
+
+        store._connection.execute(
+            f"UPDATE run_journal_state SET {column} = ? WHERE run_id = ?",
+            (getattr(before, column), run_id),
+        )
+        store._connection.commit()
+        recovered = store.recover_running_as_interrupted()
+        assert [turn.run_id for turn in recovered] == [run_id]
+        assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+        operation = store.record_operation_intent(
+            operation_id=_id(725),
+            capability_id="builtin/test-mutation",
+            policy_revision="policy-v1",
+            idempotency_key_hash="3" * 64,
+            request_digest="4" * 64,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            call_id="metadata-call",
+        )
+        assert operation.record.status == "outcome_unknown"
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_recovery_rejects_running_run_with_no_durable_events_atomically(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    conversation_id, turn_id, run_id = _id(726), _id(727), _id(728)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="reject missing recovery prefix",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        before = store.get_run_journal_state(run_id)
+        store._connection.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+        store._connection.commit()
+
+        with pytest.raises(
+            ConversationConflictError,
+            match="journal metadata is inconsistent",
+        ):
+            store.recover_running_as_interrupted()
+
+        restored = store.get_conversation(conversation_id)
+        assert restored.active_run_id == run_id
+        assert restored.turns[0].status == "running"
+        assert store.get_run_journal_state(run_id) == before
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?", (run_id,)
+        ).fetchone()[0] == 0
+    finally:
+        store.close()
+
+
 def test_recovery_marks_running_turns_interrupted_and_clears_active_run(
     tmp_path: Path,
 ) -> None:
@@ -557,7 +2276,7 @@ def test_recovery_discards_open_assistant_block_before_terminal(
             "assistant.block.discarded",
             "run.failed",
         ]
-        assert [event["seq"] for event in events] == [1, 2, 3, 4]
+        assert [event["seq"] for event in events] == [1, 2, 513, 514]
         assert events[2]["payload"] == {
             "block_id": "crashed-block",
             "reason": "runtime_failure",
@@ -611,7 +2330,7 @@ def test_recovery_starts_and_finishes_requested_tool_before_terminal(
             "tool.call.finished",
             "run.failed",
         ]
-        assert [event["seq"] for event in events] == [1, 2, 3, 4, 5]
+        assert [event["seq"] for event in events] == [1, 2, 513, 514, 515]
         assert events[2]["payload"] == {
             "call_id": "crashed-call",
             "tool_id": "builtin/echo",
@@ -683,7 +2402,7 @@ def test_recovery_finishes_already_started_tool_before_terminal(
             "tool.call.finished",
             "run.failed",
         ]
-        assert [event["seq"] for event in events] == [1, 2, 3, 4, 5]
+        assert [event["seq"] for event in events] == [1, 2, 3, 513, 514]
         assert events[3]["payload"]["outcome"] == "failed"
     finally:
         journal.close()
@@ -760,7 +2479,7 @@ def test_recovery_allows_ephemeral_delta_gap_while_block_is_open(
             "assistant.block.finished",
             "run.failed",
         ]
-        assert [event["seq"] for event in events] == [1, 2, 4, 5]
+        assert [event["seq"] for event in events] == [1, 2, 4, 513]
         assert events[-1]["payload"]["code"] == "control_restarted"
     finally:
         journal.close()
@@ -807,7 +2526,7 @@ def test_recovery_fails_closed_on_unexplained_sequence_gap(
         store.close()
 
 
-def test_recovery_capacity_counts_ephemeral_sequence_gaps(
+def test_recovery_capacity_counts_rows_not_reserved_ephemeral_sequence_gaps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database = _database(tmp_path)
@@ -846,16 +2565,17 @@ def test_recovery_capacity_counts_ephemeral_sequence_gaps(
         )
         monkeypatch.setattr(sessions_module, "MAX_RECOVERY_EVENTS_PER_RUN", 5)
 
-        with pytest.raises(ConversationConflictError, match="event capacity"):
-            store.recover_running_as_interrupted()
+        recovered = store.recover_running_as_interrupted()
 
         restored = store.get_conversation(conversation_id)
-        assert restored.active_run_id == run_id
-        assert restored.turns[0].status == "running"
+        assert [turn.status for turn in recovered] == ["interrupted"]
+        assert restored.active_run_id is None
+        assert restored.turns[0].status == "interrupted"
         assert [event["seq"] for event in journal.events_for_run(run_id)] == [
             1,
             2,
             5,
+            513,
         ]
     finally:
         journal.close()

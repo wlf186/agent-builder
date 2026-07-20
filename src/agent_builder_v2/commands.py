@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 
 from .contracts import StartRunCommand
-from .control import RunRecord, RunService
+from .query_engine import QueryEngineRegistry, QueryRunHandle
 
 
 RUN_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -22,33 +22,34 @@ class CancelRunCommand:
 
 
 class CommandBus:
-    """Delegate validated application commands to the authoritative RunService.
+    """Delegate validated application commands to logical QueryEngines.
 
     Authentication, CSRF, HTTP parsing, and response projection stay in the web
-    adapter.  The bus does not duplicate Run state or introduce another loop.
+    adapter.  QueryEngine binds conversation identity while RunService remains
+    the authoritative sequencer and Worker supervisor underneath it.
     """
 
-    def __init__(self, run_service: RunService) -> None:
-        self._run_service = run_service
+    def __init__(self, query_engines: QueryEngineRegistry) -> None:
+        self._query_engines = query_engines
 
-    async def start(self, command: StartRunCommand) -> RunRecord:
+    async def start(self, command: StartRunCommand) -> QueryRunHandle:
         if not isinstance(command, StartRunCommand):
             raise TypeError("start requires StartRunCommand")
         command.validate()
-        return await self._run_service.start(command)
+        return await self._query_engines.submit(command)
 
     async def cancel(self, run_id: str) -> None:
         command = CancelRunCommand(run_id)
         command.validate()
-        await self._run_service.cancel(command.run_id)
+        await self._query_engines.cancel(command.run_id)
 
     async def dispatch(
         self, command: StartRunCommand | CancelRunCommand
-    ) -> RunRecord | None:
+    ) -> QueryRunHandle | None:
         if isinstance(command, StartRunCommand):
             return await self.start(command)
         if isinstance(command, CancelRunCommand):
             command.validate()
-            await self._run_service.cancel(command.run_id)
+            await self._query_engines.cancel(command.run_id)
             return None
         raise TypeError("unsupported command")

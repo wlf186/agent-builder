@@ -300,6 +300,29 @@ def _new_ruleset_fd() -> int:
     return int(descriptor)
 
 
+def _new_filesystem_ruleset_fd() -> int:
+    """Create a filesystem-only ruleset for trusted lifecycle qualification."""
+
+    attr = _RulesetAttr(
+        handled_access_fs=_HANDLED_FS_ACCESS,
+        handled_access_net=0,
+        scoped=0,
+    )
+    libc = _libc()
+    descriptor = libc.syscall(
+        _SYS_LANDLOCK_CREATE_RULESET,
+        ctypes.byref(attr),
+        ctypes.sizeof(attr),
+        0,
+    )
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise SandboxUnavailableError(
+            f"required Landlock filesystem features are unavailable: errno={error}"
+        )
+    return int(descriptor)
+
+
 def _probe_required_landlock_features() -> None:
     descriptor = _new_ruleset_fd()
     os.close(descriptor)
@@ -657,6 +680,64 @@ def _install_landlock(
         os.close(ruleset_fd)
 
 
+def apply_checkout_write_confinement(repository_root: Path) -> None:
+    """Restrict this process tree to writes beneath one qualified checkout.
+
+    This boundary is intentionally narrower than the untrusted Worker sandbox:
+    trusted lifecycle commands retain networking and process creation, while
+    Landlock denies every filesystem mutation outside ``repository_root``.
+    The restriction is inherited across fork and exec and has no permissive
+    fallback when a required rule cannot be installed.
+    """
+
+    qualification = require_qualified_host()
+    if qualification.landlock_abi < MINIMUM_LANDLOCK_ABI:
+        raise SandboxUnavailableError("checkout confinement requires Landlock")
+    checkout = _capture_rule_root(
+        Path(repository_root).resolve(strict=True), expect_directory=True
+    )
+    if checkout.path == Path("/"):
+        raise SandboxUnavailableError("filesystem root cannot be a checkout")
+
+    readable: list[_RuleRoot] = []
+    for candidate in (
+        Path("/usr"),
+        Path("/etc"),
+        Path("/proc"),
+        Path("/sys"),
+        Path("/run"),
+        Path("/dev"),
+    ):
+        captured = _optional_rule_root(candidate)
+        if captured is not None:
+            readable.append(captured)
+    null_device = _optional_rule_root(Path("/dev/null"))
+
+    ruleset_fd = _new_filesystem_ruleset_fd()
+    read_rights = (
+        _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_READ_DIR | _ACCESS_IOCTL_DEV
+    )
+    try:
+        for root in readable:
+            _add_path_rule(ruleset_fd, root, read_rights)
+        if null_device is not None:
+            _add_path_rule(
+                ruleset_fd,
+                null_device,
+                _ACCESS_READ_FILE | _ACCESS_WRITE_FILE | _ACCESS_IOCTL_DEV,
+            )
+        _add_path_rule(ruleset_fd, checkout, _HANDLED_FS_ACCESS)
+        _set_no_new_privileges()
+        result = _libc().syscall(_SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
+        if result != 0:
+            error = ctypes.get_errno()
+            raise SandboxUnavailableError(
+                f"could not enter checkout confinement: errno={error}"
+            )
+    finally:
+        os.close(ruleset_fd)
+
+
 def _build_seccomp_filter(machine: str) -> list[_SockFilter]:
     normalised = _MACHINE_ALIASES.get(machine.lower(), machine.lower())
     specification = _SECCOMP_ARCHITECTURES.get(normalised)
@@ -747,6 +828,7 @@ __all__ = [
     "apply_worker_resource_limits",
     "apply_worker_sandbox",
     "apply_worker_umask",
+    "apply_checkout_write_confinement",
     "close_worker_file_descriptors",
     "configure_parent_death_signal",
     "host_qualification",

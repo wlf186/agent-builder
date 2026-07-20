@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+import hashlib
 import json
 import socket
 from typing import Any
@@ -13,7 +14,7 @@ import pytest
 
 import agent_builder_v2.ollama as ollama_module
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
-from agent_builder_v2.context import ContextCompiler
+from agent_builder_v2.context import ContextCompiler, estimate_provider_input_tokens
 from agent_builder_v2.model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
 from agent_builder_v2.ollama import (
     HARNESS_TOOL_ID,
@@ -30,7 +31,9 @@ from agent_builder_v2.ollama import (
     OllamaBrokerError,
     OllamaCancelledError,
     OllamaFrame,
+    OllamaRequestMetadata,
     OllamaToolResult,
+    REQUEST_DIGEST_DOMAIN,
     RUNTIME_CONTEXT_TOKEN_CAP,
 )
 from agent_builder_v2.tools import prototype_tool_specs
@@ -267,8 +270,16 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
     )
     broker, provider = await _started_broker([first, second])
     try:
-        session = broker.new_run(_plan(broker, "please echo hello"))
-        tool_frames = await _collect(session.stream_turn("please echo hello"))
+        plan = _plan(broker, "please echo hello")
+        session = broker.new_run(plan)
+        observed: list[OllamaRequestMetadata] = []
+
+        async def observe(metadata: OllamaRequestMetadata) -> None:
+            observed.append(metadata)
+
+        tool_frames = await _collect(
+            session.stream_turn("please echo hello", on_request=observe)
+        )
         assert tool_frames == [
             OllamaFrame(
                 "tool.use",
@@ -292,7 +303,9 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
             content="hello",
         )
         final_frames = await _collect(
-            session.stream_turn("please echo hello", (result,))
+            session.stream_turn(
+                "please echo hello", (result,), on_request=observe
+            )
         )
         content_frames = [frame for frame in final_frames if frame.kind == "content"]
         assert "".join(str(frame.payload["text"]) for frame in content_frames) == "".join(
@@ -318,6 +331,32 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
         assert len(chat_requests) == 2
         first_body = json.loads(chat_requests[0].content)
         second_body = json.loads(chat_requests[1].content)
+        assert observed == [
+            OllamaRequestMetadata(
+                iteration=1,
+                message_count=len(first_body["messages"]),
+                tool_count=len(first_body["tools"]),
+                estimated_input_tokens=estimate_provider_input_tokens(
+                    first_body["messages"], plan.tools
+                ),
+                request_bytes=len(chat_requests[0].content),
+                request_digest=hashlib.sha256(
+                    REQUEST_DIGEST_DOMAIN + chat_requests[0].content
+                ).hexdigest(),
+            ),
+            OllamaRequestMetadata(
+                iteration=2,
+                message_count=len(second_body["messages"]),
+                tool_count=0,
+                estimated_input_tokens=estimate_provider_input_tokens(
+                    second_body["messages"], ()
+                ),
+                request_bytes=len(chat_requests[1].content),
+                request_digest=hashlib.sha256(
+                    REQUEST_DIGEST_DOMAIN + chat_requests[1].content
+                ).hexdigest(),
+            ),
+        ]
         for body in (first_body, second_body):
             assert body["model"] == OLLAMA_MODEL
             assert body["stream"] is True
@@ -339,6 +378,75 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
             {"role": "tool", "tool_name": "builtin_echo", "content": "hello"},
         ]
     finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_request_observer_failure_prevents_provider_http_and_state_commit() -> None:
+    broker, provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(_provider_frame(done=True, done_reason="stop"))
+            )
+        ]
+    )
+    try:
+        session = broker.new_run(_plan(broker, "hello"))
+
+        async def reject(_metadata: OllamaRequestMetadata) -> None:
+            raise RuntimeError("simulated durable boundary failure")
+
+        with pytest.raises(RuntimeError, match="durable boundary"):
+            await _collect(session.stream_turn("hello", on_request=reject))
+        assert not any(request.url.path == "/api/chat" for request in provider.requests)
+        assert session.messages == ()
+
+        observed: list[OllamaRequestMetadata] = []
+
+        async def accept(metadata: OllamaRequestMetadata) -> None:
+            observed.append(metadata)
+
+        frames = await _collect(session.stream_turn("hello", on_request=accept))
+        assert frames[-1].kind == "stop"
+        assert [item.iteration for item in observed] == [1]
+        assert sum(request.url.path == "/api/chat" for request in provider.requests) == 1
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_slow_request_observer_preserves_session_single_flight() -> None:
+    broker, provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(_provider_frame(done=True, done_reason="stop"))
+            )
+        ]
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    try:
+        session = broker.new_run(_plan(broker, "hello"))
+
+        async def observe(_metadata: OllamaRequestMetadata) -> None:
+            entered.set()
+            await release.wait()
+
+        first = asyncio.create_task(
+            _collect(session.stream_turn("hello", on_request=observe))
+        )
+        await entered.wait()
+        assert not any(request.url.path == "/api/chat" for request in provider.requests)
+
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("hello"))
+        assert raised.value.code == "model_concurrency_error"
+
+        release.set()
+        assert (await first)[-1].kind == "stop"
+        assert sum(request.url.path == "/api/chat" for request in provider.requests) == 1
+    finally:
+        release.set()
         await broker.close()
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import hmac
 import json
 import re
 
@@ -12,6 +13,19 @@ from .tools import ToolSpec, toolset_digest
 
 CONTEXT_PLAN_SCHEMA_VERSION = "1"
 CONTEXT_RENDERER_VERSION = "ordered-sections-v1"
+CONTEXT_INSPECTION_KEY_BYTES = 32
+CONTEXT_INSPECTION_NOTICE = (
+    "Prompt section content is withheld by default. This operator view exposes "
+    "only bounded metadata and per-process keyed inspection digests."
+)
+CONTEXT_RENDERER_DESCRIPTION = (
+    "The provider renderer merges all leading system sections, preserving their "
+    "order and section labels, into one system message; subsequent transcript "
+    "sections remain separate role-bearing messages."
+)
+_CONTEXT_INSPECTION_DIGEST_DOMAIN = (
+    b"agent-builder-context-section-inspection-v1\0"
+)
 TOKEN_ESTIMATOR_ID = "utf8-bytes-upper-bound-v1"
 MAX_CONTEXT_SECTIONS = 128
 MAX_HISTORY_MESSAGES = 256
@@ -217,6 +231,93 @@ class PromptSection:
             "truncation_policy": self.truncation_policy,
             "estimated_tokens": self.estimated_tokens,
             "content": self.content,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PromptSectionInspection:
+    """Content-withholding metadata for one ordered prompt section."""
+
+    section_id: str
+    role: str
+    trust: str
+    provenance: str
+    cache_scope: str
+    truncation_policy: str
+    estimated_tokens: int
+    content_bytes: int
+    content_digest: str
+
+    @classmethod
+    def from_section(
+        cls,
+        section: PromptSection,
+        *,
+        content_digest_key: bytes,
+    ) -> PromptSectionInspection:
+        if (
+            not isinstance(content_digest_key, bytes)
+            or len(content_digest_key) != CONTEXT_INSPECTION_KEY_BYTES
+        ):
+            raise ContextPlanError("invalid context inspection digest key")
+        encoded = section.content.encode("utf-8")
+        return cls(
+            section_id=section.section_id,
+            role=section.role,
+            trust=section.trust,
+            provenance=section.provenance,
+            cache_scope=section.cache_scope,
+            truncation_policy=section.truncation_policy,
+            estimated_tokens=section.estimated_tokens,
+            content_bytes=len(encoded),
+            content_digest=hmac.new(
+                content_digest_key,
+                _CONTEXT_INSPECTION_DIGEST_DOMAIN + encoded,
+                hashlib.sha256,
+            ).hexdigest(),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a new JSON-safe object without section content."""
+
+        return {
+            "id": self.section_id,
+            "role": self.role,
+            "trust": self.trust,
+            "provenance": self.provenance,
+            "cache": self.cache_scope,
+            "truncation": self.truncation_policy,
+            "estimated_tokens": self.estimated_tokens,
+            "content_bytes": self.content_bytes,
+            "content_digest": self.content_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ContextPlanInspection:
+    """Immutable operator projection of one freshly verified ContextPlan."""
+
+    context_plan: tuple[tuple[str, str | int], ...]
+    renderer_version: str
+    provider_message_count: int
+    leading_system_section_count: int
+    sections: tuple[PromptSectionInspection, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        """Build a defensive response tree on every call."""
+
+        return {
+            "context_plan": dict(self.context_plan),
+            "renderer": {
+                "version": self.renderer_version,
+                "leading_system_sections_merged": True,
+                "leading_system_section_count": self.leading_system_section_count,
+                "description": CONTEXT_RENDERER_DESCRIPTION,
+            },
+            "provider_message_count": self.provider_message_count,
+            "sections": [section.to_dict() for section in self.sections],
+            "content_exposure": "withheld",
+            "notice": CONTEXT_INSPECTION_NOTICE,
         }
 
 
@@ -520,6 +621,50 @@ class ContextPlan:
     def provider_messages(self) -> list[dict[str, str]]:
         return _provider_messages(self.sections)
 
+    def operator_inspection(
+        self, content_digest_key: bytes
+    ) -> ContextPlanInspection:
+        """Return a fresh, content-withholding projection for an operator API.
+
+        Authentication is deliberately owned by the Web boundary. Re-verifying
+        here prevents a stale or in-memory-tampered plan from being exposed as
+        trusted inspection metadata.
+        """
+
+        if (
+            not isinstance(content_digest_key, bytes)
+            or len(content_digest_key) != CONTEXT_INSPECTION_KEY_BYTES
+        ):
+            raise ContextPlanError("invalid context inspection digest key")
+        self.verify()
+        provider_message_count = len(_provider_messages(self.sections))
+        leading_system_section_count = next(
+            (
+                index
+                for index, section in enumerate(self.sections)
+                if section.role != "system"
+            ),
+            len(self.sections),
+        )
+        immutable_metadata: list[tuple[str, str | int]] = []
+        for key, value in self.public_metadata().items():
+            if not isinstance(value, (str, int)) or isinstance(value, bool):
+                raise ContextPlanError("context inspection metadata is invalid")
+            immutable_metadata.append((key, value))
+        return ContextPlanInspection(
+            context_plan=tuple(immutable_metadata),
+            renderer_version=CONTEXT_RENDERER_VERSION,
+            provider_message_count=provider_message_count,
+            leading_system_section_count=leading_system_section_count,
+            sections=tuple(
+                PromptSectionInspection.from_section(
+                    section,
+                    content_digest_key=content_digest_key,
+                )
+                for section in self.sections
+            ),
+        )
+
     def public_metadata(self) -> dict[str, object]:
         return {
             "plan_id": self.reference.plan_id,
@@ -784,17 +929,22 @@ class ContextCompiler:
 
 
 __all__ = [
+    "CONTEXT_INSPECTION_NOTICE",
     "CONTEXT_PLAN_SCHEMA_VERSION",
+    "CONTEXT_RENDERER_DESCRIPTION",
+    "CONTEXT_RENDERER_VERSION",
     "CompressionPolicy",
     "ConversationMessage",
     "ContextCompiler",
     "ContextPlan",
     "ContextPlanError",
+    "ContextPlanInspection",
     "ContextPlanReference",
     "ModelContext",
     "ModelProfile",
     "PROVIDER_TEMPLATE_TOKEN_RESERVE",
     "PromptSection",
+    "PromptSectionInspection",
     "estimate_provider_input_tokens",
     "estimate_text_tokens",
 ]

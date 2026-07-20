@@ -11,6 +11,7 @@ import errno
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import stat
 import threading
@@ -24,7 +25,18 @@ from pathlib import Path
 DEFAULT_TOKEN_PATH = Path(".runtime/secrets/web-bootstrap-token")
 TOKEN_BYTES = 32
 TOKEN_HEX_LENGTH = TOKEN_BYTES * 2
+MIN_PROJECT_TOKEN_LENGTH = 10
+MAX_PROJECT_TOKEN_LENGTH = 128
 MAX_CREDENTIAL_LENGTH = 256
+_PROJECT_TOKEN = re.compile(
+    rf"[A-Za-z0-9._~+-]{{{MIN_PROJECT_TOKEN_LENGTH},{MAX_PROJECT_TOKEN_LENGTH}}}"
+)
+
+
+def is_valid_project_token(value: object) -> bool:
+    """Accept generated tokens and bounded operator-chosen ASCII tokens."""
+
+    return isinstance(value, str) and _PROJECT_TOKEN.fullmatch(value) is not None
 
 
 class AuthenticationError(PermissionError):
@@ -83,8 +95,64 @@ class ProjectTokenStore:
         )
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
         flags |= self._no_follow_flag()
-        descriptor: int | None = None
         published = False
+        try:
+            self._write_candidate(temporary, token, flags)
+
+            # A concurrent creator may win; its fully written file is then
+            # authoritative and this process discards its candidate.
+            published = self._publish_noreplace(temporary)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+        if published:
+            self._fsync_parent()
+        return self._read_existing()
+
+    def replace(self, token: str) -> None:
+        """Atomically rotate the private token without exposing it in argv.
+
+        Callers must obtain ``token`` through a non-logging channel such as an
+        interactive no-echo prompt.  Existing unsafe secret paths are rejected
+        instead of silently replaced.
+        """
+
+        if not is_valid_project_token(token):
+            raise ValueError("project token has an invalid format")
+        self._ensure_private_parent()
+        try:
+            self._read_existing()
+        except FileNotFoundError:
+            pass
+
+        temporary = self.path.parent / (
+            f".{self.path.name}.{secrets.token_hex(8)}.tmp"
+        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        flags |= self._no_follow_flag()
+        try:
+            self._write_candidate(temporary, token, flags)
+            os.replace(temporary, self.path)
+            self._fsync_parent()
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+        verified = self._read_existing()
+        if not hmac.compare_digest(
+            hashlib.sha256(verified.encode("ascii")).digest(),
+            hashlib.sha256(token.encode("ascii")).digest(),
+        ):
+            raise RuntimeError("project token rotation verification failed")
+
+    @staticmethod
+    def _write_candidate(temporary: Path, token: str, flags: int) -> None:
+        descriptor: int | None = None
         try:
             descriptor = os.open(temporary, flags, 0o600)
             os.fchmod(descriptor, 0o600)
@@ -96,23 +164,9 @@ class ProjectTokenStore:
                     raise OSError("failed to write project token")
                 view = view[written:]
             os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = None
-
-            # A concurrent creator may win; its fully written file is then
-            # authoritative and this process discards its candidate.
-            published = self._publish_noreplace(temporary)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-
-        if published:
-            self._fsync_parent()
-        return self._read_existing()
 
     def _publish_noreplace(self, temporary: Path) -> bool:
         """Atomically move one complete candidate into an absent final path."""
@@ -183,7 +237,7 @@ class ProjectTokenStore:
                 raise RuntimeError("project token must have mode 0600")
             if metadata.st_nlink != 1:
                 raise RuntimeError("project token must not have another hard link")
-            raw = os.read(descriptor, TOKEN_HEX_LENGTH + 2)
+            raw = os.read(descriptor, MAX_PROJECT_TOKEN_LENGTH + 2)
             if os.read(descriptor, 1):
                 raise RuntimeError("project token is unexpectedly large")
         finally:
@@ -195,9 +249,7 @@ class ProjectTokenStore:
             token = raw.decode("ascii")
         except UnicodeDecodeError as exc:
             raise RuntimeError("project token is not valid ASCII") from exc
-        if len(token) != TOKEN_HEX_LENGTH or any(
-            character not in "0123456789abcdef" for character in token
-        ):
+        if not is_valid_project_token(token):
             raise RuntimeError("project token has an invalid format")
         return token
 
@@ -254,7 +306,9 @@ class SessionService:
         if max_sessions <= 0 or max_sessions > 10_000:
             raise ValueError("max_sessions must be between 1 and 10000")
 
-        self._project_token = project_token
+        self._project_token_digest = hashlib.sha256(
+            project_token.encode("ascii")
+        ).digest()
         self._ttl_seconds = float(ttl_seconds)
         self._max_sessions = max_sessions
         self._clock = monotonic_clock
@@ -377,13 +431,16 @@ class SessionService:
         return len(expired)
 
     def _constant_time_token_match(self, candidate: str | None) -> bool:
-        if not self._bounded_text(candidate):
-            # Perform one comparison even for malformed input to keep the
-            # authentication path uniform without allocating unbounded data.
-            hmac.compare_digest(self._project_token, "0" * TOKEN_HEX_LENGTH)
-            return False
-        assert candidate is not None
-        return hmac.compare_digest(self._project_token, candidate)
+        valid = is_valid_project_token(candidate)
+        if self._bounded_text(candidate):
+            assert candidate is not None
+            candidate_digest = hashlib.sha256(candidate.encode("utf-8")).digest()
+        else:
+            # Perform the same fixed-size comparison for malformed or
+            # unbounded input without hashing attacker-controlled large text.
+            candidate_digest = b"\0" * hashlib.sha256().digest_size
+        matched = hmac.compare_digest(self._project_token_digest, candidate_digest)
+        return bool(valid and matched)
 
     def _digest(self, value: str) -> bytes:
         return hmac.new(self._pepper, value.encode("utf-8"), hashlib.sha256).digest()
@@ -394,6 +451,4 @@ class SessionService:
 
     @staticmethod
     def _valid_credential(value: str) -> bool:
-        return len(value) == TOKEN_HEX_LENGTH and all(
-            character in "0123456789abcdef" for character in value
-        )
+        return is_valid_project_token(value)

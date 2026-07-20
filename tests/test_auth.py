@@ -13,13 +13,16 @@ import pytest
 from agent_builder_v2.auth import (
     AuthenticationError,
     CsrfError,
+    MAX_PROJECT_TOKEN_LENGTH,
     SessionCapacityError,
     SessionService,
     ProjectTokenStore,
+    is_valid_project_token,
 )
 
 
 PROJECT_TOKEN = "a" * 64
+OPERATOR_TOKEN = "operator-token_2026"
 
 
 def test_project_token_is_atomic_private_and_stable(tmp_path: Path) -> None:
@@ -46,6 +49,54 @@ def test_project_token_rejects_symlinked_secret_directory(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="not a real directory"):
         ProjectTokenStore(tmp_path).load_or_create()
+
+
+def test_operator_token_rotation_is_atomic_private_and_authenticates(
+    tmp_path: Path,
+) -> None:
+    store = ProjectTokenStore(tmp_path)
+    previous = store.load_or_create()
+    previous_inode = store.path.stat().st_ino
+
+    store.replace(OPERATOR_TOKEN)
+
+    metadata = store.path.stat()
+    assert store.load_or_create() == OPERATOR_TOKEN
+    assert store.path.read_text(encoding="ascii") == f"{OPERATOR_TOKEN}\n"
+    assert metadata.st_ino != previous_inode
+    assert stat.S_IMODE(metadata.st_mode) == 0o600
+    assert metadata.st_nlink == 1
+    assert SessionService(OPERATOR_TOKEN).create(OPERATOR_TOKEN).session_id
+    with pytest.raises(AuthenticationError, match="authentication failed"):
+        SessionService(OPERATOR_TOKEN).create(previous)
+
+
+@pytest.mark.parametrize(
+    "token",
+    (
+        "short",
+        "contains space",
+        "contains\nnewline",
+        "contains\0nul",
+        "非ascii访问令牌",
+        "a" * (MAX_PROJECT_TOKEN_LENGTH + 1),
+    ),
+)
+def test_operator_token_format_rejects_unsafe_values(token: str) -> None:
+    assert is_valid_project_token(token) is False
+    with pytest.raises(ValueError, match="invalid format"):
+        SessionService(token)
+
+
+def test_rotation_refuses_an_unsafe_existing_secret(tmp_path: Path) -> None:
+    store = ProjectTokenStore(tmp_path)
+    previous = store.load_or_create()
+    store.path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="mode 0600"):
+        store.replace(OPERATOR_TOKEN)
+
+    assert store.path.read_text(encoding="ascii") == f"{previous}\n"
 
 
 def test_session_capacity_csrf_expiry_and_reuse() -> None:

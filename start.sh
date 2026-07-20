@@ -15,12 +15,25 @@ PID_FILE="$RUNTIME_ROOT/gateway.pid"
 LOG_FILE="$RUNTIME_ROOT/gateway.log"
 LOCK_FILE="$RUNTIME_ROOT/lifecycle.lock"
 LOG_SUPERVISOR="$ROOT/scripts/log_supervisor.py"
+IDENTITY_HELPER="$ROOT/scripts/process_identity.sh"
+if [[ ! -f "$IDENTITY_HELPER" || -L "$IDENTITY_HELPER" \
+    || "$(stat -c '%u' -- "$IDENTITY_HELPER" 2>/dev/null || true)" != "$EUID" \
+    || "$(stat -c '%h' -- "$IDENTITY_HELPER" 2>/dev/null || true)" != 1 ]]; then
+    printf '[agent-builder start] ERROR: process identity helper is missing or unsafe\n' >&2
+    exit 1
+fi
+# shellcheck source=scripts/process_identity.sh
+source "$IDENTITY_HELPER"
+SYNC_COUNTER_TOOL="$ROOT/scripts/sync_counter_tool.py"
+SYNC_COUNTER_LIBRARY="$ROOT/.runtime/qualification-sync/libagent_builder_sync_counter.so"
+SYNC_COUNTER_FILE="$ROOT/.runtime/qualification-sync/sync-counter.bin"
 SOURCE_ROOT="$ROOT/src"
 PYTHON="$ROOT/.venv/bin/python"
 STARTING_PID=""
 STARTING_PGID=""
 STARTING_MARKER=""
 LAUNCH_ATTEMPTED=false
+QUALIFICATION_SYNC_COUNT=false
 
 export HARNESS_V2_HOST=0.0.0.0
 export HARNESS_V2_PORT=20815
@@ -31,43 +44,30 @@ export PYTHONUNBUFFERED=1
 
 usage() {
     cat <<'EOF'
-Usage: ./start.sh
+Usage: ./start.sh [--qualification-sync-count]
 
 Starts Agent Builder on 0.0.0.0:20815 using only checkout-local state.
+
+--qualification-sync-count  Explicitly instrument supervisor, Gateway and
+                            Workers for bounded libc sync-call qualification.
+                            This is not a normal operating mode.
 EOF
 }
 
 if (($#)); then
     case "$1" in
         --help|-h) usage; exit 0 ;;
+        --qualification-sync-count) QUALIFICATION_SYNC_COUNT=true ;;
         *) printf '[agent-builder start] ERROR: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
     esac
+    (($# == 1)) || { printf '[agent-builder start] ERROR: too many arguments\n' >&2; usage >&2; exit 2; }
 fi
 
 log() { printf '[agent-builder start] %s\n' "$*"; }
 fail() { printf '[agent-builder start] ERROR: %s\n' "$*" >&2; return 1; }
 
 process_marker() {
-    local process_stat marker
-    if [[ -r "/proc/$1/stat" ]]; then
-        process_stat="$(<"/proc/$1/stat")"
-        process_stat="${process_stat##*) }"
-        marker="$(awk '{print $20}' <<<"$process_stat")"
-        [[ "$marker" =~ ^[0-9]+$ ]] || return 1
-        printf 'linux:%s\n' "$marker"
-    else
-        marker="$(ps -o lstart= -p "$1" 2>/dev/null | tr -d '[:space:]')"
-        [[ -n "$marker" ]] || return 1
-        printf 'ps:%s\n' "$marker"
-    fi
-}
-
-process_command() {
-    if [[ -r "/proc/$1/cmdline" ]]; then
-        tr '\0' ' ' 2>/dev/null < "/proc/$1/cmdline" || true
-    else
-        ps -o command= -p "$1" 2>/dev/null || true
-    fi
+    agent_builder_process_marker "$1"
 }
 
 record_value() {
@@ -76,29 +76,20 @@ record_value() {
 }
 
 safe_pid_record() {
-    local links size
-    [[ -f "$PID_FILE" && ! -L "$PID_FILE" ]] || return 1
-    links="$(stat -c '%h' -- "$PID_FILE" 2>/dev/null || true)"
-    size="$(stat -c '%s' -- "$PID_FILE" 2>/dev/null || true)"
-    [[ "$links" == 1 && "$size" =~ ^[0-9]+$ && "$size" -le 4096 ]]
+    agent_builder_private_pid_record "$PID_FILE" 4096 \
+        && agent_builder_gateway_record_shape_valid "$PID_FILE"
 }
 
 GATEWAY_PID=""
 GATEWAY_PGID=""
 GATEWAY_MARKER=""
+WEB_PID=""
+WEB_MARKER=""
+GATEWAY_SYNC_COUNTER=""
 gateway_identity_valid() {
-    local current_marker current_pgid command_line current_cwd
-    [[ "$GATEWAY_PID" =~ ^[0-9]+$ && "$GATEWAY_PID" -gt 1 ]] || return 1
-    kill -0 "$GATEWAY_PID" 2>/dev/null || return 1
-    current_marker="$(process_marker "$GATEWAY_PID" 2>/dev/null || true)"
-    current_pgid="$(ps -o pgid= -p "$GATEWAY_PID" 2>/dev/null | tr -d '[:space:]')"
-    command_line="$(process_command "$GATEWAY_PID")"
-    current_cwd="$(readlink -f -- "/proc/$GATEWAY_PID/cwd" 2>/dev/null || true)"
-    [[ "$current_marker" == "$GATEWAY_MARKER" \
-        && "$current_pgid" == "$GATEWAY_PGID" \
-        && "$current_cwd" == "$ROOT" \
-        && "$command_line" == *"$LOG_SUPERVISOR"* \
-        && "$command_line" == *"agent_builder_v2.web"* ]]
+    agent_builder_gateway_chain_valid \
+        "$ROOT" "$GATEWAY_PID" "$GATEWAY_PGID" "$GATEWAY_MARKER" \
+        "$WEB_PID" "$WEB_MARKER" "$GATEWAY_SYNC_COUNTER"
 }
 
 load_managed_gateway() {
@@ -109,10 +100,17 @@ load_managed_gateway() {
     GATEWAY_PID="$(record_value pid)"
     GATEWAY_PGID="$(record_value pgid)"
     GATEWAY_MARKER="$(record_value marker)"
+    WEB_PID="$(record_value web_pid)"
+    WEB_MARKER="$(record_value web_marker)"
+    GATEWAY_SYNC_COUNTER="$(record_value sync_counter)"
     recorded_root="$(record_value root)"
     [[ "$schema" == 1 && "$role" == gateway ]] || return 1
     [[ "$GATEWAY_PID" =~ ^[0-9]+$ && "$GATEWAY_PID" -gt 1 ]] || return 1
     [[ "$GATEWAY_PGID" == "$GATEWAY_PID" && -n "$GATEWAY_MARKER" ]] || return 1
+    [[ "$WEB_PID" =~ ^[0-9]+$ && "$WEB_PID" -gt 1 \
+        && "$WEB_PID" != "$GATEWAY_PID" && -n "$WEB_MARKER" ]] || return 1
+    [[ -z "$GATEWAY_SYNC_COUNTER" \
+        || "$GATEWAY_SYNC_COUNTER" == libc-sync-calls-v1 ]] || return 1
     [[ "$recorded_root" == "$ROOT" ]] || return 1
     kill -0 "$GATEWAY_PID" 2>/dev/null || return 1
 
@@ -137,19 +135,15 @@ group_alive() {
 }
 
 starting_identity_valid() {
-    local current_marker current_pgid command_line current_cwd
+    local expected_sync=""
     [[ "$STARTING_PID" =~ ^[0-9]+$ && "$STARTING_PID" -gt 1 ]] || return 1
     [[ "$STARTING_PGID" == "$STARTING_PID" && -n "$STARTING_MARKER" ]] || return 1
-    kill -0 "$STARTING_PID" 2>/dev/null || return 1
-    current_marker="$(process_marker "$STARTING_PID" 2>/dev/null || true)"
-    current_pgid="$(ps -o pgid= -p "$STARTING_PID" 2>/dev/null | tr -d '[:space:]')"
-    command_line="$(process_command "$STARTING_PID")"
-    current_cwd="$(readlink -f -- "/proc/$STARTING_PID/cwd" 2>/dev/null || true)"
-    [[ "$current_marker" == "$STARTING_MARKER" \
-        && "$current_pgid" == "$STARTING_PGID" \
-        && "$current_cwd" == "$ROOT" \
-        && "$command_line" == *"$LOG_SUPERVISOR"* \
-        && "$command_line" == *"agent_builder_v2.web"* ]]
+    if [[ "$QUALIFICATION_SYNC_COUNT" == true ]]; then
+        expected_sync=libc-sync-calls-v1
+    fi
+    agent_builder_supervisor_identity_valid \
+        "$ROOT" "$STARTING_PID" "$STARTING_PGID" "$STARTING_MARKER" \
+        "$expected_sync"
 }
 
 starting_direct_child_valid() {
@@ -283,6 +277,10 @@ flock -w 30 8 || fail "timed out waiting for another V2 lifecycle command"
 
 if load_managed_gateway; then
     health_ok || fail "gateway is running but unhealthy; see $LOG_FILE"
+    if [[ "$QUALIFICATION_SYNC_COUNT" == true \
+        && "$(record_value sync_counter)" != "libc-sync-calls-v1" ]]; then
+        fail "the running Gateway was not started in sync-counter qualification mode"
+    fi
     log "gateway is already healthy (pid $GATEWAY_PID)"
     trap - ERR INT TERM
     exit 0
@@ -309,17 +307,53 @@ if tcp_open 127.0.0.1 "$HARNESS_V2_PORT"; then
     fail "port 0.0.0.0:$HARNESS_V2_PORT conflicts with an unmanaged listener"
 fi
 
-"$PYTHON" "$LOG_SUPERVISOR" \
-    --new-session \
-    --clean-env \
-    --runtime-root "$RUNTIME_ROOT" \
-    --log-file "$LOG_FILE" \
-    --pid-file "$PID_FILE" \
-    --max-bytes 5242880 \
-    --backups 3 \
-    -- \
-    "$PYTHON" -m agent_builder_v2.web \
-    </dev/null >/dev/null 2>&1 8>&- &
+SUPERVISOR_QUALIFICATION_ARGS=()
+if [[ "$QUALIFICATION_SYNC_COUNT" == true ]]; then
+    [[ -f "$SYNC_COUNTER_TOOL" && ! -L "$SYNC_COUNTER_TOOL" ]] \
+        || fail "sync counter qualification tool is missing or unsafe"
+    log "preparing and self-testing the bounded libc sync-call counter"
+    "$PYTHON" "$SYNC_COUNTER_TOOL" prepare \
+        || fail "sync counter qualification preparation failed"
+    [[ -f "$SYNC_COUNTER_LIBRARY" && ! -L "$SYNC_COUNTER_LIBRARY" \
+        && "$(stat -c '%h' -- "$SYNC_COUNTER_LIBRARY" 2>/dev/null || true)" == 1 \
+        && "$(stat -c '%a' -- "$SYNC_COUNTER_LIBRARY" 2>/dev/null || true)" == 500 ]] \
+        || fail "prepared sync counter library is unsafe"
+    [[ -f "$SYNC_COUNTER_FILE" && ! -L "$SYNC_COUNTER_FILE" \
+        && "$(stat -c '%h' -- "$SYNC_COUNTER_FILE" 2>/dev/null || true)" == 1 \
+        && "$(stat -c '%a' -- "$SYNC_COUNTER_FILE" 2>/dev/null || true)" == 600 \
+        && "$(stat -c '%s' -- "$SYNC_COUNTER_FILE" 2>/dev/null || true)" == 4096 ]] \
+        || fail "prepared sync counter page is unsafe"
+    SUPERVISOR_QUALIFICATION_ARGS+=(--qualification-sync-counter)
+    LD_PRELOAD="$SYNC_COUNTER_LIBRARY" \
+    _AGENT_BUILDER_QUALIFICATION_SYNC_COUNTER=1 \
+    _AGENT_BUILDER_SYNC_COUNTER_FILE="$SYNC_COUNTER_FILE" \
+    _AGENT_BUILDER_SYNC_COUNTER_ROLE=supervisor \
+    _AGENT_BUILDER_SYNC_COUNTER_REQUIRED=1 \
+    "$PYTHON" "$LOG_SUPERVISOR" \
+        --new-session \
+        --clean-env \
+        "${SUPERVISOR_QUALIFICATION_ARGS[@]}" \
+        --runtime-root "$RUNTIME_ROOT" \
+        --log-file "$LOG_FILE" \
+        --pid-file "$PID_FILE" \
+        --max-bytes 5242880 \
+        --backups 3 \
+        -- \
+        "$PYTHON" -m agent_builder_v2.web \
+        </dev/null >/dev/null 2>&1 8>&- &
+else
+    "$PYTHON" "$LOG_SUPERVISOR" \
+        --new-session \
+        --clean-env \
+        --runtime-root "$RUNTIME_ROOT" \
+        --log-file "$LOG_FILE" \
+        --pid-file "$PID_FILE" \
+        --max-bytes 5242880 \
+        --backups 3 \
+        -- \
+        "$PYTHON" -m agent_builder_v2.web \
+        </dev/null >/dev/null 2>&1 8>&- &
+fi
 STARTING_PID=$!
 LAUNCH_ATTEMPTED=true
 STARTING_MARKER="$(process_marker "$STARTING_PID" 2>/dev/null || true)"

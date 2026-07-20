@@ -46,6 +46,7 @@ ROOT_COMMANDS = (
     "bootstrap.sh",
     "start.sh",
     "stop.sh",
+    "set-access-token.sh",
     "purge.sh",
     "governance.sh",
 )

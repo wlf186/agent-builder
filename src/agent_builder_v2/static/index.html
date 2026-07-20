@@ -48,80 +48,306 @@
       </section>
 
       <section id="workspace" class="workspace" hidden>
-        <aside class="panel session-panel" aria-labelledby="sessions-title">
-          <div class="section-heading session-heading">
-            <div>
-              <p class="section-label">CONVERSATIONS</p>
-              <h2 id="sessions-title">会话</h2>
+        <details id="session-drawer" class="panel session-panel session-drawer">
+          <summary class="session-drawer-summary">
+            <span class="session-current">
+              <span class="section-label">CONVERSATION</span>
+              <strong id="active-session-title">请选择一个会话</strong>
+            </span>
+            <code id="session-id">未选择</code>
+            <span class="session-drawer-hint">会话管理</span>
+          </summary>
+          <div class="session-drawer-body" aria-labelledby="sessions-title">
+            <div class="section-heading session-heading">
+              <div>
+                <p class="section-label">CONVERSATIONS</p>
+                <h2 id="sessions-title">会话</h2>
+              </div>
+              <button id="new-session-button" type="button">新建会话</button>
             </div>
-            <button id="new-session-button" type="button">新建</button>
+            <p id="session-list-status" class="session-list-status" role="status">
+              正在读取会话…
+            </p>
+            <ol id="session-list" class="session-list" aria-label="已有会话"></ol>
+            <p id="session-empty" class="session-empty" hidden>
+              还没有会话。新建一个会话后即可开始对话。
+            </p>
+            <code id="agent-id" class="agent-id"></code>
           </div>
-          <p id="session-list-status" class="session-list-status" role="status">正在读取会话…</p>
-          <ol id="session-list" class="session-list" aria-label="已有会话"></ol>
-          <p id="session-empty" class="session-empty" hidden>
-            还没有会话。新建一个会话后即可开始对话。
-          </p>
-          <code id="agent-id" class="agent-id"></code>
-        </aside>
+        </details>
 
-        <div class="conversation-stack">
-          <section class="panel composer-panel">
-            <div class="section-heading">
+        <div class="replay-grid">
+          <section
+            id="replay-workbench"
+            class="panel timeline-panel replay-workbench"
+            aria-labelledby="timeline-title"
+          >
+            <header class="replay-heading">
               <div>
-                <p class="section-label">COMMAND SYSTEM</p>
-                <h2 id="active-session-title">请选择一个会话</h2>
+                <p class="section-label">RUNTIME TRACE</p>
+                <h2 id="timeline-title">Run 时序工作台</h2>
+                <p class="timeline-hint">
+                  Run 事件按 seq 排列，Turn fact 明确标为 UI 投影；选择节点可检查消息体。
+                </p>
               </div>
-              <code id="session-id">未选择</code>
-            </div>
-            <form id="run-form">
-              <label for="message-input">用户消息</label>
-              <textarea
-                id="message-input"
-                maxlength="8192"
-                placeholder="在当前会话中继续提问…"
-                required
-                disabled
-              ></textarea>
-              <div class="actions">
-                <button id="run-button" type="submit" disabled>发送</button>
-                <button id="cancel-button" class="danger" type="button" disabled>停止 Run</button>
-              </div>
-            </form>
-          </section>
+              <span id="event-count">0 events</span>
+            </header>
 
-          <section class="panel output-panel">
-            <div class="section-heading">
-              <div>
-                <p class="section-label">CONVERSATION</p>
-                <h2>多轮对话</h2>
-              </div>
-              <code id="run-id">等待运行</code>
+            <div class="timeline-controls">
+              <label for="timeline-run-select">查看 Turn / Run</label>
+              <select id="timeline-run-select" disabled>
+                <option value="">暂无可回放的 Turn / Run</option>
+              </select>
+              <button id="context-inspect-button" class="quiet" type="button" disabled>
+                查看本轮上下文
+              </button>
             </div>
-            <div class="conversation-body">
+
+            <div id="replay-toolbar" class="replay-toolbar" aria-label="事件回放控制">
+              <div class="replay-step-controls" role="group" aria-label="回放步进">
+                <button id="replay-prev-button" class="quiet" type="button" disabled>
+                  上一步
+                </button>
+                <button id="replay-play-button" class="quiet" type="button" disabled>
+                  播放
+                </button>
+                <button id="replay-next-button" class="quiet" type="button" disabled>
+                  下一步
+                </button>
+                <button
+                  id="replay-follow-button"
+                  class="quiet"
+                  type="button"
+                  aria-pressed="true"
+                  disabled
+                >
+                  跟随最新
+                </button>
+              </div>
               <div
-                id="conversation-messages"
-                class="conversation-messages"
-                aria-live="polite"
-                aria-label="当前会话消息"
-              ></div>
-              <p id="conversation-empty" class="conversation-empty">
-                选择或新建会话后，消息会显示在这里。
-              </p>
+                id="timeline-filter-form"
+                class="timeline-filters"
+                role="group"
+                aria-label="事件类型过滤"
+              >
+                <button type="button" data-timeline-filter="all" aria-pressed="true">全部</button>
+                <button type="button" data-timeline-filter="llm" aria-pressed="false">LLM</button>
+                <button type="button" data-timeline-filter="tool" aria-pressed="false">Tool</button>
+                <button type="button" data-timeline-filter="error" aria-pressed="false">异常</button>
+              </div>
             </div>
-          </section>
-        </div>
 
-        <section class="panel timeline-panel">
-          <div class="section-heading">
-            <div>
-              <p class="section-label">RUNTIME TRACE</p>
-              <h2>事件时间线</h2>
-              <p class="timeline-hint">点击任一事件查看完整消息体</p>
-            </div>
-            <span id="event-count">0 events</span>
+            <section
+              id="sequence-stage"
+              class="sequence-stage"
+              aria-labelledby="sequence-stage-title"
+            >
+              <h3 id="sequence-stage-title" class="visually-hidden">当前 Run 的四泳道时序图</h3>
+              <div id="sequence-lane-header" class="sequence-lane-header" aria-hidden="true">
+                <span data-sequence-lane="user">User</span>
+                <span data-sequence-lane="harness">Harness</span>
+                <span data-sequence-lane="llm">LLM</span>
+                <span data-sequence-lane="tool">Tool</span>
+              </div>
+              <ol
+                id="event-list"
+                class="event-list"
+                aria-label="按顺序排列的 Run 步骤与规范事件"
+              ></ol>
+            </section>
+
+            <section
+              id="event-inspector"
+              class="event-inspector"
+              aria-labelledby="event-inspector-title"
+            >
+              <header class="event-inspector-heading">
+                <div>
+                  <p class="section-label">NODE INSPECTOR</p>
+                  <h3 id="event-inspector-title">节点详情</h3>
+                </div>
+                <span class="inspector-safety-label">canonical / no-store context</span>
+              </header>
+              <p id="event-inspector-empty" class="event-inspector-empty">
+                选择时序图中的节点，查看该步骤对应的消息体与来源。
+              </p>
+              <div class="inspector-tabs" role="tablist" aria-label="节点详情视图">
+                <button
+                  id="inspector-tab-summary"
+                  type="button"
+                  role="tab"
+                  data-inspector-tab="summary"
+                  aria-controls="inspector-panel-summary"
+                  aria-selected="true"
+                >
+                  摘要
+                </button>
+                <button
+                  id="inspector-tab-business"
+                  type="button"
+                  role="tab"
+                  data-inspector-tab="business"
+                  aria-controls="inspector-panel-business"
+                  aria-selected="false"
+                  tabindex="-1"
+                >
+                  逻辑消息
+                </button>
+                <button
+                  id="inspector-tab-payload"
+                  type="button"
+                  role="tab"
+                  data-inspector-tab="payload"
+                  aria-controls="inspector-panel-payload"
+                  aria-selected="false"
+                  tabindex="-1"
+                >
+                  Payload
+                </button>
+                <button
+                  id="inspector-tab-envelope"
+                  type="button"
+                  role="tab"
+                  data-inspector-tab="envelope"
+                  aria-controls="inspector-panel-envelope"
+                  aria-selected="false"
+                  tabindex="-1"
+                >
+                  Envelope
+                </button>
+                <button
+                  id="inspector-tab-context"
+                  type="button"
+                  role="tab"
+                  data-inspector-tab="context"
+                  aria-controls="inspector-panel-context"
+                  aria-selected="false"
+                  tabindex="-1"
+                >
+                  Context
+                </button>
+              </div>
+              <div
+                id="inspector-panel-summary"
+                class="inspector-panel"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-summary"
+                data-inspector-panel="summary"
+              >
+                <div id="event-inspector-summary" class="inspector-summary"></div>
+              </div>
+              <div
+                id="inspector-panel-business"
+                class="inspector-panel"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-business"
+                data-inspector-panel="business"
+                hidden
+              >
+                <pre id="event-inspector-business" class="inspector-code"></pre>
+              </div>
+              <div
+                id="inspector-panel-payload"
+                class="inspector-panel"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-payload"
+                data-inspector-panel="payload"
+                hidden
+              >
+                <pre id="event-inspector-payload" class="inspector-code"></pre>
+              </div>
+              <div
+                id="inspector-panel-envelope"
+                class="inspector-panel"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-envelope"
+                data-inspector-panel="envelope"
+                hidden
+              >
+                <p class="inspector-note">
+                  规范事件显示完整 canonical EventEnvelope；Replay 节点显示 control frame。
+                  两者都不是 Ollama 或模型供应商的原始报文。
+                </p>
+                <pre id="event-inspector-envelope" class="inspector-code"></pre>
+              </div>
+              <div
+                id="inspector-panel-context"
+                class="inspector-panel inspector-context-panel"
+                role="tabpanel"
+                aria-labelledby="inspector-tab-context"
+                data-inspector-panel="context"
+                hidden
+              >
+                <p>
+                  Context 检查只返回正文隐藏的计划与 Section 元数据，不返回 system prompt。
+                </p>
+                <button
+                  id="event-inspector-context-button"
+                  class="quiet"
+                  type="button"
+                  disabled
+                >
+                  查看本轮上下文元数据
+                </button>
+              </div>
+            </section>
+          </section>
+
+          <div class="conversation-stack conversation-column">
+            <section
+              id="turn-conversation-panel"
+              class="panel output-panel conversation-panel"
+              aria-labelledby="conversation-title"
+            >
+              <header class="conversation-heading">
+                <div>
+                  <p class="section-label">CONVERSATION TURNS</p>
+                  <h2 id="conversation-title">用户与智能体</h2>
+                </div>
+                <code id="run-id">等待运行</code>
+              </header>
+              <p class="conversation-hint">
+                每一轮展示用户提交与智能体消息；运行中内容会明确标记，选择 Turn 可联动左侧 Run。
+              </p>
+              <div class="conversation-body">
+                <div
+                  id="conversation-messages"
+                  class="conversation-messages"
+                  aria-live="polite"
+                  aria-label="当前会话按 Turn 分组的消息"
+                ></div>
+                <p id="conversation-empty" class="conversation-empty">
+                  选择或新建会话后，消息会显示在这里。
+                </p>
+              </div>
+            </section>
+
+            <section class="panel composer-panel composer-dock" aria-labelledby="composer-title">
+              <div class="composer-heading">
+                <div>
+                  <p class="section-label">COMMAND SYSTEM</p>
+                  <h2 id="composer-title">发送新一轮</h2>
+                </div>
+              </div>
+              <form id="run-form">
+                <label for="message-input">用户消息</label>
+                <textarea
+                  id="message-input"
+                  maxlength="8192"
+                  placeholder="在当前会话中继续提问…"
+                  required
+                  disabled
+                ></textarea>
+                <div class="actions">
+                  <button id="run-button" type="submit" disabled>发送</button>
+                  <button id="cancel-button" class="danger" type="button" disabled>
+                    停止 Run
+                  </button>
+                </div>
+              </form>
+            </section>
           </div>
-          <ol id="event-list" class="event-list"></ol>
-        </section>
+        </div>
       </section>
     </main>
 
@@ -134,7 +360,7 @@
         <header class="event-detail-heading">
           <div>
             <p class="section-label">CANONICAL EVENT</p>
-            <h2 id="event-detail-title">完整事件消息</h2>
+            <h2 id="event-detail-title">规范事件消息体</h2>
           </div>
           <button
             id="event-detail-close"
@@ -146,7 +372,48 @@
           </button>
         </header>
         <p id="event-detail-summary" class="event-detail-summary"></p>
+        <p class="event-detail-note">
+          以下 JSON 是完整的规范事件信封，不是 Ollama 或模型供应商的原始请求、响应报文。
+        </p>
         <pre id="event-detail-json" class="event-detail-json"></pre>
+      </section>
+    </dialog>
+
+    <dialog
+      id="context-inspect-dialog"
+      class="context-inspect-dialog"
+      aria-labelledby="context-inspect-title"
+    >
+      <section class="context-inspect-card">
+        <header class="context-inspect-heading">
+          <div>
+            <p class="section-label">EFFECTIVE CONTEXT</p>
+            <h2 id="context-inspect-title">本轮上下文</h2>
+          </div>
+          <button
+            id="context-inspect-close"
+            class="quiet"
+            type="button"
+            aria-label="关闭本轮上下文"
+          >
+            关闭
+          </button>
+        </header>
+        <p id="context-inspect-availability" class="context-inspect-availability"></p>
+        <dl id="context-inspect-metrics" class="context-inspect-metrics"></dl>
+        <section class="context-section-panel" aria-labelledby="context-sections-title">
+          <h3 id="context-sections-title">按渲染顺序排列的 Section</h3>
+          <p class="context-content-notice">
+            Section 正文默认不返回。conversation 历史正文请查看右侧多轮对话；system
+            prompt 和其它隐藏 prompt 不暴露。
+          </p>
+          <ol id="context-section-list" class="context-section-list"></ol>
+        </section>
+        <p id="context-inspect-notice" class="context-inspect-notice"></p>
+        <details class="context-json-details">
+          <summary>完整安全 JSON（仅元数据）</summary>
+          <pre id="context-inspect-json" class="context-inspect-json"></pre>
+        </details>
       </section>
     </dialog>
   </body>

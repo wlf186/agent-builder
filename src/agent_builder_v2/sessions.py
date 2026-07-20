@@ -7,7 +7,7 @@ boundary event instead of relying on a recoverably inconsistent dual write.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import math
@@ -20,7 +20,23 @@ from threading import Lock
 from typing import Literal
 from uuid import uuid4
 
-from .contracts import SCHEMA_VERSION, EventEnvelope, utc_now
+from .contracts import (
+    RUN_CURSOR_RESERVED_THROUGH,
+    SCHEMA_VERSION,
+    EventEnvelope,
+    utc_now,
+)
+from .replay import (
+    LEGACY_PROJECTION_VERSION,
+    PROJECTION_VERSION,
+    ProjectionSnapshot,
+    ReplayCorruptionError,
+    RunIdentity,
+    decode_projection_snapshot,
+    decode_durable_event,
+    encode_projection_snapshot,
+    project_durable_run,
+)
 from .tools import ToolSpec, prototype_tool_specs
 
 
@@ -38,7 +54,7 @@ MAX_DURABLE_EVENT_BYTES = 65_536
 # Startup recovery replays only a bounded durable prefix.  These limits mirror
 # the live Control Plane quotas without importing ``control`` (which imports
 # this module), and leave room for the closure events plus the terminal.
-MAX_RECOVERY_EVENTS_PER_RUN = 512
+MAX_RECOVERY_EVENTS_PER_RUN = RUN_CURSOR_RESERVED_THROUGH
 MAX_RECOVERY_DURABLE_BYTES_PER_RUN = 256 * 1024
 MAX_RECOVERY_SEQUENCE = 1_000_000
 MAX_RECOVERY_JSON_DEPTH = 16
@@ -50,6 +66,11 @@ MAX_RECOVERY_FIELD_NAME_BYTES = 128
 MAX_RECOVERY_WORKER_TEXT_BYTES = 12_288
 MAX_LIST_LIMIT = 100
 MAX_LIST_OFFSET = 100_000
+MAX_OPERATION_RECORDS_PER_AGENT = 4_096
+MAX_PROVIDER_CALLS_PER_RUN = 64
+MAX_SNAPSHOT_BYTES = 65_536
+MAX_LEDGER_TEXT_BYTES = 128
+MAX_USAGE_TOKENS = 1_000_000_000
 
 _SAFE_ID = re.compile(r"^[a-f0-9-]{32,36}$")
 _RECOVERY_EVENT_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -57,9 +78,14 @@ _RECOVERY_WORKER_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _RECOVERY_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
 )
+_LEDGER_DIGEST = re.compile(r"^[a-f0-9]{64}$")
+_LEDGER_NAME = re.compile(r"^[A-Za-z0-9._:/-]{1,128}$")
+_CURRENCY = re.compile(r"^[A-Z]{3,12}$")
 _RECOVERY_DURABLE_KINDS = frozenset(
     {
         "run.started",
+        "model.request.started",
+        "model.response.finished",
         "assistant.block.started",
         "assistant.block.finished",
         "assistant.block.discarded",
@@ -80,6 +106,10 @@ _RECOVERY_TOOL_SPECS: dict[str, ToolSpec] = {
 TurnStatus = Literal["running", "completed", "failed", "cancelled", "interrupted"]
 TerminalTurnStatus = Literal["failed", "cancelled", "interrupted"]
 MessageRole = Literal["user", "assistant"]
+OperationStatus = Literal[
+    "intent", "dispatched", "succeeded", "failed", "cancelled", "outcome_unknown"
+]
+ProviderUsageStatus = Literal["started", "complete", "incomplete"]
 
 
 class ConversationStoreError(RuntimeError):
@@ -292,6 +322,76 @@ class ConversationDeleteResult:
 
 
 @dataclass(frozen=True, slots=True)
+class RunJournalState:
+    run_id: str
+    oldest_available_seq: int
+    latest_durable_seq: int
+    reserved_through: int
+    terminal_seq: int | None
+    terminal_kind: str | None
+    availability: str
+    event_count: int
+    durable_bytes: int
+    input_tokens: int
+    output_tokens: int
+    last_input_tokens: int
+    usage_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRecord:
+    operation_id: str
+    agent_id: str
+    conversation_id: str | None
+    turn_id: str | None
+    run_id: str | None
+    call_id: str | None
+    capability_id: str
+    policy_revision: str
+    idempotency_key_hash: str
+    request_digest: str
+    status: OperationStatus
+    executor_kind: str | None
+    executor_identity_digest: str | None
+    outcome_digest: str | None
+    created_at: str
+    dispatched_at: str | None
+    resolved_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OperationMutation:
+    record: OperationRecord
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUsage:
+    run_id: str
+    call_index: int
+    provider: str
+    model: str
+    profile_digest: str
+    context_plan_id: str
+    estimated_input_tokens: int
+    hard_input_tokens: int
+    status: ProviderUsageStatus
+    input_tokens: int | None
+    output_tokens: int | None
+    cost_minor_units: int | None
+    currency: str | None
+    pricing_profile_digest: str | None
+    started_at: str
+    completed_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderUsageMutation:
+    record: ProviderUsage
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _RecoveryScan:
     last_seq: int
     event_count: int
@@ -303,6 +403,47 @@ def _validate_id(value: object, field: str) -> str:
     if not isinstance(value, str) or _SAFE_ID.fullmatch(value) is None:
         raise ValueError(f"invalid {field}")
     return value
+
+
+def _ledger_digest(value: object, field: str) -> str:
+    if not isinstance(value, str) or _LEDGER_DIGEST.fullmatch(value) is None:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _ledger_name(value: object, field: str) -> str:
+    if not isinstance(value, str) or _LEDGER_NAME.fullmatch(value) is None:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _optional_ledger_id(value: object, field: str) -> str | None:
+    return None if value is None else _validate_id(value, field)
+
+
+def _usage_count(value: object, field: str, *, positive: bool = False) -> int:
+    minimum = 1 if positive else 0
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not minimum <= value <= MAX_USAGE_TOKENS
+    ):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def _run_journal_state_from_row(row: tuple[object, ...]) -> RunJournalState:
+    values = list(row)
+    values[-1] = bool(values[-1])
+    return RunJournalState(*values)  # type: ignore[arg-type]
+
+
+def _operation_from_row(row: tuple[object, ...]) -> OperationRecord:
+    return OperationRecord(*row)  # type: ignore[arg-type]
+
+
+def _provider_usage_from_row(row: tuple[object, ...]) -> ProviderUsage:
+    return ProviderUsage(*row)  # type: ignore[arg-type]
 
 
 def conversation_message_id(turn_id: str, role: MessageRole) -> str:
@@ -587,7 +728,7 @@ class ConversationStore:
                     "could not enforce conversation state size limit"
                 )
             self._connection.executescript(
-                """
+                f"""
                 BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS events (
                     run_id TEXT NOT NULL,
@@ -637,6 +778,165 @@ class ConversationStore:
                     ON conversations(agent_id, updated_at DESC);
                 CREATE INDEX IF NOT EXISTS conversation_turns_history
                     ON conversation_turns(conversation_id, status, position);
+                CREATE UNIQUE INDEX IF NOT EXISTS events_one_terminal_per_run
+                    ON events(run_id)
+                    WHERE kind IN ('run.completed', 'run.failed', 'run.cancelled');
+                CREATE TABLE IF NOT EXISTS run_journal_state (
+                    run_id TEXT PRIMARY KEY
+                        REFERENCES conversation_turns(run_id) ON DELETE CASCADE,
+                    oldest_available_seq INTEGER NOT NULL CHECK (oldest_available_seq > 0),
+                    latest_durable_seq INTEGER NOT NULL CHECK (latest_durable_seq > 0),
+                    reserved_through INTEGER NOT NULL CHECK (reserved_through >= 1),
+                    terminal_seq INTEGER,
+                    terminal_kind TEXT CHECK (
+                        terminal_kind IS NULL OR terminal_kind IN (
+                            'run.completed', 'run.failed', 'run.cancelled'
+                        )
+                    ),
+                    availability TEXT NOT NULL CHECK (
+                        availability IN ('full', 'snapshot_only', 'pruned', 'corrupt')
+                    ),
+                    event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                    durable_bytes INTEGER NOT NULL CHECK (durable_bytes >= 0),
+                    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+                    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+                    last_input_tokens INTEGER NOT NULL DEFAULT 0
+                        CHECK (last_input_tokens >= 0),
+                    usage_complete INTEGER NOT NULL DEFAULT 0
+                        CHECK (usage_complete IN (0, 1)),
+                    CHECK (
+                        (terminal_seq IS NULL AND terminal_kind IS NULL)
+                        OR (terminal_seq > 0 AND terminal_kind IS NOT NULL)
+                    )
+                );
+                CREATE TABLE IF NOT EXISTS run_snapshots (
+                    run_id TEXT PRIMARY KEY
+                        REFERENCES run_journal_state(run_id) ON DELETE CASCADE,
+                    projection_version TEXT NOT NULL,
+                    through_seq INTEGER NOT NULL CHECK (through_seq > 0),
+                    snapshot_json TEXT NOT NULL,
+                    source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+                    ephemeral_loss INTEGER NOT NULL CHECK (ephemeral_loss IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    CHECK (length(CAST(snapshot_json AS BLOB)) <= 65536)
+                );
+                CREATE TABLE IF NOT EXISTS operation_ledger (
+                    operation_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    conversation_id TEXT REFERENCES conversations(conversation_id)
+                        ON DELETE CASCADE,
+                    turn_id TEXT REFERENCES conversation_turns(turn_id) ON DELETE CASCADE,
+                    run_id TEXT REFERENCES conversation_turns(run_id) ON DELETE CASCADE,
+                    call_id TEXT,
+                    capability_id TEXT NOT NULL,
+                    policy_revision TEXT NOT NULL,
+                    idempotency_key_hash TEXT NOT NULL CHECK (
+                        length(idempotency_key_hash) = 64
+                    ),
+                    request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'intent', 'dispatched', 'succeeded', 'failed',
+                            'cancelled', 'outcome_unknown'
+                        )
+                    ),
+                    executor_kind TEXT,
+                    executor_identity_digest TEXT,
+                    outcome_digest TEXT,
+                    created_at TEXT NOT NULL,
+                    dispatched_at TEXT,
+                    resolved_at TEXT,
+                    UNIQUE (agent_id, idempotency_key_hash),
+                    CHECK (
+                        (status = 'intent' AND executor_kind IS NULL
+                            AND executor_identity_digest IS NULL
+                            AND dispatched_at IS NULL AND resolved_at IS NULL
+                            AND outcome_digest IS NULL)
+                        OR (status = 'dispatched' AND executor_kind IS NOT NULL
+                            AND executor_identity_digest IS NOT NULL
+                            AND dispatched_at IS NOT NULL AND resolved_at IS NULL
+                            AND outcome_digest IS NULL)
+                        OR (status IN ('succeeded', 'failed', 'cancelled')
+                            AND executor_kind IS NOT NULL
+                            AND executor_identity_digest IS NOT NULL
+                            AND dispatched_at IS NOT NULL AND resolved_at IS NOT NULL
+                            AND outcome_digest IS NOT NULL)
+                        OR (status = 'outcome_unknown' AND executor_kind IS NOT NULL
+                            AND executor_identity_digest IS NOT NULL
+                            AND dispatched_at IS NOT NULL AND resolved_at IS NOT NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS operation_ledger_run
+                    ON operation_ledger(run_id, call_id);
+                CREATE TABLE IF NOT EXISTS provider_usage (
+                    run_id TEXT NOT NULL
+                        REFERENCES run_journal_state(run_id) ON DELETE CASCADE,
+                    call_index INTEGER NOT NULL CHECK (
+                        call_index BETWEEN 1 AND 64
+                    ),
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    profile_digest TEXT NOT NULL CHECK (length(profile_digest) = 64),
+                    context_plan_id TEXT NOT NULL,
+                    estimated_input_tokens INTEGER NOT NULL CHECK (
+                        estimated_input_tokens BETWEEN 0 AND 1000000000
+                    ),
+                    hard_input_tokens INTEGER NOT NULL CHECK (
+                        hard_input_tokens BETWEEN 1 AND 1000000000
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN ('started', 'complete', 'incomplete')
+                    ),
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cost_minor_units INTEGER,
+                    currency TEXT,
+                    pricing_profile_digest TEXT,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    PRIMARY KEY (run_id, call_index),
+                    CHECK (estimated_input_tokens <= hard_input_tokens),
+                    CHECK (
+                        (status = 'started' AND input_tokens IS NULL
+                            AND output_tokens IS NULL AND completed_at IS NULL)
+                        OR (status = 'incomplete' AND input_tokens IS NULL
+                            AND output_tokens IS NULL AND completed_at IS NOT NULL)
+                        OR (status = 'complete' AND input_tokens BETWEEN 0 AND 1000000000
+                            AND output_tokens BETWEEN 0 AND 1000000000
+                            AND completed_at IS NOT NULL)
+                    ),
+                    CHECK (
+                        (cost_minor_units IS NULL AND currency IS NULL
+                            AND pricing_profile_digest IS NULL)
+                        OR (cost_minor_units >= 0 AND currency IS NOT NULL
+                            AND pricing_profile_digest IS NOT NULL
+                            AND length(pricing_profile_digest) = 64)
+                    )
+                );
+                INSERT OR IGNORE INTO run_journal_state(
+                    run_id, oldest_available_seq, latest_durable_seq,
+                    reserved_through, terminal_seq, terminal_kind, availability,
+                    event_count, durable_bytes, input_tokens, output_tokens,
+                    last_input_tokens, usage_complete
+                )
+                SELECT
+                    t.run_id,
+                    COALESCE(MIN(e.seq), 1),
+                    COALESCE(MAX(e.seq), 1),
+                    {RUN_CURSOR_RESERVED_THROUGH},
+                    MAX(CASE WHEN e.kind IN (
+                        'run.completed', 'run.failed', 'run.cancelled'
+                    ) THEN e.seq END),
+                    MAX(CASE WHEN e.kind IN (
+                        'run.completed', 'run.failed', 'run.cancelled'
+                    ) THEN e.kind END),
+                    'full',
+                    COUNT(e.seq),
+                    COALESCE(SUM(length(CAST(e.envelope_json AS BLOB))), 0),
+                    0, 0, 0, 0
+                FROM conversation_turns AS t
+                LEFT JOIN events AS e ON e.run_id = t.run_id
+                GROUP BY t.run_id;
                 COMMIT;
                 """
             )
@@ -669,6 +969,1244 @@ class ConversationStore:
             """,
             (event.run_id, event.seq, event.kind, event.occurred_at, encoded),
         )
+
+    def _owned_run_exists(self, run_id: str) -> bool:
+        return self._connection.execute(
+            """
+            SELECT 1
+            FROM conversation_turns AS t
+            JOIN conversations AS c ON c.conversation_id = t.conversation_id
+            WHERE t.run_id = ? AND c.agent_id = ?
+            """,
+            (run_id, self.agent_id),
+        ).fetchone() is not None
+
+    def _run_journal_row(self, run_id: str) -> tuple[object, ...] | None:
+        return self._connection.execute(
+            """
+            SELECT s.run_id, s.oldest_available_seq, s.latest_durable_seq,
+                   s.reserved_through, s.terminal_seq, s.terminal_kind,
+                   s.availability, s.event_count, s.durable_bytes,
+                   s.input_tokens, s.output_tokens, s.last_input_tokens,
+                   s.usage_complete
+            FROM run_journal_state AS s
+            JOIN conversation_turns AS t ON t.run_id = s.run_id
+            JOIN conversations AS c ON c.conversation_id = t.conversation_id
+            WHERE s.run_id = ? AND c.agent_id = ?
+            """,
+            (run_id, self.agent_id),
+        ).fetchone()
+
+    def _append_running_boundary_locked(
+        self,
+        event: EventEnvelope,
+        *,
+        expected_kind: str,
+    ) -> str:
+        """Append one nonterminal boundary and advance its journal atomically."""
+
+        identity = self._resolve_run_identity_locked(event.run_id)
+        turn_row = self._turn_for_run(event.run_id)
+        state_row = self._run_journal_row(event.run_id)
+        if identity is None or turn_row is None or state_row is None:
+            raise TurnNotFoundError("Run has no conversation turn")
+        turn = _turn_from_row(turn_row)
+        state = _run_journal_state_from_row(state_row)
+        encoded = _encode_boundary_event(
+            event,
+            expected_kind=expected_kind,
+            agent_id=identity.agent_id,
+            conversation_id=identity.conversation_id,
+            turn_id=identity.turn_id,
+            run_id=identity.run_id,
+            minimum_seq=2,
+        )
+        encoded_bytes = len(encoded.encode("utf-8"))
+        if (
+            turn.status != "running"
+            or state.oldest_available_seq != 1
+            or state.reserved_through != RUN_CURSOR_RESERVED_THROUGH
+            or state.terminal_seq is not None
+            or state.terminal_kind is not None
+            or state.availability != "full"
+            or not 1 <= state.latest_durable_seq < event.seq <= MAX_RECOVERY_SEQUENCE
+            or not 1 <= state.event_count < MAX_RECOVERY_EVENTS_PER_RUN
+            or not 1 <= state.durable_bytes
+            or state.durable_bytes + encoded_bytes
+            > MAX_RECOVERY_DURABLE_BYTES_PER_RUN
+        ):
+            raise ConversationConflictError(
+                "Run journal rejects provider boundary append"
+            )
+        self._insert_boundary_event(event, encoded)
+        cursor = self._connection.execute(
+            """
+            UPDATE run_journal_state
+            SET latest_durable_seq = ?, event_count = event_count + 1,
+                durable_bytes = durable_bytes + ?
+            WHERE run_id = ? AND latest_durable_seq = ?
+              AND terminal_seq IS NULL AND availability = 'full'
+            """,
+            (
+                event.seq,
+                encoded_bytes,
+                event.run_id,
+                state.latest_durable_seq,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ConversationConflictError(
+                "Run journal provider boundary update was lost"
+            )
+        return encoded
+
+    def get_run_journal_state(self, run_id: str) -> RunJournalState:
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._run_journal_row(run_id)
+            except sqlite3.Error as exc:
+                raise ConversationStoreUnavailableError(
+                    "could not read Run journal state"
+                ) from exc
+        if row is None:
+            raise TurnNotFoundError("Run has no journal state")
+        return _run_journal_state_from_row(row)
+
+    def _resolve_run_identity_locked(self, run_id: str) -> RunIdentity | None:
+        row = self._connection.execute(
+            """
+            SELECT c.agent_id, t.conversation_id, t.turn_id, t.run_id
+            FROM conversation_turns AS t
+            JOIN conversations AS c ON c.conversation_id = t.conversation_id
+            WHERE t.run_id = ? AND c.agent_id = ?
+            """,
+            (run_id, self.agent_id),
+        ).fetchone()
+        return None if row is None else RunIdentity(*row)
+
+    def resolve_run_identity(self, run_id: str) -> RunIdentity:
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            self._ensure_open()
+            try:
+                identity = self._resolve_run_identity_locked(run_id)
+            except sqlite3.Error as exc:
+                raise ConversationStoreUnavailableError(
+                    "could not resolve Run identity"
+                ) from exc
+        if identity is None:
+            raise TurnNotFoundError("Run has no conversation turn")
+        return identity
+
+    def read_run_snapshot(self, run_id: str) -> ProjectionSnapshot | None:
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            self._ensure_open()
+            try:
+                identity = self._resolve_run_identity_locked(run_id)
+                if identity is None:
+                    raise TurnNotFoundError("Run has no conversation turn")
+                row = self._connection.execute(
+                    """
+                    SELECT p.projection_version, p.through_seq, p.snapshot_json,
+                           p.source_digest, s.latest_durable_seq, s.terminal_seq,
+                           s.terminal_kind
+                    FROM run_snapshots AS p
+                    JOIN run_journal_state AS s ON s.run_id = p.run_id
+                    WHERE p.run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+            except ConversationStoreError:
+                raise
+            except sqlite3.Error as exc:
+                raise ConversationStoreUnavailableError(
+                    "could not read Run snapshot"
+                ) from exc
+        if row is None:
+            return None
+        (
+            version,
+            through_seq,
+            raw_snapshot,
+            stored_digest,
+            latest_durable_seq,
+            terminal_seq,
+            terminal_kind,
+        ) = row
+        if (
+            version not in {LEGACY_PROJECTION_VERSION, PROJECTION_VERSION}
+            or not isinstance(through_seq, int)
+            or isinstance(through_seq, bool)
+            or through_seq != latest_durable_seq
+            or through_seq != terminal_seq
+            or terminal_kind not in {
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }
+            or not isinstance(stored_digest, str)
+            or _LEDGER_DIGEST.fullmatch(stored_digest) is None
+        ):
+            raise ConversationConflictError("Run snapshot is invalid")
+        if not isinstance(raw_snapshot, str):
+            raise ConversationConflictError("Run snapshot is invalid")
+        try:
+            encoded_snapshot = raw_snapshot.encode("utf-8")
+            if hashlib.sha256(encoded_snapshot).hexdigest() != stored_digest:
+                raise ConversationConflictError("Run snapshot digest is invalid")
+            snapshot = decode_projection_snapshot(
+                encoded_snapshot,
+                expected_identity=identity,
+                expected_through_seq=through_seq,
+            )
+        except ReplayCorruptionError as exc:
+            raise ConversationConflictError("Run snapshot is invalid") from exc
+        document = snapshot.document
+        if (
+            snapshot.version != version
+            or
+            not isinstance(document.get("started"), dict)
+            or not isinstance(document.get("blocks"), list)
+            or not isinstance(document.get("tools"), list)
+            or not isinstance(document.get("terminal"), dict)
+            or set(document["terminal"]) != {"kind", "payload"}  # type: ignore[arg-type]
+            or document["terminal"].get("kind") != terminal_kind  # type: ignore[union-attr]
+            or not isinstance(document["terminal"].get("payload"), dict)  # type: ignore[union-attr]
+        ):
+            raise ConversationConflictError("Run snapshot is invalid")
+        return snapshot
+
+    def get_run_snapshot(self, run_id: str) -> dict[str, object] | None:
+        snapshot = self.read_run_snapshot(run_id)
+        return None if snapshot is None else snapshot.to_dict()
+
+    def _operation_row(
+        self, *, operation_id: str | None = None, idempotency_key_hash: str | None = None
+    ) -> tuple[object, ...] | None:
+        if (operation_id is None) == (idempotency_key_hash is None):
+            raise ValueError("one operation lookup identity is required")
+        field = "operation_id" if operation_id is not None else "idempotency_key_hash"
+        value = operation_id if operation_id is not None else idempotency_key_hash
+        return self._connection.execute(
+            f"""
+            SELECT operation_id, agent_id, conversation_id, turn_id, run_id,
+                   call_id, capability_id, policy_revision, idempotency_key_hash,
+                   request_digest, status, executor_kind,
+                   executor_identity_digest, outcome_digest, created_at,
+                   dispatched_at, resolved_at
+            FROM operation_ledger
+            WHERE {field} = ? AND agent_id = ?
+            """,
+            (value, self.agent_id),
+        ).fetchone()
+
+    def _validate_operation_target(
+        self,
+        conversation_id: str | None,
+        turn_id: str | None,
+        run_id: str | None,
+    ) -> None:
+        if run_id is not None:
+            row = self._connection.execute(
+                """
+                SELECT t.conversation_id, t.turn_id
+                FROM conversation_turns AS t
+                JOIN conversations AS c ON c.conversation_id = t.conversation_id
+                WHERE t.run_id = ? AND c.agent_id = ?
+                """,
+                (run_id, self.agent_id),
+            ).fetchone()
+            if row is None or (conversation_id is not None and row[0] != conversation_id) or (
+                turn_id is not None and row[1] != turn_id
+            ):
+                raise TurnNotFoundError("operation target Run was not found")
+            return
+        if turn_id is not None:
+            row = self._connection.execute(
+                """
+                SELECT t.conversation_id
+                FROM conversation_turns AS t
+                JOIN conversations AS c ON c.conversation_id = t.conversation_id
+                WHERE t.turn_id = ? AND c.agent_id = ?
+                """,
+                (turn_id, self.agent_id),
+            ).fetchone()
+            if row is None or (conversation_id is not None and row[0] != conversation_id):
+                raise TurnNotFoundError("operation target Turn was not found")
+            return
+        if conversation_id is not None and self._connection.execute(
+            """
+            SELECT 1 FROM conversations WHERE conversation_id = ? AND agent_id = ?
+            """,
+            (conversation_id, self.agent_id),
+        ).fetchone() is None:
+            raise ConversationNotFoundError("operation target conversation was not found")
+
+    def record_operation_intent(
+        self,
+        *,
+        operation_id: str,
+        capability_id: str,
+        policy_revision: str,
+        idempotency_key_hash: str,
+        request_digest: str,
+        conversation_id: str | None = None,
+        turn_id: str | None = None,
+        run_id: str | None = None,
+        call_id: str | None = None,
+    ) -> OperationMutation:
+        operation_id = _validate_id(operation_id, "operation_id")
+        capability_id = _ledger_name(capability_id, "capability_id")
+        policy_revision = _ledger_name(policy_revision, "policy_revision")
+        idempotency_key_hash = _ledger_digest(
+            idempotency_key_hash, "idempotency_key_hash"
+        )
+        request_digest = _ledger_digest(request_digest, "request_digest")
+        conversation_id = _optional_ledger_id(conversation_id, "conversation_id")
+        turn_id = _optional_ledger_id(turn_id, "turn_id")
+        run_id = _optional_ledger_id(run_id, "run_id")
+        call_id = None if call_id is None else _ledger_name(call_id, "call_id")
+        timestamp = utc_now()
+        immutable = (
+            self.agent_id,
+            conversation_id,
+            turn_id,
+            run_id,
+            call_id,
+            capability_id,
+            policy_revision,
+            idempotency_key_hash,
+            request_digest,
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                existing_row = self._operation_row(
+                    idempotency_key_hash=idempotency_key_hash
+                )
+                if existing_row is not None:
+                    existing = _operation_from_row(existing_row)
+                    if (
+                        existing.agent_id,
+                        existing.conversation_id,
+                        existing.turn_id,
+                        existing.run_id,
+                        existing.call_id,
+                        existing.capability_id,
+                        existing.policy_revision,
+                        existing.idempotency_key_hash,
+                        existing.request_digest,
+                    ) != immutable:
+                        raise ConversationConflictError(
+                            "idempotency key was reused with a different operation"
+                        )
+                    self._connection.commit()
+                    return OperationMutation(existing, False)
+                self._validate_operation_target(conversation_id, turn_id, run_id)
+                count = self._connection.execute(
+                    "SELECT COUNT(*) FROM operation_ledger WHERE agent_id = ?",
+                    (self.agent_id,),
+                ).fetchone()[0]
+                if count >= MAX_OPERATION_RECORDS_PER_AGENT:
+                    raise ConversationConflictError("operation ledger capacity is exhausted")
+                self._connection.execute(
+                    """
+                    INSERT INTO operation_ledger(
+                        operation_id, agent_id, conversation_id, turn_id, run_id,
+                        call_id, capability_id, policy_revision,
+                        idempotency_key_hash, request_digest, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'intent', ?)
+                    """,
+                    (operation_id, *immutable, timestamp),
+                )
+                row = self._operation_row(operation_id=operation_id)
+                assert row is not None
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise ConversationConflictError("operation identity already exists") from exc
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not record operation intent"
+                ) from exc
+        return OperationMutation(_operation_from_row(row), True)
+
+    def mark_operation_dispatched(
+        self,
+        operation_id: str,
+        *,
+        executor_kind: str,
+        executor_identity_digest: str,
+    ) -> OperationMutation:
+        operation_id = _validate_id(operation_id, "operation_id")
+        executor_kind = _ledger_name(executor_kind, "executor_kind")
+        executor_identity_digest = _ledger_digest(
+            executor_identity_digest, "executor_identity_digest"
+        )
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row = self._operation_row(operation_id=operation_id)
+                if row is None:
+                    raise TurnNotFoundError("operation was not found")
+                existing = _operation_from_row(row)
+                changed = False
+                if existing.status == "intent":
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE operation_ledger
+                        SET status = 'dispatched', executor_kind = ?,
+                            executor_identity_digest = ?, dispatched_at = ?
+                        WHERE operation_id = ? AND agent_id = ? AND status = 'intent'
+                        """,
+                        (
+                            executor_kind,
+                            executor_identity_digest,
+                            timestamp,
+                            operation_id,
+                            self.agent_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConversationConflictError("operation dispatch transition was lost")
+                    changed = True
+                elif (
+                    existing.executor_kind != executor_kind
+                    or existing.executor_identity_digest != executor_identity_digest
+                ):
+                    raise ConversationConflictError(
+                        "operation is bound to a different executor"
+                    )
+                row = self._operation_row(operation_id=operation_id)
+                assert row is not None
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not record operation dispatch"
+                ) from exc
+        return OperationMutation(_operation_from_row(row), changed)
+
+    def record_operation_outcome(
+        self,
+        operation_id: str,
+        status: Literal["succeeded", "failed", "cancelled", "outcome_unknown"],
+        *,
+        outcome_digest: str | None = None,
+    ) -> OperationMutation:
+        operation_id = _validate_id(operation_id, "operation_id")
+        if status not in {"succeeded", "failed", "cancelled", "outcome_unknown"}:
+            raise ValueError("invalid operation outcome")
+        if status == "outcome_unknown":
+            if outcome_digest is not None:
+                raise ValueError("outcome_unknown cannot claim an outcome digest")
+        else:
+            outcome_digest = _ledger_digest(outcome_digest, "outcome_digest")
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row = self._operation_row(operation_id=operation_id)
+                if row is None:
+                    raise TurnNotFoundError("operation was not found")
+                existing = _operation_from_row(row)
+                changed = False
+                if existing.status == "dispatched":
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE operation_ledger
+                        SET status = ?, outcome_digest = ?, resolved_at = ?
+                        WHERE operation_id = ? AND agent_id = ?
+                          AND status = 'dispatched'
+                        """,
+                        (
+                            status,
+                            outcome_digest,
+                            timestamp,
+                            operation_id,
+                            self.agent_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConversationConflictError("operation outcome transition was lost")
+                    changed = True
+                elif existing.status != status or existing.outcome_digest != outcome_digest:
+                    raise ConversationConflictError("operation already has another outcome")
+                row = self._operation_row(operation_id=operation_id)
+                assert row is not None
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not record operation outcome"
+                ) from exc
+        return OperationMutation(_operation_from_row(row), changed)
+
+    def _recover_dispatched_operations_locked(self, timestamp: str) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE operation_ledger
+            SET status = 'outcome_unknown', outcome_digest = NULL, resolved_at = ?
+            WHERE agent_id = ? AND status = 'dispatched'
+            """,
+            (timestamp, self.agent_id),
+        )
+        return max(cursor.rowcount, 0)
+
+    def recover_dispatched_operations(self) -> int:
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                count = self._recover_dispatched_operations_locked(timestamp)
+                self._connection.commit()
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not recover dispatched operations"
+                ) from exc
+        return count
+
+    def _provider_usage_row(
+        self, run_id: str, call_index: int
+    ) -> tuple[object, ...] | None:
+        return self._connection.execute(
+            """
+            SELECT u.run_id, u.call_index, u.provider, u.model,
+                   u.profile_digest, u.context_plan_id,
+                   u.estimated_input_tokens, u.hard_input_tokens, u.status,
+                   u.input_tokens, u.output_tokens, u.cost_minor_units,
+                   u.currency, u.pricing_profile_digest,
+                   u.started_at, u.completed_at
+            FROM provider_usage AS u
+            JOIN run_journal_state AS s ON s.run_id = u.run_id
+            JOIN conversation_turns AS t ON t.run_id = s.run_id
+            JOIN conversations AS c ON c.conversation_id = t.conversation_id
+            WHERE u.run_id = ? AND u.call_index = ? AND c.agent_id = ?
+            """,
+            (run_id, call_index, self.agent_id),
+        ).fetchone()
+
+    def _start_provider_usage_locked(
+        self,
+        immutable: tuple[object, ...],
+        *,
+        timestamp: str,
+    ) -> tuple[tuple[object, ...], bool]:
+        run_id = immutable[0]
+        call_index = immutable[1]
+        assert isinstance(run_id, str) and isinstance(call_index, int)
+        if not self._owned_run_exists(run_id):
+            raise TurnNotFoundError("Run has no conversation turn")
+        row = self._provider_usage_row(run_id, call_index)
+        if row is not None:
+            existing = _provider_usage_from_row(row)
+            if (
+                existing.run_id,
+                existing.call_index,
+                existing.provider,
+                existing.model,
+                existing.profile_digest,
+                existing.context_plan_id,
+                existing.estimated_input_tokens,
+                existing.hard_input_tokens,
+            ) != immutable:
+                raise ConversationConflictError(
+                    "provider call identity was reused with different metadata"
+                )
+            return row, False
+        self._connection.execute(
+            """
+            INSERT INTO provider_usage(
+                run_id, call_index, provider, model, profile_digest,
+                context_plan_id, estimated_input_tokens, hard_input_tokens,
+                status, started_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?)
+            """,
+            (*immutable, timestamp),
+        )
+        row = self._provider_usage_row(run_id, call_index)
+        assert row is not None
+        return row, True
+
+    def _complete_provider_usage_locked(
+        self,
+        run_id: str,
+        call_index: int,
+        outcome: tuple[object, ...],
+        *,
+        timestamp: str,
+    ) -> tuple[tuple[object, ...], bool]:
+        row = self._provider_usage_row(run_id, call_index)
+        if row is None:
+            raise TurnNotFoundError("provider call was not found")
+        existing = _provider_usage_from_row(row)
+        input_tokens = outcome[0]
+        assert isinstance(input_tokens, int)
+        if input_tokens > existing.hard_input_tokens:
+            raise ConversationConflictError(
+                "provider usage exceeds the hard input budget"
+            )
+        changed = False
+        if existing.status == "started":
+            cursor = self._connection.execute(
+                """
+                UPDATE provider_usage
+                SET status = 'complete', input_tokens = ?, output_tokens = ?,
+                    cost_minor_units = ?, currency = ?,
+                    pricing_profile_digest = ?, completed_at = ?
+                WHERE run_id = ? AND call_index = ? AND status = 'started'
+                """,
+                (
+                    *outcome,
+                    timestamp,
+                    run_id,
+                    call_index,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationConflictError("provider usage transition was lost")
+            changed = True
+        elif existing.status != "complete" or (
+            existing.input_tokens,
+            existing.output_tokens,
+            existing.cost_minor_units,
+            existing.currency,
+            existing.pricing_profile_digest,
+        ) != outcome:
+            raise ConversationConflictError(
+                "provider call already has another usage outcome"
+            )
+        row = self._provider_usage_row(run_id, call_index)
+        assert row is not None
+        return row, changed
+
+    def start_provider_usage(
+        self,
+        run_id: str,
+        call_index: int,
+        *,
+        provider: str,
+        model: str,
+        profile_digest: str,
+        context_plan_id: str,
+        estimated_input_tokens: int,
+        hard_input_tokens: int,
+    ) -> ProviderUsageMutation:
+        run_id = _validate_id(run_id, "run_id")
+        if (
+            not isinstance(call_index, int)
+            or isinstance(call_index, bool)
+            or not 1 <= call_index <= MAX_PROVIDER_CALLS_PER_RUN
+        ):
+            raise ValueError("invalid provider call_index")
+        provider = _ledger_name(provider, "provider")
+        model = _ledger_name(model, "model")
+        profile_digest = _ledger_digest(profile_digest, "profile_digest")
+        context_plan_id = _ledger_name(context_plan_id, "context_plan_id")
+        estimated_input_tokens = _usage_count(
+            estimated_input_tokens, "estimated_input_tokens"
+        )
+        hard_input_tokens = _usage_count(
+            hard_input_tokens, "hard_input_tokens", positive=True
+        )
+        if estimated_input_tokens > hard_input_tokens:
+            raise ValueError("estimated input exceeds the hard input budget")
+        timestamp = utc_now()
+        immutable = (
+            run_id,
+            call_index,
+            provider,
+            model,
+            profile_digest,
+            context_plan_id,
+            estimated_input_tokens,
+            hard_input_tokens,
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row, changed = self._start_provider_usage_locked(
+                    immutable,
+                    timestamp=timestamp,
+                )
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not start provider usage record"
+                ) from exc
+        return ProviderUsageMutation(_provider_usage_from_row(row), changed)
+
+    def complete_provider_usage(
+        self,
+        run_id: str,
+        call_index: int,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cost_minor_units: int | None = None,
+        currency: str | None = None,
+        pricing_profile_digest: str | None = None,
+    ) -> ProviderUsageMutation:
+        run_id = _validate_id(run_id, "run_id")
+        if (
+            not isinstance(call_index, int)
+            or isinstance(call_index, bool)
+            or not 1 <= call_index <= MAX_PROVIDER_CALLS_PER_RUN
+        ):
+            raise ValueError("invalid provider call_index")
+        input_tokens = _usage_count(input_tokens, "input_tokens")
+        output_tokens = _usage_count(output_tokens, "output_tokens")
+        if cost_minor_units is None:
+            if currency is not None or pricing_profile_digest is not None:
+                raise ValueError("incomplete provider cost metadata")
+        else:
+            cost_minor_units = _usage_count(cost_minor_units, "cost_minor_units")
+            if not isinstance(currency, str) or _CURRENCY.fullmatch(currency) is None:
+                raise ValueError("invalid currency")
+            pricing_profile_digest = _ledger_digest(
+                pricing_profile_digest, "pricing_profile_digest"
+            )
+        timestamp = utc_now()
+        outcome = (
+            input_tokens,
+            output_tokens,
+            cost_minor_units,
+            currency,
+            pricing_profile_digest,
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row, changed = self._complete_provider_usage_locked(
+                    run_id,
+                    call_index,
+                    outcome,
+                    timestamp=timestamp,
+                )
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not complete provider usage record"
+                ) from exc
+        return ProviderUsageMutation(_provider_usage_from_row(row), changed)
+
+    def start_provider_usage_with_event(
+        self,
+        run_id: str,
+        call_index: int,
+        *,
+        provider: str,
+        model: str,
+        profile_digest: str,
+        context_plan_id: str,
+        estimated_input_tokens: int,
+        hard_input_tokens: int,
+        boundary_event: EventEnvelope,
+    ) -> ProviderUsageMutation:
+        """Atomically admit provider usage and its canonical request boundary."""
+
+        run_id = _validate_id(run_id, "run_id")
+        if (
+            not isinstance(call_index, int)
+            or isinstance(call_index, bool)
+            or not 1 <= call_index <= MAX_PROVIDER_CALLS_PER_RUN
+        ):
+            raise ValueError("invalid provider call_index")
+        provider = _ledger_name(provider, "provider")
+        model = _ledger_name(model, "model")
+        profile_digest = _ledger_digest(profile_digest, "profile_digest")
+        context_plan_id = _ledger_name(context_plan_id, "context_plan_id")
+        estimated_input_tokens = _usage_count(
+            estimated_input_tokens, "estimated_input_tokens"
+        )
+        hard_input_tokens = _usage_count(
+            hard_input_tokens, "hard_input_tokens", positive=True
+        )
+        if estimated_input_tokens > hard_input_tokens:
+            raise ValueError("estimated input exceeds the hard input budget")
+        payload = (
+            boundary_event.payload
+            if isinstance(boundary_event, EventEnvelope)
+            else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("iteration") != call_index
+            or payload.get("context_plan_id") != context_plan_id
+            or payload.get("estimated_input_tokens") != estimated_input_tokens
+        ):
+            raise ValueError("provider request boundary disagrees with its usage")
+        immutable = (
+            run_id,
+            call_index,
+            provider,
+            model,
+            profile_digest,
+            context_plan_id,
+            estimated_input_tokens,
+            hard_input_tokens,
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row, changed = self._start_provider_usage_locked(
+                    immutable,
+                    timestamp=boundary_event.occurred_at,
+                )
+                self._append_running_boundary_locked(
+                    boundary_event,
+                    expected_kind="model.request.started",
+                )
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise ConversationConflictError(
+                    "provider request boundary already exists"
+                ) from exc
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not commit provider request boundary"
+                ) from exc
+        return ProviderUsageMutation(_provider_usage_from_row(row), changed)
+
+    def complete_provider_usage_with_event(
+        self,
+        run_id: str,
+        call_index: int,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        boundary_event: EventEnvelope,
+    ) -> ProviderUsageMutation:
+        """Atomically complete provider usage and its canonical response boundary."""
+
+        run_id = _validate_id(run_id, "run_id")
+        if (
+            not isinstance(call_index, int)
+            or isinstance(call_index, bool)
+            or not 1 <= call_index <= MAX_PROVIDER_CALLS_PER_RUN
+        ):
+            raise ValueError("invalid provider call_index")
+        input_tokens = _usage_count(input_tokens, "input_tokens")
+        output_tokens = _usage_count(output_tokens, "output_tokens")
+        payload = (
+            boundary_event.payload
+            if isinstance(boundary_event, EventEnvelope)
+            else None
+        )
+        if (
+            not isinstance(payload, dict)
+            or payload.get("iteration") != call_index
+            or payload.get("input_tokens") != input_tokens
+            or payload.get("output_tokens") != output_tokens
+            or payload.get("usage_complete") is not True
+            or payload.get("error_code") is not None
+            or payload.get("outcome") not in {"tool_use", "end_turn"}
+        ):
+            raise ValueError("provider response boundary disagrees with its usage")
+        outcome = (input_tokens, output_tokens, None, None, None)
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row, changed = self._complete_provider_usage_locked(
+                    run_id,
+                    call_index,
+                    outcome,
+                    timestamp=boundary_event.occurred_at,
+                )
+                self._append_running_boundary_locked(
+                    boundary_event,
+                    expected_kind="model.response.finished",
+                )
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise ConversationConflictError(
+                    "provider response boundary already exists"
+                ) from exc
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not commit provider response boundary"
+                ) from exc
+        return ProviderUsageMutation(_provider_usage_from_row(row), changed)
+
+    def provider_usage_for_run(self, run_id: str) -> tuple[ProviderUsage, ...]:
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            self._ensure_open()
+            try:
+                if not self._owned_run_exists(run_id):
+                    raise TurnNotFoundError("Run has no conversation turn")
+                rows = self._connection.execute(
+                    """
+                    SELECT run_id, call_index, provider, model, profile_digest,
+                           context_plan_id, estimated_input_tokens,
+                           hard_input_tokens, status, input_tokens, output_tokens,
+                           cost_minor_units, currency, pricing_profile_digest,
+                           started_at, completed_at
+                    FROM provider_usage
+                    WHERE run_id = ? ORDER BY call_index
+                    LIMIT ?
+                    """,
+                    (run_id, MAX_PROVIDER_CALLS_PER_RUN + 1),
+                ).fetchall()
+            except ConversationStoreError:
+                raise
+            except sqlite3.Error as exc:
+                raise ConversationStoreUnavailableError(
+                    "could not read provider usage"
+                ) from exc
+        if len(rows) > MAX_PROVIDER_CALLS_PER_RUN:
+            raise ConversationConflictError("provider usage exceeds its capacity")
+        return tuple(_provider_usage_from_row(row) for row in rows)
+
+    def _mark_started_usage_incomplete_locked(self, timestamp: str) -> int:
+        cursor = self._connection.execute(
+            """
+            UPDATE provider_usage
+            SET status = 'incomplete', completed_at = ?
+            WHERE status = 'started' AND run_id IN (
+                SELECT t.run_id
+                FROM conversation_turns AS t
+                JOIN conversations AS c ON c.conversation_id = t.conversation_id
+                WHERE c.agent_id = ?
+            )
+            """,
+            (timestamp, self.agent_id),
+        )
+        return max(cursor.rowcount, 0)
+
+    def _usage_aggregate_locked(
+        self, run_id: str, *, force_incomplete: bool = False
+    ) -> tuple[int, int, int, bool]:
+        row = self._connection.execute(
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN status = 'complete' THEN input_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status = 'complete' THEN output_tokens ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN status != 'complete' THEN 1 ELSE 0 END), 0)
+            FROM provider_usage WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        assert row is not None
+        total, input_tokens, output_tokens, incomplete = row
+        last = self._connection.execute(
+            """
+            SELECT input_tokens FROM provider_usage
+            WHERE run_id = ? AND status = 'complete'
+            ORDER BY call_index DESC LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        last_input_tokens = 0 if last is None else last[0]
+        complete = total > 0 and incomplete == 0 and not force_incomplete
+        return input_tokens, output_tokens, last_input_tokens, complete
+
+    def _project_run_locked(
+        self, run_id: str, *, allow_reserved_recovery_gap: bool
+    ) -> tuple[ProjectionSnapshot, int, int, int, int, bool]:
+        identity = self._resolve_run_identity_locked(run_id)
+        state_row = self._run_journal_row(run_id)
+        if identity is None or state_row is None:
+            raise ConversationConflictError("Run projection has no durable identity")
+        state = _run_journal_state_from_row(state_row)
+        if state.reserved_through != RUN_CURSOR_RESERVED_THROUGH:
+            raise ConversationConflictError(
+                "Run projection has an invalid cursor reservation"
+            )
+        rows = self._connection.execute(
+            """
+            SELECT run_id, seq, kind, occurred_at,
+                   CASE
+                     WHEN typeof(envelope_json) = 'text'
+                      AND length(CAST(envelope_json AS BLOB)) BETWEEN 2 AND ?
+                     THEN CAST(envelope_json AS BLOB)
+                   END
+            FROM events WHERE run_id = ? ORDER BY seq LIMIT ?
+            """,
+            (
+                MAX_DURABLE_EVENT_BYTES,
+                run_id,
+                MAX_RECOVERY_EVENTS_PER_RUN + 1,
+            ),
+        ).fetchall()
+        if not rows or len(rows) > MAX_RECOVERY_EVENTS_PER_RUN:
+            raise ConversationConflictError("Run projection event count is invalid")
+        events: list[EventEnvelope] = []
+        durable_bytes = 0
+        try:
+            for column_run_id, seq, kind, occurred_at, raw in rows:
+                if not isinstance(raw, bytes):
+                    raise ReplayCorruptionError("durable event has an invalid size")
+                durable_bytes += len(raw)
+                if durable_bytes > MAX_RECOVERY_DURABLE_BYTES_PER_RUN:
+                    raise ReplayCorruptionError("durable Run exceeds its byte limit")
+                event = decode_durable_event(
+                    raw,
+                    column_run_id=column_run_id,
+                    column_seq=seq,
+                    column_kind=kind,
+                    column_occurred_at=occurred_at,
+                )
+                if RunIdentity.from_event(event) != identity:
+                    raise ReplayCorruptionError("durable Run changes identity")
+                events.append(event)
+            snapshot, gaps = project_durable_run(
+                events,
+                reserved_through=(
+                    state.reserved_through if allow_reserved_recovery_gap else None
+                ),
+            )
+        except ReplayCorruptionError as exc:
+            raise ConversationConflictError("Run projection is invalid") from exc
+        if not snapshot.complete:
+            raise ConversationConflictError("terminal Run projection is incomplete")
+        return (
+            snapshot,
+            events[0].seq,
+            events[-1].seq,
+            len(events),
+            durable_bytes,
+            bool(gaps),
+        )
+
+    def _validate_terminal_usage_locked(
+        self,
+        run_id: str,
+        terminal_event: EventEnvelope,
+        usage: tuple[int, int, int, bool],
+    ) -> None:
+        count = self._connection.execute(
+            "SELECT COUNT(*) FROM provider_usage WHERE run_id = ?",
+            (run_id,),
+        ).fetchone()[0]
+        if count == 0:
+            return
+        value = terminal_event.payload.get("usage")
+        expected = {
+            "input_tokens": usage[0],
+            "output_tokens": usage[1],
+            "last_input_tokens": usage[2],
+            "complete": usage[3],
+        }
+        if (
+            not isinstance(value, dict)
+            or set(value) != set(expected)
+            or any(
+                not isinstance(value.get(field), int)
+                or isinstance(value.get(field), bool)
+                for field in (
+                    "input_tokens",
+                    "output_tokens",
+                    "last_input_tokens",
+                )
+            )
+            or not isinstance(value.get("complete"), bool)
+            or value != expected
+        ):
+            raise ConversationConflictError(
+                "terminal usage does not match the provider ledger"
+            )
+
+    def _refresh_terminal_projection_locked(
+        self,
+        run_id: str,
+        terminal_event: EventEnvelope,
+        *,
+        force_usage_incomplete: bool,
+        ephemeral_loss: bool,
+    ) -> None:
+        self._connection.execute(
+            """
+            UPDATE provider_usage
+            SET status = 'incomplete', completed_at = ?
+            WHERE run_id = ? AND status = 'started'
+            """,
+            (terminal_event.occurred_at, run_id),
+        )
+        usage = self._usage_aggregate_locked(
+            run_id, force_incomplete=force_usage_incomplete
+        )
+        self._validate_terminal_usage_locked(run_id, terminal_event, usage)
+        (
+            snapshot,
+            oldest,
+            latest,
+            event_count,
+            durable_bytes,
+            projected_ephemeral_loss,
+        ) = self._project_run_locked(
+            run_id, allow_reserved_recovery_gap=ephemeral_loss
+        )
+        if (
+            snapshot.through_seq != terminal_event.seq
+            or snapshot.identity.run_id != run_id
+        ):
+            raise ConversationConflictError("Run terminal projection is inconsistent")
+        cursor = self._connection.execute(
+            """
+            UPDATE run_journal_state
+            SET oldest_available_seq = ?, latest_durable_seq = ?,
+                terminal_seq = ?, terminal_kind = ?, availability = 'full',
+                event_count = ?, durable_bytes = ?, input_tokens = ?,
+                output_tokens = ?, last_input_tokens = ?, usage_complete = ?
+            WHERE run_id = ? AND terminal_seq IS NULL
+            """,
+            (
+                oldest,
+                latest,
+                terminal_event.seq,
+                terminal_event.kind,
+                event_count,
+                durable_bytes,
+                *usage[:3],
+                int(usage[3]),
+                run_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise ConversationConflictError("Run terminal projection already exists")
+        encoded = encode_projection_snapshot(snapshot)
+        encoded_bytes = encoded.encode("utf-8")
+        if len(encoded_bytes) > MAX_SNAPSHOT_BYTES:
+            raise ConversationConflictError("Run snapshot exceeds its limit")
+        source_digest = hashlib.sha256(encoded_bytes).hexdigest()
+        self._connection.execute(
+            """
+            INSERT INTO run_snapshots(
+                run_id, projection_version, through_seq, snapshot_json,
+                source_digest, ephemeral_loss, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+                projection_version = excluded.projection_version,
+                through_seq = excluded.through_seq,
+                snapshot_json = excluded.snapshot_json,
+                source_digest = excluded.source_digest,
+                ephemeral_loss = excluded.ephemeral_loss,
+                created_at = excluded.created_at
+            """,
+            (
+                run_id,
+                PROJECTION_VERSION,
+                snapshot.through_seq,
+                encoded,
+                source_digest,
+                int(ephemeral_loss or projected_ephemeral_loss),
+                terminal_event.occurred_at,
+            ),
+        )
+
+    def _tombstone_unavailable_run_locked(
+        self,
+        run_id: str,
+        *,
+        timestamp: str,
+    ) -> None:
+        """Atomically discard a partial journal that cannot reach durability.
+
+        A memory-only terminal event is deliberately not promoted to canonical
+        history.  Keeping the durable prefix would leave a terminal Turn whose
+        Run still looked active to retention and recovery.  Instead we retain
+        only the bounded Run identity/usage tombstone and make replay fail
+        explicitly through the existing ``pruned`` availability state.
+        """
+
+        state_row = self._run_journal_row(run_id)
+        if state_row is None:
+            raise ConversationConflictError("Run has no journal state")
+        state = _run_journal_state_from_row(state_row)
+        if (
+            state.availability != "full"
+            or state.terminal_seq is not None
+            or state.terminal_kind is not None
+        ):
+            raise ConversationConflictError(
+                "Run journal cannot become an unavailable tombstone"
+            )
+        self._connection.execute(
+            """
+            UPDATE operation_ledger
+            SET status = 'outcome_unknown', outcome_digest = NULL,
+                resolved_at = ?
+            WHERE agent_id = ? AND run_id = ? AND status = 'dispatched'
+            """,
+            (timestamp, self.agent_id, run_id),
+        )
+        self._connection.execute(
+            """
+            UPDATE provider_usage
+            SET status = 'incomplete', completed_at = ?
+            WHERE run_id = ? AND status = 'started'
+            """,
+            (timestamp, run_id),
+        )
+        usage = self._usage_aggregate_locked(run_id, force_incomplete=True)
+        self._connection.execute(
+            "DELETE FROM run_snapshots WHERE run_id = ?",
+            (run_id,),
+        )
+        self._connection.execute(
+            "DELETE FROM events WHERE run_id = ?",
+            (run_id,),
+        )
+        cursor = self._connection.execute(
+            """
+            UPDATE run_journal_state
+            SET oldest_available_seq = latest_durable_seq,
+                terminal_seq = NULL, terminal_kind = NULL,
+                availability = 'pruned', event_count = 0, durable_bytes = 0,
+                input_tokens = ?, output_tokens = ?, last_input_tokens = ?,
+                usage_complete = 0
+            WHERE run_id = ? AND availability = 'full'
+              AND terminal_seq IS NULL AND terminal_kind IS NULL
+            """,
+            (*usage[:3], run_id),
+        )
+        if cursor.rowcount != 1:
+            raise ConversationConflictError(
+                "Run unavailable tombstone transition was lost"
+            )
 
     def create_conversation(
         self,
@@ -1004,6 +2542,22 @@ class ConversationStore:
                     (run_id, timestamp, conversation_id, self.agent_id),
                 )
                 self._insert_boundary_event(started_event, encoded_event)
+                self._connection.execute(
+                    """
+                    INSERT INTO run_journal_state(
+                        run_id, oldest_available_seq, latest_durable_seq,
+                        reserved_through, terminal_seq, terminal_kind,
+                        availability, event_count, durable_bytes,
+                        input_tokens, output_tokens, last_input_tokens,
+                        usage_complete
+                    ) VALUES (?, 1, 1, ?, NULL, NULL, 'full', 1, ?, 0, 0, 0, 0)
+                    """,
+                    (
+                        run_id,
+                        RUN_CURSOR_RESERVED_THROUGH,
+                        len(encoded_event.encode("utf-8")),
+                    ),
+                )
                 self._connection.commit()
             except ConversationStoreError:
                 self._rollback()
@@ -1152,12 +2706,27 @@ class ConversationStore:
                     )
                 if terminal_event is not None and encoded_event is not None:
                     self._insert_boundary_event(terminal_event, encoded_event)
+                    self._refresh_terminal_projection_locked(
+                        run_id,
+                        terminal_event,
+                        force_usage_incomplete=False,
+                        ephemeral_loss=False,
+                    )
+                else:
+                    self._tombstone_unavailable_run_locked(
+                        run_id,
+                        timestamp=timestamp,
+                    )
                 self._connection.commit()
             except ConversationStoreError:
                 self._rollback()
                 raise
             except sqlite3.IntegrityError as exc:
                 self._rollback()
+                if terminal_event is None:
+                    raise ConversationStoreUnavailableError(
+                        "could not finalize unavailable Run tombstone"
+                    ) from exc
                 raise ConversationConflictError(
                     "canonical terminal event already exists"
                 ) from exc
@@ -1220,6 +2789,10 @@ class ConversationStore:
         pending_call_id: str | None = None
         pending_tool_id: str | None = None
         pending_tool_started = False
+        finished_call_ids: list[str] = []
+        model_request_count = 0
+        open_model_request: tuple[str, int] | None = None
+        last_model_outcome: str | None = None
 
         while True:
             row = cursor.fetchone()
@@ -1319,7 +2892,139 @@ class ConversationStore:
                 raise ConversationConflictError(
                     "running turn already has a terminal event"
                 )
-            if kind == "assistant.block.started":
+            if kind == "model.request.started":
+                model_payload = _exact_recovery_payload(
+                    payload,
+                    {
+                        "request_id",
+                        "iteration",
+                        "context_plan_id",
+                        "context_plan_digest",
+                        "request_digest",
+                        "request_bytes",
+                        "estimated_input_tokens",
+                        "message_count",
+                        "tool_count",
+                        "tool_result_call_ids",
+                    },
+                )
+                iteration = model_payload.get("iteration")
+                request_id = _recovery_worker_id(
+                    model_payload.get("request_id"), "model request_id"
+                )
+                result_ids = model_payload.get("tool_result_call_ids")
+                if (
+                    not isinstance(iteration, int)
+                    or isinstance(iteration, bool)
+                    or not 1 <= iteration <= 3
+                    or request_id != f"model-{iteration}"
+                    or iteration != model_request_count + 1
+                    or open_model_request is not None
+                    or open_block_id is not None
+                    or pending_call_id is not None
+                    or (model_request_count and last_model_outcome != "tool_use")
+                    or not isinstance(model_payload.get("context_plan_id"), str)
+                    or len(str(model_payload["context_plan_id"]).encode("utf-8"))
+                    > 128
+                    or not isinstance(model_payload.get("context_plan_digest"), str)
+                    or _LEDGER_DIGEST.fullmatch(
+                        str(model_payload["context_plan_digest"])
+                    )
+                    is None
+                    or not isinstance(model_payload.get("request_digest"), str)
+                    or _LEDGER_DIGEST.fullmatch(str(model_payload["request_digest"]))
+                    is None
+                    or any(
+                        not isinstance(model_payload.get(field), int)
+                        or isinstance(model_payload.get(field), bool)
+                        or not 1 <= int(model_payload[field]) <= MAX_USAGE_TOKENS
+                        for field in (
+                            "request_bytes",
+                            "estimated_input_tokens",
+                            "message_count",
+                        )
+                    )
+                    or not isinstance(model_payload.get("tool_count"), int)
+                    or isinstance(model_payload.get("tool_count"), bool)
+                    or not 0 <= int(model_payload["tool_count"]) <= 16
+                    or not isinstance(result_ids, list)
+                    or len(result_ids) > 3
+                ):
+                    raise ConversationConflictError(
+                        "running turn has an invalid model request"
+                    )
+                validated_result_ids = [
+                    _recovery_worker_id(item, "model Tool result call_id")
+                    for item in result_ids
+                ]
+                if (
+                    validated_result_ids != finished_call_ids
+                    or (
+                        iteration == 1
+                        and model_payload["tool_count"] != len(_RECOVERY_TOOL_SPECS)
+                    )
+                    or (iteration > 1 and model_payload["tool_count"] != 0)
+                ):
+                    raise ConversationConflictError(
+                        "running turn has inconsistent model capabilities"
+                    )
+                model_request_count = iteration
+                open_model_request = (request_id, iteration)
+                last_model_outcome = None
+            elif kind == "model.response.finished":
+                model_payload = _exact_recovery_payload(
+                    payload,
+                    {
+                        "request_id",
+                        "iteration",
+                        "outcome",
+                        "input_tokens",
+                        "output_tokens",
+                        "usage_complete",
+                        "error_code",
+                    },
+                )
+                request_id = _recovery_worker_id(
+                    model_payload.get("request_id"), "model request_id"
+                )
+                iteration = model_payload.get("iteration")
+                outcome = model_payload.get("outcome")
+                input_tokens = model_payload.get("input_tokens")
+                output_tokens = model_payload.get("output_tokens")
+                usage_complete = model_payload.get("usage_complete")
+                error_code = model_payload.get("error_code")
+                successful = outcome in {"tool_use", "end_turn"}
+                if (
+                    open_model_request != (request_id, iteration)
+                    or outcome not in {"tool_use", "end_turn", "error", "cancelled"}
+                    or not isinstance(input_tokens, int)
+                    or isinstance(input_tokens, bool)
+                    or not 0 <= input_tokens <= MAX_USAGE_TOKENS
+                    or not isinstance(output_tokens, int)
+                    or isinstance(output_tokens, bool)
+                    or not 0 <= output_tokens <= MAX_USAGE_TOKENS
+                    or not isinstance(usage_complete, bool)
+                    or (
+                        successful
+                        and (usage_complete is not True or error_code is not None)
+                    )
+                    or (
+                        not successful
+                        and (
+                            usage_complete is not False
+                            or input_tokens != 0
+                            or output_tokens != 0
+                            or not isinstance(error_code, str)
+                            or _RECOVERY_WORKER_ID.fullmatch(error_code) is None
+                        )
+                    )
+                ):
+                    raise ConversationConflictError(
+                        "running turn has an invalid model response"
+                    )
+                open_model_request = None
+                last_model_outcome = str(outcome)
+            elif kind == "assistant.block.started":
                 block_payload = _exact_recovery_payload(
                     payload, {"block_id", "block_type"}
                 )
@@ -1330,6 +3035,7 @@ class ConversationStore:
                     block_payload.get("block_type") != "content"
                     or block_id in seen_blocks
                     or open_block_id is not None
+                    or open_model_request is not None
                 ):
                     raise ConversationConflictError(
                         "running turn has an invalid assistant block start"
@@ -1390,7 +3096,12 @@ class ConversationStore:
                     raise ConversationConflictError(
                         "running turn has invalid Tool arguments"
                     ) from exc
-                if call_id in seen_calls or pending_call_id is not None:
+                if (
+                    call_id in seen_calls
+                    or pending_call_id is not None
+                    or open_model_request is not None
+                    or (model_request_count and last_model_outcome != "tool_use")
+                ):
                     raise ConversationConflictError(
                         "running turn has an invalid Tool request"
                     )
@@ -1460,6 +3171,7 @@ class ConversationStore:
                 pending_call_id = None
                 pending_tool_id = None
                 pending_tool_started = False
+                finished_call_ids.append(call_id)
             elif kind != "run.started":
                 raise ConversationConflictError(
                     "running turn has an unsupported durable event"
@@ -1467,6 +3179,22 @@ class ConversationStore:
             last_seq = seq
 
         closure_events: list[tuple[str, dict[str, object]]] = []
+        if open_model_request is not None:
+            request_id, iteration = open_model_request
+            closure_events.append(
+                (
+                    "model.response.finished",
+                    {
+                        "request_id": request_id,
+                        "iteration": iteration,
+                        "outcome": "error",
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "usage_complete": False,
+                        "error_code": "control_restarted",
+                    },
+                )
+            )
         if open_block_id is not None:
             closure_events.append(
                 (
@@ -1500,6 +3228,42 @@ class ConversationStore:
             tuple(closure_events),
         )
 
+    def _validated_running_journal_state_locked(
+        self,
+        existing: ConversationTurn,
+        recovery: _RecoveryScan,
+    ) -> RunJournalState:
+        state_row = self._run_journal_row(existing.run_id)
+        if state_row is None:
+            raise ConversationConflictError(
+                "running turn has no Run journal state"
+            )
+        state = _run_journal_state_from_row(state_row)
+        snapshot_exists = self._connection.execute(
+            "SELECT 1 FROM run_snapshots WHERE run_id = ?",
+            (existing.run_id,),
+        ).fetchone()
+        if (
+            recovery.event_count < 1
+            or state.oldest_available_seq != 1
+            or state.latest_durable_seq != recovery.last_seq
+            or state.reserved_through != RUN_CURSOR_RESERVED_THROUGH
+            or state.terminal_seq is not None
+            or state.terminal_kind is not None
+            or state.availability != "full"
+            or state.event_count != recovery.event_count
+            or state.durable_bytes != recovery.durable_bytes
+            or state.input_tokens != 0
+            or state.output_tokens != 0
+            or state.last_input_tokens != 0
+            or state.usage_complete
+            or snapshot_exists is not None
+        ):
+            raise ConversationConflictError(
+                "running Run journal metadata is inconsistent"
+            )
+        return state
+
     def recover_running_as_interrupted(self) -> tuple[ConversationTurn, ...]:
         """Fail closed after restart; interrupted partial output is not history."""
 
@@ -1508,6 +3272,8 @@ class ConversationStore:
             self._ensure_open()
             try:
                 self._begin_write()
+                self._recover_dispatched_operations_locked(timestamp)
+                self._mark_started_usage_incomplete_locked(timestamp)
                 rows = self._connection.execute(
                     """
                     SELECT t.turn_id, t.conversation_id, t.run_id, t.position,
@@ -1524,7 +3290,22 @@ class ConversationStore:
                 for row in rows:
                     existing = _turn_from_row(row)
                     recovery = self._scan_recovery_events(existing)
+                    state = self._validated_running_journal_state_locked(
+                        existing,
+                        recovery,
+                    )
                     if recovery.event_count:
+                        recovery_base = max(
+                            recovery.last_seq, state.reserved_through
+                        )
+                        # Every still-started call was changed to incomplete at
+                        # the beginning of this transaction.  Fully paired
+                        # response boundaries therefore retain exact provider
+                        # usage, while an open call keeps the terminal rollup
+                        # incomplete without discarding earlier exact calls.
+                        usage = self._usage_aggregate_locked(
+                            existing.run_id, force_incomplete=False
+                        )
                         synthetic = [
                             *recovery.closure_events,
                             (
@@ -1537,18 +3318,18 @@ class ConversationStore:
                                     ),
                                     "retryable": True,
                                     "usage": {
-                                        "input_tokens": 0,
-                                        "output_tokens": 0,
-                                        "last_input_tokens": 0,
-                                        "complete": False,
+                                        "input_tokens": usage[0],
+                                        "output_tokens": usage[1],
+                                        "last_input_tokens": usage[2],
+                                        "complete": usage[3],
                                     },
                                 },
                             ),
                         ]
                         if (
-                            recovery.last_seq + len(synthetic)
+                            recovery.event_count + len(synthetic)
                             > MAX_RECOVERY_EVENTS_PER_RUN
-                            or recovery.last_seq + len(synthetic)
+                            or recovery_base + len(synthetic)
                             > MAX_RECOVERY_SEQUENCE
                         ):
                             raise ConversationConflictError(
@@ -1563,7 +3344,7 @@ class ConversationStore:
                                 conversation_id=existing.conversation_id,
                                 turn_id=existing.turn_id,
                                 run_id=existing.run_id,
-                                seq=recovery.last_seq + offset,
+                                seq=recovery_base + offset,
                                 occurred_at=timestamp,
                                 kind=kind,
                                 durability="durable",
@@ -1577,7 +3358,7 @@ class ConversationStore:
                                 turn_id=existing.turn_id,
                                 run_id=existing.run_id,
                                 minimum_seq=2,
-                                exact_seq=recovery.last_seq + offset,
+                                exact_seq=recovery_base + offset,
                             )
                             total_bytes += len(encoded.encode("utf-8"))
                             if total_bytes > MAX_RECOVERY_DURABLE_BYTES_PER_RUN:
@@ -1587,6 +3368,13 @@ class ConversationStore:
                             prepared.append((recovery_event, encoded))
                         for recovery_event, encoded in prepared:
                             self._insert_boundary_event(recovery_event, encoded)
+                        terminal_event = prepared[-1][0]
+                        self._refresh_terminal_projection_locked(
+                            existing.run_id,
+                            terminal_event,
+                            force_usage_incomplete=False,
+                            ephemeral_loss=True,
+                        )
                     cursor = self._connection.execute(
                         """
                         UPDATE conversations

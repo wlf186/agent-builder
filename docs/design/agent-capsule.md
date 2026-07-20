@@ -1,7 +1,7 @@
 ---
 owner: runtime-maintainers
 status: maintained
-last_reviewed: 2026-07-18
+last_reviewed: 2026-07-19
 review_cycle: quarterly
 ---
 
@@ -44,7 +44,10 @@ generation 都是 1。通用 Agent registry/provisioning 尚未实现。
 - `worker-env` 位于 Agent runtime root，当前由 checkout interpreter 创建
   `venv --without-pip`；每个 Agent 路径独立，不在 Agent 间共享可写环境。
 - Worker 环境只包含最小 PATH 和 checkout-local HOME/TMP/XDG/PYTHONPATH；不继承
-  secrets、Conda、用户 site-package 或模型地址。
+  secrets、Conda、用户 site-package 或模型地址。唯一例外是显式
+  `start.sh --qualification-sync-count` RR：Control Plane 只透传固定、经 checkout 路径与
+  digest 校验的 qualification preload/counter/role，正常运行不存在该 capability，详情见
+  [qualification contract](qualification.md)。
 - `input/work/output` 只是路径边界，不代表当前支持文件能力。Landlock 当前不给 Worker
   任何直接写权限。
 
@@ -71,8 +74,11 @@ Run 树，限制 1,024 entries、16 MiB logical bytes 和 32 MiB allocated bytes
 
 Worker 使用新 session，Gateway 进程组不能作为“顺带清理”它的依据。`worker.pid`
 记录 repository、Agent、Run root、PID、PGID、Linux start marker、interpreter、cwd、
-module 和完整命令；停止/删除前重新比对 `/proc`。记录不安全且指向活进程时 fail
-closed，不按缓存 PGID 或端口误杀。
+module 和完整命令，并必须是当前 uid、`0600`、单 hardlink、固定大小/shape 的普通文件；
+停止/删除前重新比对 `/proc`。Gateway record 还绑定 supervisor → Web child，live Worker
+只有在 `PPid` 为该已验证 Web、marker/PGID/NNP/seccomp 和 record 同时匹配时才取得信号
+权限。记录不安全且指向活进程时 fail closed，不按缓存 PGID、exact-argv 伪装或端口误杀；
+停止顺序先 Worker 后 Gateway。
 
 ## 启动恢复与孤儿处理
 

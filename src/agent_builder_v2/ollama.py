@@ -9,8 +9,9 @@ address, or a general network socket.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
 import re
@@ -57,6 +58,7 @@ MAX_CONTENT_JSON_STRING_BYTES = MAX_BROKER_FRAME_BYTES - 16 * 1024
 CANCEL_POLL_SECONDS = 0.05
 QUALIFICATION_TIMEOUT_SECONDS = 8.0
 TURN_TIMEOUT_SECONDS = 25.0
+REQUEST_DIGEST_DOMAIN = b"agent-builder-ollama-request-v1\0"
 
 _SAFE_CALL_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -95,6 +97,18 @@ class OllamaToolResult:
     outcome: str = "succeeded"
 
 
+@dataclass(frozen=True, slots=True)
+class OllamaRequestMetadata:
+    """Bounded metadata for one exact provider request, never its raw body."""
+
+    iteration: int
+    message_count: int
+    tool_count: int
+    estimated_input_tokens: int
+    request_bytes: int
+    request_digest: str
+
+
 @dataclass(frozen=True)
 class OllamaQualification:
     version: str
@@ -114,6 +128,7 @@ class _PendingTool:
 
 Resolver = Callable[..., list[tuple[Any, ...]]]
 CancelCheck = Callable[[], bool]
+RequestObserver = Callable[[OllamaRequestMetadata], Awaitable[None]]
 
 
 def _bounded_text(value: object, maximum_bytes: int, *, allow_empty: bool) -> str:
@@ -527,6 +542,7 @@ class OllamaRunSession:
         user_message: str,
         tool_results: Sequence[OllamaToolResult] = (),
         is_cancelled: CancelCheck = lambda: False,
+        on_request: RequestObserver | None = None,
     ) -> AsyncIterator[OllamaFrame]:
         if self._in_flight:
             raise OllamaBrokerError(
@@ -538,6 +554,8 @@ class OllamaRunSession:
             )
         if not callable(is_cancelled):
             raise TypeError("is_cancelled must be callable")
+        if on_request is not None and not callable(on_request):
+            raise TypeError("on_request must be callable")
         message = _bounded_text(user_message, MAX_USER_BYTES, allow_empty=False)
         if message != self._context_plan.user_message():
             raise OllamaBrokerError(
@@ -631,9 +649,26 @@ class OllamaRunSession:
             )
 
         self._in_flight = True
-        self._turns += 1
         result: AsyncIterator[dict[str, Any]] | None = None
         try:
+            if on_request is not None:
+                # Occupy the session before this await so a slow observer cannot
+                # let a second stream pass the single-flight guard.  Callback
+                # failure reaches the same finally path without consuming a
+                # model iteration or opening provider HTTP.
+                await on_request(
+                    OllamaRequestMetadata(
+                        iteration=self._turns + 1,
+                        message_count=len(candidate_messages),
+                        tool_count=len(available_tools),
+                        estimated_input_tokens=runtime_input_tokens,
+                        request_bytes=len(encoded_request),
+                        request_digest=hashlib.sha256(
+                            REQUEST_DIGEST_DOMAIN + encoded_request
+                        ).hexdigest(),
+                    )
+                )
+            self._turns += 1
             result = self._stream_response(encoded_request, is_cancelled)
             content_parts: list[str] = []
             coalesced: list[str] = []
@@ -1068,6 +1103,8 @@ __all__ = [
     "OllamaCancelledError",
     "OllamaFrame",
     "OllamaQualification",
+    "OllamaRequestMetadata",
     "OllamaRunSession",
     "OllamaToolResult",
+    "REQUEST_DIGEST_DOMAIN",
 ]

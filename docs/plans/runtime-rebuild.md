@@ -152,6 +152,19 @@ Conversation，两轮均以 `run.completed` 收敛，durable replay 分别为 11
 暗号问题，context inspection 为 `exact`、`no-store`。终态无生产 Worker PID record 或
 Run root 残留；该 smoke 不是新的 platform/SSD qualification RR。
 
+`RR-CTX-TOOL-20260720-01`（implementation_ref:
+`fdb676aa53b2ae5e729e1654f0c7006456145587`）完成 CTX-03、CTX-04、TOOL-01
+候选验证：全量 `392 passed`，governance 扫描 12 个 Markdown、8 个 shell script、93 个
+文本文件通过，`git diff --check` 通过。受管 stop/start 后 20815 健康报告
+`qwen3.5:2b` 与 `landlock+seccomp`；两个真实 Run 均为 3 次 model request、2 次 Echo、
+唯一 completed terminal。无 workspace 文件时 section 为 platform/agent/environment/user；
+临时 private CLAUDE.md 时增加独立 workspace trust section，移除后无残留。unsafe mode
+真实 admission 返回不含路径的 409。Git negative matrix 覆盖 parent-repository no-op、
+metadata symlink、外部 config include 的 Landlock 拒绝、输出洪泛和 non-repository；collector
+及 prompt/tool snapshots 不落盘，Git optional lock 和全部 workspace 写入由 kernel policy
+拒绝，不增加逐 token/chunk/frame 写。v1 Echo toolset digest `77c47868160c…` 保持可回放。
+该记录关闭三项 contract，不扩大 QUA-01 的平台/SSD release 结论。
+
 ## Phase 1 — Clean-root qualification
 
 目标：让清洁后的根目录成为唯一可运行系统，并用可重复证据封住旧/新边界。
@@ -320,9 +333,9 @@ ready”的声明。
 | 5 | LOOP-01 | P0 | 有界多步 model → Tool → model loop substrate | REC-01, AGT-01 | done |
 | 6 | CTX-01 | P0/parallel | Prompt section registry | — | done |
 | 7 | CTX-02 | P0/parallel | authenticated context inspection | CTX-01 | done |
-| 8 | CTX-03 | P0 | workspace CLAUDE.md | CTX-01, AGT-01 | not_started |
-| 9 | CTX-04 | P0 | bounded Git/date/environment context | CTX-01, AGT-01 | not_started |
-| 10 | TOOL-01 | P0 | Tool contract v2 与 EffectiveToolSet | LOOP-01, AGT-01 | not_started |
+| 8 | CTX-03 | P0 | workspace CLAUDE.md | CTX-01, AGT-01 | done |
+| 9 | CTX-04 | P0 | bounded Git/date/environment context | CTX-01, AGT-01 | done |
+| 10 | TOOL-01 | P0 | Tool contract v2 与 EffectiveToolSet | LOOP-01, AGT-01 | done |
 | 11 | PERM-01 | P0 | Capability Broker 与 durable permission 状态机 | REC-01, AGT-01, TOOL-01 | not_started |
 | 12 | CMP-01 | P0 | Tool-result budget 与 micro-compaction | CTX-01, TOOL-01 | not_started |
 | 13 | CMP-02 | P0 | durable projection boundary 与 snapshot | REC-01, CTX-01, CMP-01 | not_started |
@@ -527,47 +540,55 @@ Authority：[架构](../design/architecture.md)、[安全边界](../../SECURITY.
 Authority：[架构](../design/architecture.md)、[安全边界](../../SECURITY.md)和
 [Agent Capsule design](../design/agent-capsule.md)。
 
-- [ ] 首版只从当前 Agent Capsule 内精确的 `workspace/CLAUDE.md` 加载，不向上遍历、
+- [x] 首版只从当前 Agent Capsule 内精确的 `workspace/CLAUDE.md` 加载，不向上遍历、
   不读取 HOME、不支持 checkout 外 include。
-- [ ] regular-file、no-follow、containment、owner/mode、UTF-8、硬字节上限和 stable-read
+- [x] regular-file、no-follow、containment、owner/mode、UTF-8、硬字节上限和 stable-read
   digest 全部 fail closed；缺文件是确定性 no-op。
-- [ ] workspace instruction 只能形成独立 trust section，不能伪装 platform/system contract。
-- [ ] oversize、非 UTF-8、symlink/hardlink、rename race、跨 Agent 和删除中 Capsule
+- [x] workspace instruction 只能形成独立 trust section，不能伪装 platform/system contract。
+- [x] oversize、非 UTF-8、symlink/hardlink、rename race、跨 Agent 和删除中 Capsule
   都不会接受 Run 或泄露其它路径。
 
-证据：_待补。_
+证据：`workspace_context.py` 的 descriptor-anchored 32 KiB stable read 与
+`tests/test_workspace_context.py` negative matrix；`context.py` 的独立 workspace trust provider；
+`RR-CTX-TOOL-20260720-01` 真实 private/unsafe/missing 三路径。
 
 ### CTX-04 — Bounded Git/date/environment context
 
 Authority：[架构](../design/architecture.md)、[安全边界](../../SECURITY.md)和
 [Agent Capsule design](../design/agent-capsule.md)。
 
-- [ ] Git collector 使用固定 executable identity、固定 Capsule workspace cwd、clean env、
+- [x] Git collector 使用固定 executable identity、固定 Capsule workspace cwd、clean env、
   禁用 optional lock/pager/hooks/user config，并限制子命令、时间、输出和提交数。
-- [ ] date/timezone 与环境 section 只来自受信 Control Plane allowlist；不复制继承环境、
+- [x] date/timezone 与环境 section 只来自受信 Control Plane allowlist；不复制继承环境、
   secret、host path 或高基数机器信息。
-- [ ] 每个 section 记录 source digest/provenance；Git、branch、commit message 和文件名
+- [x] 每个 section 记录 source digest/provenance；Git、branch、commit message 和文件名
   一律按 untrusted project data 渲染，不得提升为 instruction。
-- [ ] non-repository、detached/unborn、恶意 config/ref/message、超时、输出洪泛、rename/
+- [x] non-repository、detached/unborn、恶意 config/ref/message、超时、输出洪泛、rename/
   delete race 和跨 Agent 路径均确定性收敛且不扩大 Run 权限。
 
-证据：_待补。_
+证据：`workspace_context.py`/`git_probe.py` 固定 `/usr/bin/git`，Git log/commit message
+数量固定为零，status 总输出 16 KiB、2 秒；helper 在 exec 前进入只读 Landlock。
+`tests/test_workspace_context.py` 覆盖 non-repo、unborn、parent discovery、symlink、外部
+config include、洪泛和 allowlisted environment；`RR-CTX-TOOL-20260720-01`。
 
 ### TOOL-01 — Tool contract v2 与 EffectiveToolSet
 
 Authority：[架构](../design/architecture.md)、[event protocol](../design/event-protocol.md)
 和[安全边界](../../SECURITY.md)。
 
-- [ ] 扩展受控 schema vocabulary、结构化 result/progress、风险、只读性、并发、超时、
+- [x] 扩展受控 schema vocabulary、结构化 result/progress、风险、只读性、并发、超时、
   cancellation、结果 trust/source 和版本语义。
-- [ ] 明确 ToolCatalog → Policy Resolver → EffectiveToolSet → Broker/Executor 边界。
-- [ ] provider 暴露、ContextPlan、Worker 校验和 executor 使用同一 canonical manifest/digest。
-- [ ] 工具在模型暴露前按 policy 过滤，但每次调用仍重新校验 identity、schema、语义和权限。
-- [ ] unknown/duplicate tool/provider、contract drift、foreign/replayed/out-of-order result、
+- [x] 明确 ToolCatalog → Policy Resolver → EffectiveToolSet → Broker/Executor 边界。
+- [x] provider 暴露、ContextPlan、Worker 校验和 executor 使用同一 canonical manifest/digest。
+- [x] 工具在模型暴露前按 policy 过滤，但每次调用仍重新校验 identity、schema、语义和权限。
+- [x] unknown/duplicate tool/provider、contract drift、foreign/replayed/out-of-order result、
   oversize frame 和调用次数超限全部拒绝。
-- [ ] ToolUseContext 不成为跨信任边界的 ambient authority；只传窄 capability/reference。
+- [x] ToolUseContext 不成为跨信任边界的 ambient authority；只传窄 capability/reference。
 
-证据：_待补。_
+证据：`tools.py` 的 v1/v2 canonical manifest、Catalog/Policy/EffectiveToolSet、窄
+ToolUseContext 与同源 Registry；`runtime.py` 固化 catalog/policy/toolset digest；Worker 仅按
+有效 ID 从 sealed catalog 重建并对账。`test_tools.py`、`test_worker.py`、broker/kernel/control/
+replay negative suites 与 `RR-CTX-TOOL-20260720-01`；历史 v1 digest 有显式 replay test。
 
 ### PERM-01 — Capability Broker 与 permission 状态机
 

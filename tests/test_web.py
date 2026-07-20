@@ -43,6 +43,7 @@ from agent_builder_v2.sessions import (
     ConversationTurn,
 )
 from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
+from agent_builder_v2.workspace_context import WorkspaceContextError
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -950,10 +951,10 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
     assert payload["content_exposure"] == "withheld"
     assert payload["provider_message_count"] == 2
     assert "provider_messages" not in payload
-    assert payload["renderer"]["version"] == "ordered-sections-v2"
+    assert payload["renderer"]["version"] == "ordered-sections-v3"
     assert (
         payload["renderer"]["section_registry_version"]
-        == "prompt-section-registry-v1"
+        == "prompt-section-registry-v2"
     )
     assert payload["renderer"]["leading_system_sections_merged"] is True
     assert payload["renderer"]["leading_system_section_count"] == 2
@@ -1610,3 +1611,29 @@ def test_negative_content_length_is_rejected_at_boundary(
 
     assert response.status_code == 400
     assert response.json() == {"detail": "invalid content length"}
+
+
+def test_unsafe_workspace_context_is_a_bounded_conflict(
+    web_client: tuple[TestClient, _Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+
+    async def reject(_command: StartRunCommand) -> object:
+        raise WorkspaceContextError("internal path detail")
+
+    monkeypatch.setattr(commands, "start", reject)
+    response = client.post(
+        "/api/runs",
+        json={"message": "hello"},
+        headers={
+            **SAME_ORIGIN,
+            "x-csrf-token": login.json()["csrf_token"],
+        },
+    )
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Agent workspace context is unsafe"}
+    assert "path" not in response.text

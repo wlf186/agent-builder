@@ -21,6 +21,7 @@ from .sandbox import (
     close_worker_file_descriptors,
     verify_worker_file_descriptors,
 )
+from .tools import prototype_tool_specs_for_ids, prototype_tools, toolset_digest
 
 
 # JSON control characters can expand to six bytes (for example ``\u0000``).
@@ -115,6 +116,7 @@ def _read_command() -> dict[str, Any]:
         "message",
         "context_plan",
         "loop_limits",
+        "effective_tool_ids",
     }:
         raise ValueError("command must be an object")
     message = value.get("message")
@@ -134,6 +136,16 @@ def _read_command() -> dict[str, Any]:
         value["loop_limits"] = LoopLimits.from_dict(value.get("loop_limits"))
     except ValueError as exc:
         raise ValueError("invalid loop limits") from exc
+    try:
+        effective_tools = prototype_tool_specs_for_ids(
+            value.get("effective_tool_ids")
+        )
+    except ValueError as exc:
+        raise ValueError("invalid effective Tool set") from exc
+    if toolset_digest(effective_tools) != context_reference.toolset_digest:
+        raise ValueError("effective Tool set changed")
+    value["effective_tools"] = effective_tools
+    del value["effective_tool_ids"]
     return value
 
 
@@ -166,9 +178,13 @@ def main() -> int:
         _write_json(event)
         return 2
 
-    model = BrokeredStreamingModel(sys.stdin.buffer, sys.stdout.buffer)
+    effective_tools = command["effective_tools"]
+    model = BrokeredStreamingModel(
+        sys.stdin.buffer, sys.stdout.buffer, effective_tools=effective_tools
+    )
     kernel = HarnessKernel(
         model=model,
+        tools=prototype_tools(effective_tools),
         cancellation=cancellation,
         loop_limits=command["loop_limits"],
     )

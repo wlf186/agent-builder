@@ -173,6 +173,7 @@ def _service(tmp_path: Path) -> tuple[RunService, _MemoryJournal]:
     service.journal = journal  # type: ignore[assignment]
     data_root = tmp_path / "data" / PROTOTYPE_AGENT_ID
     data_root.mkdir(parents=True, mode=0o700)
+    (data_root / "workspace").mkdir(mode=0o700)
     service.capsule = AgentCapsule(
         agent_id=PROTOTYPE_AGENT_ID,
         data_root=data_root,

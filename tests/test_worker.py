@@ -13,12 +13,13 @@ import pytest
 from agent_builder_v2 import worker
 from agent_builder_v2.context import ContextPlanReference
 from agent_builder_v2.contracts import LoopLimits
+from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
 
 
 CONTEXT_REFERENCE = ContextPlanReference(
     plan_id="context-" + "a" * 24,
     digest="a" * 64,
-    toolset_digest="b" * 64,
+    toolset_digest=toolset_digest(prototype_tool_specs()),
 )
 LOOP_LIMITS = LoopLimits(max_model_iterations=4, max_tool_calls=2)
 
@@ -33,6 +34,7 @@ def test_worker_command_budget_covers_worst_case_json_escaping(
                 "message": message,
                 "context_plan": CONTEXT_REFERENCE.to_dict(),
                 "loop_limits": LOOP_LIMITS.to_dict(),
+                "effective_tool_ids": ["builtin/echo"],
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -47,6 +49,7 @@ def test_worker_command_budget_covers_worst_case_json_escaping(
         "message": message,
         "context_plan": CONTEXT_REFERENCE,
         "loop_limits": LOOP_LIMITS,
+        "effective_tools": prototype_tool_specs(),
     }
 
 
@@ -101,6 +104,7 @@ def test_worker_applies_all_limits_before_input_or_kernel(
             "message": "hello",
             "context_plan": CONTEXT_REFERENCE,
             "loop_limits": LOOP_LIMITS,
+            "effective_tools": prototype_tool_specs(),
         },
     )
 
@@ -117,7 +121,7 @@ def test_worker_applies_all_limits_before_input_or_kernel(
     monkeypatch.setattr(
         worker,
         "BrokeredStreamingModel",
-        lambda *_args: calls.append("model") or object(),
+        lambda *_args, **_kwargs: calls.append("model") or object(),
     )
 
     assert worker.main() == 0

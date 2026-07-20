@@ -34,8 +34,9 @@ Model Broker 和 SQLite ownership 仍在同一个受信 Python 进程；每个 R
 │ query_engine.py  bounded identity map + one Engine / Conversation   │
 │ control.py   RunService, Worker supervisor, validator, sequencer   │
 │ sessions.py  Conversation/Turn + recovery/ledger/snapshot txns      │
-│ context.py   trusted history projection + model-capacity policy    │
-│ tools.py     immutable ToolSpec + effective prototype Tool set      │
+│ context.py   ordered prompt sections + model-capacity policy        │
+│ workspace_context.py  fail-closed CLAUDE.md/Git/UTC snapshots       │
+│ tools.py     ToolCatalog → Policy → immutable EffectiveToolSet       │
 │ state.py     durable EventJournal + bounded replay/retention        │
 │ ollama.py    fixed-target, bounded model broker                     │
 └──────────────┬────────────────────────────────────┬────────────────┘
@@ -88,9 +89,10 @@ production 无中断轮换或多用户 credential system。
    不可变 Run handle，再委托 `RunService` 为现有 Conversation 新建 Turn → Run 身份。
    `ConversationStore` 在 Agent 专属 `state.sqlite`
    中验证该会话没有 active Run，并读取带 revision、仅由 completed Turn 组成的完整
-   user/assistant pairs 快照。受信 `ContextCompiler` 根据该历史、模型画像、Capsule
-   generation、有效
-   ToolSpec 和本轮消息编译不可变 ContextPlan。
+   user/assistant pairs 快照。Control Plane 只从当前 Capsule 精确的
+   `workspace/CLAUDE.md` 读取稳定快照，并收集 UTC 日期和 Capsule 自有 Git repository
+   的有界状态；受信 `ContextCompiler` 根据这些快照、历史、模型画像、Capsule generation、
+   当前 EffectiveToolSet 和本轮消息编译不可变 ContextPlan。
 3. Control Plane 先用 expected revision 做 compare-and-swap，再在一个 SQLite 事务中
    保存 `running` Turn、绑定 active Run、写入 durable `run.started`，并在
    `run_journal_state` 为该 Run 保留 cursor high-water `512`；历史在编译期间
@@ -102,10 +104,12 @@ production 无中断轮换或多用户 credential system。
    原子发布强身份 PID record。
 6. Worker 在读取消息前完成 FD isolation、rlimits、Landlock、seccomp 与 attestation；
    Control Plane 通过 `/proc` 复核后才发送命令。
-7. Control Plane 只把本轮用户消息和 `plan_id`/plan digest/toolset digest 引用发给
+7. Control Plane 只把本轮用户消息、`plan_id`/plan digest/toolset digest 引用和经过
+   当前 catalog/policy 解析且与 digest 对账的 Tool ID 子集发给
    Worker。`HarnessKernel` 用该引用通过 Model Broker IPC v2 发起迭代；Worker 不能读取
    或改写 ContextPlan 中完整的 platform/Agent 指令、Tool manifest、模型画像和预算；
-   Worker 只保留运行时内置的同版本 ToolSpec，用于调用校验与本地 Echo 执行。
+   Worker。Worker 只能从运行时密封的 catalog 解析该子集，用同一 manifest 校验模型
+   Tool call 与本地 Echo 执行；未知 ID、摘要漂移或目录外 contract 均在执行前拒绝。
 8. Broker 为该 Run 独占一个 `OllamaRunSession`，从受信 ContextPlan 渲染 system、
    completed history user/assistant pairs 和当前 user message，并从相同 ToolSpec 生成
    Ollama Tool schema。当前不可变 `TurnRuntimeSnapshot` 固化 Agent generation、模型画像、
@@ -159,8 +163,9 @@ executor 使用它，因此不代表已实现有副作用 Tool 或 exactly-once 
 | `worker.py` | 一个 Run 的 bootstrap 与 IPC | 网络 endpoint、持久状态、其它 Agent |
 | `kernel.py` | context/model/tool/cancel/terminal 单一循环 | HTTP、SQLite、进程管理 |
 | `context.py` | 确定性 sections/provenance、completed-history projection、动态预算与 plan digest、正文隐藏的 operator inspection | provider/network selection、语义 summary、第二份 prompt persistence |
+| `workspace_context.py` / `git_probe.py` | Capsule 精确路径的 CLAUDE.md stable read、UTC allowlist、只读 Landlock 内固定 Git collector 和不可变 source snapshot | 向上遍历、任意文件读取、继承环境、通用命令执行 |
 | `ollama.py` | 固定 endpoint/model、模型资格、per-Run transcript、ContextPlan 渲染、协议上限 | 浏览器可配置 provider |
-| `tools.py` | 共享 `ToolSpec`、schema/限制/Tool set digest 和本地 Echo dispatch | Shell/Skill/MCP 动态执行 |
+| `tools.py` | 版本化 `ToolSpec`、受控 schema/result/progress vocabulary、ToolCatalog/Policy/EffectiveToolSet、窄 ToolUseContext 和本地 Echo dispatch | permission 决策、Shell/Skill/MCP 动态执行 |
 | `contracts.py` | command/event 类型与 canonical identity | 持久化策略 |
 | `replay.py` | canonical durable payload/state validator、model call 配对、确定性 UI projector、v1/v2 snapshot codec | SQLite 事务、live stream、ContextPlan transcript |
 | `state.py` | durable semantic append、严格有界 replay、snapshot-only retention | token delta、完整 live Run truth、语义 summary |
@@ -250,9 +255,9 @@ QueryEngine (lazy, replaceable) ─────> Conversation (durable, authorit
 | command system | `CommandBus` start/cancel | 最小实现 |
 | Query engine | one logical `QueryEngine` per Conversation + bounded registry | restore/submit/interrupt/delete 已跑通；durable state 仍由 Store/RunService 持有 |
 | Agent loop | one isolated `HarnessKernel` finite loop per Run | 已跑通 |
-| context assembly | trusted immutable `ContextPlan`、provenance/digest/budget、completed Turn 原生 chat roles | 多轮历史和动态完整-pair tail window 已进入真实请求；支持认证 metadata inspection，尚无 workspace 指令注入或语义 summary |
+| context assembly | trusted immutable `ContextPlan`、provenance/digest/budget、completed Turn 原生 chat roles | 多轮历史、Capsule CLAUDE.md、UTC/Git context 和动态完整-pair tail window 已进入真实请求；支持认证 metadata inspection，尚无语义 summary |
 | model abstraction | `StreamingModel` + trusted Ollama Broker | 固定 provider/model |
-| Tool registry/dispatch | shared immutable `ToolSpec` + `ToolRegistry` | 仅 Echo |
+| Tool registry/dispatch | `ToolCatalog → Policy Resolver → EffectiveToolSet → Broker/Worker/Executor` | v2 contract 与只读 Echo 已贯通；权限状态机和有副作用 Tool 未实现 |
 | state/history | durable Conversation/Turn + canonical event journal + bounded replay/snapshot | transcript、模型调用边界和旧 Run 可恢复；旧 Worker/live SSE 不恢复 |
 | permissions/sandbox | broker boundary + Landlock/seccomp | 固定 Worker 路径已实现 |
 | sub-agent/task system | parent/child Run、mailbox、scheduler | 未实现 |
@@ -297,8 +302,7 @@ summary 不能把不同模型/profile 的计数和快照静默复用。
 
 ## 当前不支持
 
-旧 Worker或模型流跨进程恢复、语义 summary/compaction snapshot、workspace `CLAUDE.md`
-注入、文件工具、Shell、Skill、MCP、RAG、
+旧 Worker或模型流跨进程恢复、语义 summary/compaction snapshot、文件工具、Shell、Skill、MCP、RAG、
 artifact broker、权限交互、子智能体、多用户、TLS、远程部署、正式 observability 和
 production release qualification 均未实现。路线见
 [runtime rebuild plan](../plans/runtime-rebuild.md)。

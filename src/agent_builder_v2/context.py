@@ -11,11 +11,12 @@ import re
 from typing import Protocol
 
 from .tools import ToolSpec, toolset_digest
+from .workspace_context import PromptSourceSnapshot
 
 
 CONTEXT_PLAN_SCHEMA_VERSION = "1"
-CONTEXT_RENDERER_VERSION = "ordered-sections-v2"
-PROMPT_SECTION_REGISTRY_VERSION = "prompt-section-registry-v1"
+CONTEXT_RENDERER_VERSION = "ordered-sections-v3"
+PROMPT_SECTION_REGISTRY_VERSION = "prompt-section-registry-v2"
 CONTEXT_INSPECTION_KEY_BYTES = 32
 CONTEXT_INSPECTION_NOTICE = (
     "Prompt section content is withheld by default. This operator view exposes "
@@ -45,7 +46,9 @@ _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _PLAN_ID = re.compile(r"^context-[a-f0-9]{24}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 _ROLES = frozenset({"system", "user", "assistant"})
-_TRUST_CLASSES = frozenset({"platform", "agent", "workspace", "conversation", "user"})
+_TRUST_CLASSES = frozenset(
+    {"platform", "agent", "workspace", "environment", "project", "conversation", "user"}
+)
 _CACHE_SCOPES = frozenset({"build", "agent_generation", "conversation", "turn", "none"})
 _TRUNCATION_POLICIES = frozenset({"never", "tail", "summary"})
 _MESSAGE_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -612,27 +615,42 @@ class ContextPlan:
         ):
             raise ContextPlanError("context plan structure is invalid")
         expected_history_sections = self.included_history_message_count
-        history_sections = tuple(
-            section
-            for section in self.sections
-            if section.section_id.startswith("conversation.")
-            and section.section_id != "conversation.window"
+        first_non_system = next(
+            (
+                index
+                for index, section in enumerate(self.sections)
+                if section.role != "system"
+            ),
+            len(self.sections),
         )
+        leading_ids = [section.section_id for section in self.sections[:first_non_system]]
+        optional_system_order = [
+            "workspace.instructions",
+            "runtime.environment",
+            "workspace.git",
+            "conversation.window",
+        ]
+        optional_ids = leading_ids[2:]
+        transcript = self.sections[first_non_system:]
+        history_sections = transcript[:-1]
         has_window_marker = any(
             section.section_id == "conversation.window" for section in self.sections
         )
         if (
-            len(self.sections) != 3 + expected_history_sections + int(has_window_marker)
-            or [section.section_id for section in self.sections[:2]]
+            leading_ids[:2]
             != ["platform.contract", "agent.instructions"]
+            or optional_ids
+            != [item for item in optional_system_order if item in optional_ids]
+            or any(item not in optional_system_order for item in optional_ids)
+            or len(transcript) != expected_history_sections + 1
             or len(history_sections) != expected_history_sections
             or self.sections[-1].section_id != "turn.user"
+            or any(
+                not section.section_id.startswith("conversation.")
+                for section in history_sections
+            )
             or has_window_marker
             != (self.windowing_strategy == "completed-turn-tail-v1")
-            or (
-                has_window_marker
-                and self.sections[2].section_id != "conversation.window"
-            )
         ):
             raise ContextPlanError("context section order is invalid")
         _provider_messages(self.sections)
@@ -728,7 +746,7 @@ class ContextPlan:
             raise ContextPlanError("invalid context reveal bound")
         revealed: list[PromptSectionReveal] = []
         for section in self.sections:
-            if section.trust in {"platform", "agent", "workspace"}:
+            if section.trust in {"platform", "agent", "workspace", "environment"}:
                 revealed.append(
                     PromptSectionReveal(
                         section.section_id,
@@ -804,6 +822,9 @@ _PROTOTYPE_AGENT_INSTRUCTIONS = (
 _REGISTRY_PROVIDER_ORDER = (
     "platform.contract",
     "agent.instructions",
+    "workspace.instructions",
+    "runtime.environment",
+    "workspace.git",
     "conversation.window",
     "conversation.history",
     "turn.user",
@@ -840,6 +861,7 @@ class PromptBuildContext:
     agent_id: str
     capsule_generation: int
     agent_instructions: str = field(repr=False)
+    prompt_sources: PromptSourceSnapshot = field(repr=False)
 
 
 class PromptSectionProvider(Protocol):
@@ -917,9 +939,105 @@ class _AgentInstructionProvider:
 
 
 @dataclass(frozen=True, slots=True)
+class _WorkspaceInstructionProvider:
+    provider_id: str = "workspace.instructions"
+    order: int = 300
+    cacheable: bool = True
+
+    def dependency_digest(self, context: PromptBuildContext) -> str:
+        source = context.prompt_sources.workspace_instructions
+        return _section_dependency_digest(
+            self.provider_id, None if source is None else source.digest
+        )
+
+    def build(self, context: PromptBuildContext) -> tuple[PromptSection, ...]:
+        source = context.prompt_sources.workspace_instructions
+        if source is None:
+            return ()
+        return (
+            PromptSection(
+                section_id=self.provider_id,
+                role="system",
+                trust="workspace",
+                provenance=source.provenance,
+                cache_scope="agent_generation",
+                truncation_policy="never",
+                dependency_digest=self.dependency_digest(context),
+                budget_tokens=32 * 1024,
+                truncation_reason="none",
+                content=source.content,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeEnvironmentProvider:
+    provider_id: str = "runtime.environment"
+    order: int = 400
+    cacheable: bool = True
+
+    def dependency_digest(self, context: PromptBuildContext) -> str:
+        source = context.prompt_sources.runtime_environment
+        return _section_dependency_digest(
+            self.provider_id, None if source is None else source.digest
+        )
+
+    def build(self, context: PromptBuildContext) -> tuple[PromptSection, ...]:
+        source = context.prompt_sources.runtime_environment
+        if source is None:
+            return ()
+        return (
+            PromptSection(
+                section_id=self.provider_id,
+                role="system",
+                trust="environment",
+                provenance=source.provenance,
+                cache_scope="turn",
+                truncation_policy="never",
+                dependency_digest=self.dependency_digest(context),
+                budget_tokens=512,
+                truncation_reason="none",
+                content=source.content,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _GitContextProvider:
+    provider_id: str = "workspace.git"
+    order: int = 500
+    cacheable: bool = True
+
+    def dependency_digest(self, context: PromptBuildContext) -> str:
+        source = context.prompt_sources.git_context
+        return _section_dependency_digest(
+            self.provider_id, None if source is None else source.digest
+        )
+
+    def build(self, context: PromptBuildContext) -> tuple[PromptSection, ...]:
+        source = context.prompt_sources.git_context
+        if source is None:
+            return ()
+        return (
+            PromptSection(
+                section_id=self.provider_id,
+                role="system",
+                trust="project",
+                provenance=source.provenance,
+                cache_scope="turn",
+                truncation_policy="never",
+                dependency_digest=self.dependency_digest(context),
+                budget_tokens=16 * 1024,
+                truncation_reason="none",
+                content=source.content,
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _ConversationWindowProvider:
     provider_id: str = "conversation.window"
-    order: int = 300
+    order: int = 600
     cacheable: bool = False
 
     def dependency_digest(self, context: PromptBuildContext) -> str:
@@ -1018,6 +1136,9 @@ class PromptSectionRegistry:
         self._providers: tuple[PromptSectionProvider, ...] = (
             _PlatformContractProvider(),
             _AgentInstructionProvider(),
+            _WorkspaceInstructionProvider(),
+            _RuntimeEnvironmentProvider(),
+            _GitContextProvider(),
             _ConversationWindowProvider(),
             _ConversationHistoryProvider(),
             _TurnUserProvider(),
@@ -1114,6 +1235,7 @@ class ContextCompiler:
         omitted_history_messages: int,
         agent_id: str,
         capsule_generation: int,
+        prompt_sources: PromptSourceSnapshot,
     ) -> tuple[PromptSection, ...]:
         return self.section_registry.build(
             PromptBuildContext(
@@ -1123,6 +1245,7 @@ class ContextCompiler:
                 agent_id=agent_id,
                 capsule_generation=capsule_generation,
                 agent_instructions=self._PROTOTYPE_AGENT_INSTRUCTIONS,
+                prompt_sources=prompt_sources,
             )
         )
 
@@ -1135,6 +1258,7 @@ class ContextCompiler:
         agent_id: str,
         capsule_generation: int,
         history: tuple[ConversationMessage, ...] = (),
+        prompt_sources: PromptSourceSnapshot | None = None,
     ) -> ContextPlan:
         if (
             not isinstance(user_message, str)
@@ -1146,6 +1270,9 @@ class ContextCompiler:
         ):
             raise ContextPlanError("invalid context compilation input")
         history = self._validated_history(history)
+        prompt_sources = prompt_sources or PromptSourceSnapshot.empty()
+        if not isinstance(prompt_sources, PromptSourceSnapshot):
+            raise ContextPlanError("invalid prompt source snapshot")
         ordered_tools = tuple(sorted(tools, key=lambda spec: spec.tool_id))
         effective_toolset_digest = toolset_digest(ordered_tools)
         policy = CompressionPolicy.for_profile(model_profile)
@@ -1158,9 +1285,12 @@ class ContextCompiler:
             omitted_history_messages=0,
             agent_id=agent_id,
             capsule_generation=capsule_generation,
+            prompt_sources=prompt_sources,
         )
         estimated_input_tokens = _estimated_input_tokens(sections, ordered_tools)
-        history_section_limit = MAX_CONTEXT_SECTIONS - 4
+        base_section_count = len(sections) - len(history)
+        history_section_limit = MAX_CONTEXT_SECTIONS - base_section_count - 1
+        history_section_limit -= history_section_limit % 2
         must_window = (
             bool(history)
             and (
@@ -1189,6 +1319,7 @@ class ContextCompiler:
                     omitted_history_messages=candidate_omitted_pairs * 2,
                     agent_id=agent_id,
                     capsule_generation=capsule_generation,
+                    prompt_sources=prompt_sources,
                 )
                 candidate_estimate = _estimated_input_tokens(
                     candidate_sections, ordered_tools
@@ -1208,6 +1339,7 @@ class ContextCompiler:
                 omitted_history_messages=omitted_history_messages,
                 agent_id=agent_id,
                 capsule_generation=capsule_generation,
+                prompt_sources=prompt_sources,
             )
             estimated_input_tokens = (
                 selected_estimate

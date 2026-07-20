@@ -51,6 +51,7 @@ from .sessions import (
     ConversationStoreUnavailableError,
     ConversationSummary,
 )
+from .workspace_context import WorkspaceContextError
 
 
 SESSION_COOKIE = "abv2_session"
@@ -946,6 +947,8 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, "conversation has an active Run") from exc
         except ConversationStoreUnavailableError as exc:
             raise HTTPException(503, "conversation state is unavailable") from exc
+        except WorkspaceContextError as exc:
+            raise HTTPException(409, "Agent workspace context is unsafe") from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {
@@ -1181,6 +1184,8 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(409, "conversation has an active Run") from exc
         except ConversationStoreUnavailableError as exc:
             raise HTTPException(503, "conversation state is unavailable") from exc
+        except WorkspaceContextError as exc:
+            raise HTTPException(409, "Agent workspace context is unsafe") from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         return {
@@ -1200,6 +1205,8 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             record = await request.app.state.commands.start(
                 StartRunCommand(agent_id=PROTOTYPE_AGENT_ID, message=message)
             )
+        except WorkspaceContextError as exc:
+            raise HTTPException(409, "Agent workspace context is unsafe") from exc
         except (ValueError, ConversationConflictError) as exc:
             raise HTTPException(400, str(exc)) from exc
         except ConversationStoreUnavailableError as exc:

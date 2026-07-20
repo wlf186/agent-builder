@@ -17,7 +17,7 @@ Capsule 是一个 Agent 的所有持久状态、可重建环境和临时 Run 的
 data/agents/<agent-id>/                  persistent, non-reproducible
 ├── manifest.json                       private identity/generation metadata
 ├── state.sqlite[-wal|-shm]             durable semantic event journal
-├── workspace/                          reserved; current Worker cannot write it
+├── workspace/                          optional CLAUDE.md / Capsule-owned Git tree; Worker cannot read or write it
 └── artifacts/                          reserved; current Worker cannot write it
 
 .runtime/agents/<agent-id>/              disposable/reproducible runtime
@@ -55,6 +55,9 @@ Ollama Broker；共享 Broker 不共享 Conversation、ContextPlan、Run、Worke
   [qualification contract](qualification.md)。
 - `input/work/output` 只是路径边界，不代表当前支持文件能力。Landlock 当前不给 Worker
   任何直接写权限。
+- Run admission 只从该 Agent 精确的 `workspace/CLAUDE.md` 与 workspace 自有 Git
+  repository 生成不可变 prompt-source snapshot；Control Plane 不向上遍历或跨 Agent
+  读取，Git helper 也被只读 Landlock 限制在当前 workspace。
 
 ## Run 生命周期
 
@@ -102,7 +105,7 @@ module 和完整命令，并必须是当前 uid、`0600`、单 hardlink、固定
 Run root 是 disposable；terminal 后删除。以下内容保留到 Agent 删除：
 
 - `manifest.json`；
-- `workspace/` 与 `artifacts/`（当前为空/保留）；
+- `workspace/`（可含 CLAUDE.md/Git project data）与 `artifacts/`；
 - `state.sqlite` durable events；
 - `worker-env`（可重建，但普通 stop 不删除）。
 

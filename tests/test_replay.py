@@ -16,7 +16,11 @@ from agent_builder_v2.replay import (
     decode_projection_snapshot,
     project_durable_run,
 )
-from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
+from agent_builder_v2.tools import (
+    PROTOTYPE_ECHO_SPEC_V1,
+    prototype_tool_specs,
+    toolset_digest,
+)
 
 
 CONVERSATION_ID = "1" * 32
@@ -206,6 +210,18 @@ def test_strict_decoder_round_trips_a_canonical_event() -> None:
     event = _event(1, "run.started", {"prototype": True})
 
     assert _decode(event) == event
+
+
+def test_retained_v1_tool_manifest_digest_remains_replayable() -> None:
+    payload = _started_payload()
+    context = payload["context_plan"]
+    assert isinstance(context, dict)
+    context["toolset_digest"] = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
+    snapshot, gaps = project_durable_run(
+        (_event(1, "run.started", payload), _event(2, "run.failed", _failed()))
+    )
+    assert snapshot.complete is True
+    assert gaps == ()
 
 
 @pytest.mark.parametrize(

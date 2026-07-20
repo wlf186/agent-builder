@@ -30,7 +30,12 @@ from .contracts import (
     TERMINAL_KINDS,
     EventEnvelope,
 )
-from .tools import ToolSpec, prototype_tool_specs, toolset_digest
+from .tools import (
+    PROTOTYPE_ECHO_SPEC_V1,
+    ToolSpec,
+    prototype_tool_specs,
+    toolset_digest,
+)
 
 
 MAX_DURABLE_EVENT_BYTES = 65_536
@@ -67,6 +72,7 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
 }
 _VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in prototype_tool_specs())
 _TOOLSET_DIGEST = toolset_digest(prototype_tool_specs())
+_LEGACY_TOOLSET_DIGEST = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
 _DURABLE_KINDS = frozenset(
     {
         "run.started",
@@ -512,7 +518,8 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         or not isinstance(digest, str)
         or _DIGEST.fullmatch(digest) is None
         or plan_id != f"context-{digest[:24]}"
-        or value.get("toolset_digest") != _TOOLSET_DIGEST
+        or value.get("toolset_digest")
+        not in {_TOOLSET_DIGEST, _LEGACY_TOOLSET_DIGEST}
         or not isinstance(history_digest, str)
         or _DIGEST.fullmatch(history_digest) is None
     ):
@@ -554,8 +561,11 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
             strategy == "completed-turn-tail-v1"
             and included_count >= history_count
         )
-        or section_count
-        != 3 + included_count + int(strategy == "completed-turn-tail-v1")
+            or not (
+                3 + included_count + int(strategy == "completed-turn-tail-v1")
+                <= section_count
+                <= 6 + included_count + int(strategy == "completed-turn-tail-v1")
+            )
     ):
         raise ReplayCorruptionError("invalid run.started history metadata")
 

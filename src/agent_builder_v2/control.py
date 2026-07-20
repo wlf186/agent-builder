@@ -51,7 +51,14 @@ from .state import (
     JournalUnavailableError,
 )
 from .sync_counter import qualification_environment
-from .tools import ToolSpec, prototype_tool_specs, toolset_digest
+from .tools import (
+    EffectiveToolSet,
+    ToolSpec,
+    prototype_tool_catalog,
+    prototype_tool_policy,
+    toolset_digest,
+)
+from .workspace_context import collect_prompt_sources
 
 
 WORKER_EVENT_KINDS = frozenset(
@@ -470,8 +477,12 @@ class RunService:
             else manage_model_broker
         )
         self.context_compiler = context_compiler or ContextCompiler()
-        self.effective_tools = prototype_tool_specs()
-        toolset_digest(self.effective_tools)
+        self.tool_catalog = prototype_tool_catalog()
+        self.tool_policy = prototype_tool_policy()
+        self.effective_toolset = EffectiveToolSet.resolve(
+            self.tool_catalog, self.tool_policy
+        )
+        self.effective_tools = self.effective_toolset.specs
         self.model_qualification: OllamaQualification | None = None
         self.sandbox_qualification: HostQualification | None = None
         self.runs: dict[str, RunRecord] = {}
@@ -780,13 +791,22 @@ class RunService:
                 ConversationMessage(message.message_id, message.role, message.content)
                 for message in snapshot.committed_history
             )
+            effective_toolset = EffectiveToolSet.resolve(
+                self.tool_catalog, self.tool_policy
+            )
+            prompt_sources = await asyncio.to_thread(
+                collect_prompt_sources, self.capsule
+            )
+            if request_cancelled.is_set() or self._closing:
+                raise asyncio.CancelledError
             context_plan = self.context_compiler.compile(
                 command.message,
                 model_profile=self.model_qualification.model_profile,
-                tools=self.effective_tools,
+                tools=effective_toolset.specs,
                 agent_id=command.agent_id,
                 capsule_generation=self.capsule.generation,
                 history=context_history,
+                prompt_sources=prompt_sources,
             )
             runtime_snapshot = TurnRuntimeSnapshot.create(
                 context_plan=context_plan,
@@ -795,6 +815,7 @@ class RunService:
                     max_tool_calls=2,
                 ),
                 wall_timeout_seconds=RUN_WALL_TIMEOUT_SECONDS,
+                effective_toolset=effective_toolset,
             )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
@@ -814,7 +835,7 @@ class RunService:
             conversation_managed=True,
             conversation_revision=snapshot.revision,
             context_plan=context_plan,
-            effective_tools=self.effective_tools,
+            effective_tools=effective_toolset.specs,
             runtime_snapshot=runtime_snapshot,
             deadline_at=(
                 asyncio.get_running_loop().time()
@@ -2217,6 +2238,9 @@ class RunService:
                                 "loop_limits": (
                                     record.runtime_snapshot.loop_limits.to_dict()
                                 ),
+                                "effective_tool_ids": [
+                                    spec.tool_id for spec in record.effective_tools
+                                ],
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),

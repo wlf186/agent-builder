@@ -51,6 +51,8 @@ def test_runtime_snapshot_freezes_every_execution_affecting_boundary() -> None:
         "context_plan_id": snapshot.context_plan.reference.plan_id,
         "context_plan_digest": snapshot.context_plan.reference.digest,
         "toolset_digest": snapshot.context_plan.reference.toolset_digest,
+        "tool_catalog_digest": snapshot.tool_catalog_digest,
+        "tool_policy_digest": snapshot.tool_policy_digest,
         "loop_limits": {"max_model_iterations": 4, "max_tool_calls": 2},
         "max_total_input_tokens": 122_880,
         "max_total_output_tokens": 8_192,

@@ -738,6 +738,57 @@ def apply_checkout_write_confinement(repository_root: Path) -> None:
         os.close(ruleset_fd)
 
 
+def apply_read_only_command_confinement(workspace: Path, executable: Path) -> None:
+    """Confine a fixed metadata command to one read-only workspace.
+
+    This is installed by a short-lived helper before ``execve``.  It avoids
+    Python's unsafe ``preexec_fn`` in the multi-threaded Gateway and ensures a
+    malicious Git repository cannot redirect reads through config, alternates
+    or symlinks outside its Agent Capsule.
+    """
+
+    qualification = require_qualified_host()
+    if qualification.landlock_abi < MINIMUM_LANDLOCK_ABI:
+        raise SandboxUnavailableError("read-only command confinement requires Landlock")
+    workspace_root = _capture_rule_root(workspace, expect_directory=True)
+    executable_root = _capture_rule_root(executable, expect_directory=False)
+    readable = [workspace_root, executable_root]
+    for candidate in _SYSTEM_READABLE_CANDIDATES:
+        captured = _optional_rule_root(candidate)
+        if captured is not None:
+            readable.append(captured)
+
+    ruleset_fd = _new_ruleset_fd()
+    directory_rights = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_READ_DIR
+    file_rights = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_IOCTL_DEV
+    try:
+        seen: set[tuple[int, int]] = set()
+        for root in readable:
+            identity = (root.device, root.inode)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rights = directory_rights if root.is_directory else file_rights
+            if root.path == Path("/dev/null"):
+                rights |= _ACCESS_WRITE_FILE
+            _add_path_rule(
+                ruleset_fd,
+                root,
+                rights,
+            )
+        configure_parent_death_signal()
+        _set_process_nondumpable()
+        _set_no_new_privileges()
+        result = _libc().syscall(_SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
+        if result != 0:
+            error = ctypes.get_errno()
+            raise SandboxUnavailableError(
+                f"could not enter read-only command domain: errno={error}"
+            )
+    finally:
+        os.close(ruleset_fd)
+
+
 def _build_seccomp_filter(machine: str) -> list[_SockFilter]:
     normalised = _MACHINE_ALIASES.get(machine.lower(), machine.lower())
     specification = _SECCOMP_ARCHITECTURES.get(normalised)
@@ -829,6 +880,7 @@ __all__ = [
     "apply_worker_sandbox",
     "apply_worker_umask",
     "apply_checkout_write_confinement",
+    "apply_read_only_command_confinement",
     "close_worker_file_descriptors",
     "configure_parent_death_signal",
     "host_qualification",

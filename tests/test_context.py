@@ -153,7 +153,10 @@ def test_prompt_section_registry_is_sealed_ordered_and_bounded() -> None:
     assert registry.provider_manifest() == (
         {"provider_id": "platform.contract", "order": 100, "cacheable": True},
         {"provider_id": "agent.instructions", "order": 200, "cacheable": True},
-        {"provider_id": "conversation.window", "order": 300, "cacheable": False},
+        {"provider_id": "workspace.instructions", "order": 300, "cacheable": True},
+        {"provider_id": "runtime.environment", "order": 400, "cacheable": True},
+        {"provider_id": "workspace.git", "order": 500, "cacheable": True},
+        {"provider_id": "conversation.window", "order": 600, "cacheable": False},
         {"provider_id": "conversation.history", "order": 1000, "cacheable": False},
         {"provider_id": "turn.user", "order": 2000, "cacheable": False},
     )
@@ -182,7 +185,7 @@ def test_prompt_section_registry_is_sealed_ordered_and_bounded() -> None:
     assert dependencies["platform.contract"] == changed_dependencies["platform.contract"]
     assert dependencies["agent.instructions"] == changed_dependencies["agent.instructions"]
     assert dependencies["turn.user"] != changed_dependencies["turn.user"]
-    assert registry.cache_entries == 2
+    assert registry.cache_entries == 3
 
     for generation in range(2, 8):
         compiler.compile(
@@ -235,7 +238,7 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     assert payload["provider_message_count"] == len(plan.provider_messages())
     assert "provider_messages" not in payload
     assert payload["renderer"] == {
-        "version": "ordered-sections-v2",
+        "version": "ordered-sections-v3",
         "section_registry_version": PROMPT_SECTION_REGISTRY_VERSION,
         "leading_system_sections_merged": True,
         "leading_system_section_count": 2,
@@ -277,7 +280,7 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     sections[0]["id"] = "changed"
     fresh = inspection.to_dict()
     assert fresh["context_plan"]["plan_id"] == plan.reference.plan_id
-    assert fresh["renderer"]["version"] == "ordered-sections-v2"
+    assert fresh["renderer"]["version"] == "ordered-sections-v3"
     assert fresh["sections"][0]["id"] == "platform.contract"
     same_key = plan.operator_inspection(inspection_key)
     different_key = plan.operator_inspection(b"z" * 32)

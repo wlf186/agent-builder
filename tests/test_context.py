@@ -18,7 +18,9 @@ from agent_builder_v2.context import (
     ContextPlanError,
     ContextPlanReference,
     ModelProfile,
+    PROMPT_SECTION_REGISTRY_VERSION,
     PROVIDER_TEMPLATE_TOKEN_RESERVE,
+    PromptSectionRegistry,
     estimate_text_tokens,
 )
 from agent_builder_v2.tools import prototype_tool_specs
@@ -146,6 +148,57 @@ def test_context_plan_is_ordered_reproducible_and_provider_renderable() -> None:
     assert "请回显这一条" not in repr(first.sections[-1])
 
 
+def test_prompt_section_registry_is_sealed_ordered_and_bounded() -> None:
+    registry = PromptSectionRegistry(maximum_cache_entries=3)
+    assert registry.provider_manifest() == (
+        {"provider_id": "platform.contract", "order": 100, "cacheable": True},
+        {"provider_id": "agent.instructions", "order": 200, "cacheable": True},
+        {"provider_id": "conversation.window", "order": 300, "cacheable": False},
+        {"provider_id": "conversation.history", "order": 1000, "cacheable": False},
+        {"provider_id": "turn.user", "order": 2000, "cacheable": False},
+    )
+    compiler = ContextCompiler(registry)
+    base = compiler.compile(
+        "first",
+        model_profile=_profile(),
+        tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+    changed_user = compiler.compile(
+        "second",
+        model_profile=_profile(),
+        tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+    dependencies = {
+        section.section_id: section.dependency_digest for section in base.sections
+    }
+    changed_dependencies = {
+        section.section_id: section.dependency_digest
+        for section in changed_user.sections
+    }
+    assert dependencies["platform.contract"] == changed_dependencies["platform.contract"]
+    assert dependencies["agent.instructions"] == changed_dependencies["agent.instructions"]
+    assert dependencies["turn.user"] != changed_dependencies["turn.user"]
+    assert registry.cache_entries == 2
+
+    for generation in range(2, 8):
+        compiler.compile(
+            "first",
+            model_profile=_profile(),
+            tools=prototype_tool_specs(),
+            agent_id=PROTOTYPE_AGENT_ID,
+            capsule_generation=generation,
+        )
+    assert registry.cache_entries == 3
+    assert base.sections[0].trust == "platform"
+    assert base.sections[0].role == "system"
+    assert base.sections[0].truncation_policy == "never"
+    assert base.sections[0].estimated_tokens <= base.sections[0].budget_tokens
+
+
 def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> None:
     history = (
         ConversationMessage("a" * 32, "user", "history-user-secret-47"),
@@ -182,7 +235,8 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     assert payload["provider_message_count"] == len(plan.provider_messages())
     assert "provider_messages" not in payload
     assert payload["renderer"] == {
-        "version": "ordered-sections-v1",
+        "version": "ordered-sections-v2",
+        "section_registry_version": PROMPT_SECTION_REGISTRY_VERSION,
         "leading_system_sections_merged": True,
         "leading_system_section_count": 2,
         "description": payload["renderer"]["description"],
@@ -197,6 +251,9 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
             "provenance",
             "cache",
             "truncation",
+            "dependency_digest",
+            "budget_tokens",
+            "truncation_reason",
             "estimated_tokens",
             "content_bytes",
             "content_digest",
@@ -220,7 +277,7 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     sections[0]["id"] = "changed"
     fresh = inspection.to_dict()
     assert fresh["context_plan"]["plan_id"] == plan.reference.plan_id
-    assert fresh["renderer"]["version"] == "ordered-sections-v1"
+    assert fresh["renderer"]["version"] == "ordered-sections-v2"
     assert fresh["sections"][0]["id"] == "platform.contract"
     same_key = plan.operator_inspection(inspection_key)
     different_key = plan.operator_inspection(b"z" * 32)
@@ -232,6 +289,29 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     )
     with pytest.raises(ContextPlanError, match="digest key"):
         plan.operator_inspection(b"short")
+
+
+def test_operator_reveal_never_exposes_trusted_instructions_and_redacts_secrets() -> None:
+    plan = ContextCompiler().compile(
+        "token=0123456789abcdef0123456789abcdef and visible diagnostic text",
+        model_profile=_profile(),
+        tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+
+    sections = plan.operator_redacted_reveal(maximum_excerpt_bytes=128)
+
+    assert [item.exposure for item in sections[:2]] == ["withheld", "withheld"]
+    assert sections[0].excerpt is None
+    assert sections[1].excerpt is None
+    assert sections[-1].exposure == "redacted_excerpt"
+    assert sections[-1].excerpt is not None
+    assert "0123456789abcdef" not in sections[-1].excerpt
+    assert "[REDACTED]" in sections[-1].excerpt
+    assert plan.sections[0].content not in str(
+        [item.to_dict() for item in sections]
+    )
 
 
 def test_plan_digest_covers_message_generation_profile_and_tool_contract() -> None:

@@ -344,12 +344,12 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
                     REQUEST_DIGEST_DOMAIN + chat_requests[0].content
                 ).hexdigest(),
             ),
-            OllamaRequestMetadata(
-                iteration=2,
-                message_count=len(second_body["messages"]),
-                tool_count=0,
-                estimated_input_tokens=estimate_provider_input_tokens(
-                    second_body["messages"], ()
+                OllamaRequestMetadata(
+                    iteration=2,
+                    message_count=len(second_body["messages"]),
+                    tool_count=len(second_body["tools"]),
+                    estimated_input_tokens=estimate_provider_input_tokens(
+                        second_body["messages"], plan.tools
                 ),
                 request_bytes=len(chat_requests[1].content),
                 request_digest=hashlib.sha256(
@@ -365,7 +365,7 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
             assert body["options"]["num_predict"] == MODEL_NUM_PREDICT
             assert body["options"]["num_ctx"] == RUNTIME_CONTEXT_TOKEN_CAP
         assert first_body["tools"][0]["function"]["name"] == "builtin_echo"
-        assert second_body["tools"] == []
+        assert second_body["tools"][0]["function"]["name"] == "builtin_echo"
         assert first_body["messages"][0]["role"] == "system"
         assert "[platform.contract]" in first_body["messages"][0]["content"]
         assert "[agent.instructions]" in first_body["messages"][0]["content"]
@@ -451,7 +451,7 @@ async def test_slow_request_observer_preserves_session_single_flight() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_capability_is_narrowed_after_the_first_call() -> None:
+async def test_frozen_tool_capability_supports_a_second_sequential_call() -> None:
     first_call = {
         "id": "call_first",
         "function": {"name": "builtin_echo", "arguments": {"text": "hello"}},
@@ -480,13 +480,22 @@ async def test_tool_capability_is_narrowed_after_the_first_call() -> None:
         session = broker.new_run(_plan(broker, "hello"))
         await _collect(session.stream_turn("hello"))
         result = OllamaToolResult("call_first", HARNESS_TOOL_ID, "hello")
-        with pytest.raises(OllamaBrokerError) as raised:
-            await _collect(session.stream_turn("hello", (result,)))
-        assert raised.value.code == "model_protocol_error"
+        second_frames = await _collect(session.stream_turn("hello", (result,)))
+        assert second_frames[-1] == OllamaFrame(
+            "tool.use",
+            {
+                "call_id": "call_repeated",
+                "tool_id": HARNESS_TOOL_ID,
+                "arguments": {"text": "hello"},
+                "usage": {"prompt_eval_count": 17, "eval_count": 5},
+            },
+        )
         chat_requests = [
             request for request in provider.requests if request.url.path == "/api/chat"
         ]
-        assert json.loads(chat_requests[1].content)["tools"] == []
+        assert json.loads(chat_requests[1].content)["tools"][0]["function"]["name"] == (
+            "builtin_echo"
+        )
     finally:
         await broker.close()
 

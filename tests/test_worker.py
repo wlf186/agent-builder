@@ -12,6 +12,7 @@ import pytest
 
 from agent_builder_v2 import worker
 from agent_builder_v2.context import ContextPlanReference
+from agent_builder_v2.contracts import LoopLimits
 
 
 CONTEXT_REFERENCE = ContextPlanReference(
@@ -19,6 +20,7 @@ CONTEXT_REFERENCE = ContextPlanReference(
     digest="a" * 64,
     toolset_digest="b" * 64,
 )
+LOOP_LIMITS = LoopLimits(max_model_iterations=4, max_tool_calls=2)
 
 
 def test_worker_command_budget_covers_worst_case_json_escaping(
@@ -27,7 +29,11 @@ def test_worker_command_budget_covers_worst_case_json_escaping(
     message = "\0" * 8_192
     payload = (
         json.dumps(
-            {"message": message, "context_plan": CONTEXT_REFERENCE.to_dict()},
+            {
+                "message": message,
+                "context_plan": CONTEXT_REFERENCE.to_dict(),
+                "loop_limits": LOOP_LIMITS.to_dict(),
+            },
             ensure_ascii=False,
             separators=(",", ":"),
         ).encode("utf-8")
@@ -40,6 +46,7 @@ def test_worker_command_budget_covers_worst_case_json_escaping(
     assert worker._read_command() == {
         "message": message,
         "context_plan": CONTEXT_REFERENCE,
+        "loop_limits": LOOP_LIMITS,
     }
 
 
@@ -90,7 +97,11 @@ def test_worker_applies_all_limits_before_input_or_kernel(
         worker,
         "_read_command",
         lambda: calls.append("read")
-        or {"message": "hello", "context_plan": CONTEXT_REFERENCE},
+        or {
+            "message": "hello",
+            "context_plan": CONTEXT_REFERENCE,
+            "loop_limits": LOOP_LIMITS,
+        },
     )
 
     class _Kernel:

@@ -7,6 +7,7 @@ import hmac
 import ipaddress
 import json
 import os
+import sqlite3
 import threading
 import time
 from collections import deque
@@ -27,10 +28,13 @@ from .auth import (
     SessionCapacityError,
     SessionService,
 )
-from .capsule import PROTOTYPE_AGENT_ID
+from .agents import AgentRegistry
+from .agent_runtime import AgentRuntime, AgentRuntimeManager
+from .capsule import PROTOTYPE_AGENT_ID, SAFE_ID
 from .commands import RUN_ID, CommandBus
 from .contracts import StartRunCommand
 from .control import RunService
+from .context_audit import ContextRevealPolicy
 from .query_engine import (
     QueryContextUnavailableError,
     QueryEngineOwnershipError,
@@ -354,6 +358,20 @@ def _conversation_response(value: Conversation) -> dict[str, object]:
     return {"session": _summary_response(value), "messages": messages}
 
 
+async def _runtime_for_agent(request: Request, agent_id: str) -> AgentRuntime:
+    """Resolve only an active Agent without disclosing malformed identities."""
+
+    if SAFE_ID.fullmatch(agent_id) is None:
+        raise HTTPException(404, "Agent not found")
+    manager: AgentRuntimeManager = request.app.state.runtime_manager
+    try:
+        return await manager.for_agent(agent_id)
+    except KeyError as exc:
+        raise HTTPException(404, "Agent not found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(409, "Agent runtime is unavailable") from exc
+
+
 def _replay_query_integer(
     request: Request,
     name: str,
@@ -447,6 +465,7 @@ def _summary_context_response(value: DurableReplay) -> dict[str, object]:
         "context_plan": dict(context_plan),
         "renderer": {
             "version": None,
+            "section_registry_version": None,
             "leading_system_sections_merged": None,
             "leading_system_section_count": None,
             "description": (
@@ -560,12 +579,23 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         project_token = ProjectTokenStore(root).load_or_create()
         sessions = SessionService(project_token, ttl_seconds=SESSION_SECONDS)
-        run_service = RunService(root, source)
-        await run_service.initialize()
-        query_engines = QueryEngineRegistry(run_service, PROTOTYPE_AGENT_ID)
+        agent_registry = AgentRegistry(root)
+        await asyncio.to_thread(agent_registry.initialize)
+        runtime_manager = AgentRuntimeManager(root, source, agent_registry)
+        await runtime_manager.initialize()
+        prototype_runtime = await runtime_manager.for_agent(PROTOTYPE_AGENT_ID)
+        run_service = prototype_runtime.run_service
+        query_engines = prototype_runtime.query_engines
+        context_reveal = ContextRevealPolicy(
+            root,
+            enabled=os.environ.get("HARNESS_V2_CONTEXT_REVEAL") == "1",
+        )
         app.state.sessions = sessions
+        app.state.agent_registry = agent_registry
+        app.state.runtime_manager = runtime_manager
         app.state.run_service = run_service
         app.state.query_engines = query_engines
+        app.state.context_reveal = context_reveal
         app.state.commands = CommandBus(query_engines)
         app.state.login_limiter = LoginLimiter()
         app.state.cookie_secure = cookie_secure
@@ -573,8 +603,9 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             yield
         finally:
             sessions.revoke_all()
-            await query_engines.close()
-            await run_service.close()
+            await runtime_manager.close()
+            context_reveal.close()
+            agent_registry.close()
 
     app = FastAPI(
         title="Harness V2 Prototype",
@@ -729,6 +760,331 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             response, secure=request.app.state.cookie_secure
         )
         return response
+
+    @app.get("/api/agents")
+    async def list_agents(request: Request) -> dict[str, object]:
+        _require_session(request)
+        registry: AgentRegistry = request.app.state.agent_registry
+        records = await asyncio.to_thread(registry.list)
+        return {"agents": [record.to_dict() for record in records]}
+
+    @app.post("/api/agents", status_code=201)
+    async def create_agent(request: Request) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) != {"display_name"} or not isinstance(
+            body.get("display_name"), str
+        ):
+            raise HTTPException(400, "display_name is required")
+        registry: AgentRegistry = request.app.state.agent_registry
+        try:
+            record = await asyncio.to_thread(
+                registry.create, body["display_name"]
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return record.to_dict()
+
+    @app.get("/api/agents/{agent_id}")
+    async def get_agent(agent_id: str, request: Request) -> dict[str, object]:
+        _require_session(request)
+        registry: AgentRegistry = request.app.state.agent_registry
+        try:
+            record = await asyncio.to_thread(registry.get, agent_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        return record.to_dict()
+
+    @app.post("/api/agents/{agent_id}/upgrade")
+    async def upgrade_agent(agent_id: str, request: Request) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) - {"display_name"} or (
+            "display_name" in body and not isinstance(body["display_name"], str)
+        ):
+            raise HTTPException(400, "invalid Agent upgrade body")
+        if agent_id == PROTOTYPE_AGENT_ID:
+            raise HTTPException(409, "the prototype Agent cannot be upgraded")
+        registry: AgentRegistry = request.app.state.agent_registry
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        try:
+            await manager.begin_drain(agent_id)
+            record = await asyncio.to_thread(
+                registry.upgrade,
+                agent_id,
+                display_name=body.get("display_name"),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        finally:
+            await manager.end_drain(agent_id)
+        return record.to_dict()
+
+    @app.delete("/api/agents/{agent_id}", status_code=204)
+    async def delete_agent(agent_id: str, request: Request) -> Response:
+        _require_csrf(request)
+        if agent_id == PROTOTYPE_AGENT_ID:
+            raise HTTPException(409, "the prototype Agent cannot be deleted")
+        registry: AgentRegistry = request.app.state.agent_registry
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        try:
+            await manager.begin_drain(agent_id)
+            await asyncio.to_thread(registry.delete, agent_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        finally:
+            await manager.end_drain(agent_id)
+        return Response(status_code=204)
+
+    @app.get("/api/agents/{agent_id}/sessions")
+    async def list_agent_conversations(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            conversations = await runtime.query_engines.list_conversations()
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return {"sessions": [_summary_response(item) for item in conversations]}
+
+    @app.post("/api/agents/{agent_id}/sessions", status_code=201)
+    async def create_agent_conversation(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) - {"title"}:
+            raise HTTPException(400, "unsupported conversation field")
+        title = body.get("title", "新会话")
+        if not isinstance(title, str):
+            raise HTTPException(400, "title must be a string")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            conversation = await runtime.query_engines.create_conversation(title)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation capacity exhausted") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _summary_response(conversation)
+
+    @app.get("/api/agents/{agent_id}/sessions/{conversation_id}")
+    async def get_agent_conversation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            conversation = await runtime.query_engines.get_conversation(
+                conversation_id
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _conversation_response(conversation)
+
+    @app.delete(
+        "/api/agents/{agent_id}/sessions/{conversation_id}", status_code=204
+    )
+    async def delete_agent_conversation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            result = await runtime.query_engines.delete_conversation(
+                conversation_id
+            )
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation has an active Run") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        if not result.deleted:
+            raise HTTPException(404, "conversation not found")
+        return Response(status_code=204)
+
+    @app.post(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/runs",
+        status_code=202,
+    )
+    async def start_agent_conversation_run(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, str]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        body = await _read_json_object(request)
+        if set(body) != {"message"} or not isinstance(body.get("message"), str):
+            raise HTTPException(400, "message is required")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            record = await runtime.commands.start(
+                StartRunCommand(
+                    agent_id=agent_id,
+                    message=body["message"],
+                    conversation_id=conversation_id,
+                )
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation has an active Run") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "agent_id": record.agent_id,
+            "run_id": record.run_id,
+            "session_id": record.conversation_id,
+            "events_url": f"/api/agents/{agent_id}/runs/{record.run_id}/events",
+        }
+
+    @app.get("/api/agents/{agent_id}/runs/{run_id}/events")
+    async def agent_run_events(
+        agent_id: str, run_id: str, request: Request
+    ) -> StreamingResponse:
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        cursor = _event_cursor(request)
+        try:
+            await runtime.query_engines.get_run(run_id)
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run stream is unavailable") from exc
+
+        async def stream() -> AsyncIterator[str]:
+            try:
+                async for envelope in runtime.query_engines.stream(run_id, cursor):
+                    if await request.is_disconnected():
+                        return
+                    if envelope is None:
+                        yield ": heartbeat\n\n"
+                    else:
+                        yield _canonical_sse_frame(envelope)
+            except (KeyError, ConversationNotFoundError):
+                return
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post(
+        "/api/agents/{agent_id}/runs/{run_id}/cancel", status_code=202
+    )
+    async def cancel_agent_run(
+        agent_id: str, run_id: str, request: Request
+    ) -> dict[str, bool]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            await runtime.commands.cancel(run_id)
+        except (KeyError, QueryEngineOwnershipError) as exc:
+            raise HTTPException(404, "run not found") from exc
+        return {"accepted": True}
+
+    @app.get("/api/agents/{agent_id}/runs/{run_id}/context")
+    async def inspect_agent_run_context(
+        agent_id: str, run_id: str, request: Request
+    ) -> Response:
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if request.query_params:
+            raise HTTPException(400, "unsupported context query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            exact = await runtime.query_engines.inspect_retained_context(run_id)
+        except QueryRunNotRetainedError:
+            exact = None
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run context is unavailable") from exc
+        except QueryContextUnavailableError as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        if exact is not None:
+            return JSONResponse(
+                exact.to_dict(), headers={"Cache-Control": "no-store"}
+            )
+        try:
+            replay = await runtime.query_engines.replay(run_id, after=0, limit=1)
+            summary = _summary_context_response(replay)
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run context is unavailable") from exc
+        except (
+            ConversationStoreUnavailableError,
+            QueryReplayCursorError,
+            QueryReplayUnavailableError,
+            ValueError,
+        ) as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        return JSONResponse(summary, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/agents/{agent_id}/runs/{run_id}/context/reveal")
+    async def reveal_agent_run_context(
+        agent_id: str, run_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if request.query_params:
+            raise HTTPException(400, "unsupported context query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        policy: ContextRevealPolicy = request.app.state.context_reveal
+        if not policy.enabled:
+            raise HTTPException(404, "context reveal is disabled")
+        if not policy.authorize(request.headers.get("x-context-operator-token")):
+            raise HTTPException(403, "context operator authorization failed")
+        try:
+            reveal = await runtime.query_engines.reveal_retained_context(run_id)
+        except QueryRunNotRetainedError as exc:
+            raise HTTPException(409, "run context is no longer retained") from exc
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except (ConversationConflictError, QueryContextUnavailableError) as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        exposed = sum(
+            section.exposure == "redacted_excerpt" for section in reveal.sections
+        )
+        try:
+            audit_id = await asyncio.to_thread(
+                policy.record,
+                agent_id=agent_id,
+                run_id=run_id,
+                availability="exact",
+                exposed_sections=exposed,
+            )
+        except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+            raise HTTPException(503, "context reveal audit is unavailable") from exc
+        return JSONResponse(
+            {**reveal.to_dict(), "audit_id": audit_id},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/sessions")
     async def list_conversations(request: Request) -> dict[str, object]:
@@ -1022,6 +1378,48 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         ) as exc:
             raise HTTPException(503, "run context is unavailable") from exc
         return JSONResponse(summary, headers={"Cache-Control": "no-store"})
+
+    @app.post("/api/runs/{run_id}/context/reveal")
+    async def reveal_run_context(run_id: str, request: Request) -> Response:
+        """Independently authorized, audited and redacted diagnostic excerpts."""
+
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if request.query_params:
+            raise HTTPException(400, "unsupported context query parameter")
+        policy: ContextRevealPolicy = request.app.state.context_reveal
+        if not policy.enabled:
+            raise HTTPException(404, "context reveal is disabled")
+        if not policy.authorize(request.headers.get("x-context-operator-token")):
+            raise HTTPException(403, "context operator authorization failed")
+        try:
+            reveal = await request.app.state.query_engines.reveal_retained_context(
+                run_id
+            )
+        except QueryRunNotRetainedError as exc:
+            raise HTTPException(409, "run context is no longer retained") from exc
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except (ConversationConflictError, QueryContextUnavailableError) as exc:
+            raise HTTPException(503, "run context is unavailable") from exc
+        exposed = sum(
+            section.exposure == "redacted_excerpt" for section in reveal.sections
+        )
+        try:
+            audit_id = await asyncio.to_thread(
+                policy.record,
+                agent_id=PROTOTYPE_AGENT_ID,
+                run_id=run_id,
+                availability="exact",
+                exposed_sections=exposed,
+            )
+        except (OSError, sqlite3.Error, RuntimeError, ValueError) as exc:
+            raise HTTPException(503, "context reveal audit is unavailable") from exc
+        return JSONResponse(
+            {**reveal.to_dict(), "audit_id": audit_id},
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get("/api/runs/{run_id}/replay")
     async def replay_run(run_id: str, request: Request) -> dict[str, object]:

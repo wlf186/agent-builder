@@ -13,9 +13,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_builder_v2.auth import SessionService
+from agent_builder_v2.agents import AgentRegistry
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
 from agent_builder_v2.commands import CommandBus
 from agent_builder_v2.context import ContextCompiler, ContextPlan, ModelProfile
+from agent_builder_v2.context_audit import ContextRevealPolicy
 from agent_builder_v2.contracts import EventEnvelope, StartRunCommand
 from agent_builder_v2.query_engine import QueryEngineRegistry
 from agent_builder_v2.replay import (
@@ -107,7 +109,9 @@ class _RunRecord:
     events: tuple[EventEnvelope, ...] = ()
 
 
-def _context_plan(message: str) -> ContextPlan:
+def _context_plan(
+    message: str, agent_id: str = PROTOTYPE_AGENT_ID
+) -> ContextPlan:
     return ContextCompiler().compile(
         message,
         model_profile=ModelProfile(
@@ -120,7 +124,7 @@ def _context_plan(message: str) -> ContextPlan:
             profile_source="test-profile",
         ),
         tools=prototype_tool_specs(),
-        agent_id=PROTOTYPE_AGENT_ID,
+        agent_id=agent_id,
         capsule_generation=1,
     )
 
@@ -135,12 +139,50 @@ class _Commands(CommandBus):
         return await super().start(command)
 
 
+class _LifecycleManager:
+    """Boundary-test lifecycle fence; execution is injected separately."""
+
+    def __init__(self) -> None:
+        self.draining: set[str] = set()
+        self.runtimes: dict[str, object] = {}
+
+    def register(
+        self,
+        agent_id: str,
+        run_service: object,
+        query_engines: QueryEngineRegistry,
+        commands: CommandBus,
+    ) -> None:
+        self.runtimes[agent_id] = SimpleNamespace(
+            agent_id=agent_id,
+            generation=1,
+            run_service=run_service,
+            query_engines=query_engines,
+            commands=commands,
+        )
+
+    async def for_agent(self, agent_id: str) -> object:
+        if agent_id in self.draining:
+            raise RuntimeError("Agent runtime is draining")
+        try:
+            return self.runtimes[agent_id]
+        except KeyError as exc:
+            raise KeyError("Agent not found") from exc
+
+    async def begin_drain(self, agent_id: str) -> None:
+        self.draining.add(agent_id)
+
+    async def end_drain(self, agent_id: str) -> None:
+        self.draining.discard(agent_id)
+
+
 class _RunService:
     capsule = object()
     model_qualification = SimpleNamespace(model="qwen3.5:2b")
     sandbox_qualification = object()
 
-    def __init__(self) -> None:
+    def __init__(self, agent_id: str = PROTOTYPE_AGENT_ID) -> None:
+        self.agent_id = agent_id
         self.conversations: dict[str, Conversation] = {}
         self.runs: dict[str, _RunRecord] = {}
         self.run_identities: dict[str, RunIdentity] = {}
@@ -159,7 +201,7 @@ class _RunService:
     async def create_conversation(self, title: str) -> Conversation:
         conversation = Conversation(
             conversation_id="4" * 32,
-            agent_id=PROTOTYPE_AGENT_ID,
+            agent_id=self.agent_id,
             title=title,
             created_at="2026-07-18T00:00:00.000Z",
             updated_at="2026-07-18T00:00:00.000Z",
@@ -207,13 +249,15 @@ class _RunService:
 
     async def start(self, command: StartRunCommand) -> _RunRecord:
         command.validate()
+        if command.agent_id != self.agent_id:
+            raise ValueError("unknown Agent")
         conversation_id = command.conversation_id or "2" * 32
         if conversation_id not in self.conversations:
             if command.conversation_id is not None:
                 raise ConversationNotFoundError("conversation not found")
             self.conversations[conversation_id] = Conversation(
                 conversation_id=conversation_id,
-                agent_id=PROTOTYPE_AGENT_ID,
+                agent_id=self.agent_id,
                 title="新会话",
                 created_at="2026-07-18T00:00:00.000Z",
                 updated_at="2026-07-18T00:00:00.000Z",
@@ -221,10 +265,10 @@ class _RunService:
                 active_run_id=None,
                 turns=(),
             )
-        plan = _context_plan(command.message)
+        plan = _context_plan(command.message, self.agent_id)
         started_event = EventEnvelope(
             event_id="7" * 32,
-            agent_id=PROTOTYPE_AGENT_ID,
+            agent_id=self.agent_id,
             conversation_id=conversation_id,
             turn_id="3" * 32,
             run_id=RUN_ID,
@@ -235,6 +279,7 @@ class _RunService:
             payload=_started_payload(plan.public_metadata()),
         )
         record = _RunRecord(
+            agent_id=self.agent_id,
             conversation_id=conversation_id,
             context_plan=plan,
             events=(started_event,),
@@ -402,6 +447,11 @@ def web_client() -> tuple[TestClient, _Commands]:
         run_service, PROTOTYPE_AGENT_ID
     )  # type: ignore[arg-type]
     commands = _Commands(query_engines)
+    runtime_manager = _LifecycleManager()
+    runtime_manager.register(
+        PROTOTYPE_AGENT_ID, run_service, query_engines, commands
+    )
+    app.state.runtime_manager = runtime_manager
     app.state.query_engines = query_engines
     app.state.commands = commands
     app.state.login_limiter = LoginLimiter()
@@ -569,6 +619,93 @@ def test_login_csrf_run_and_logout_session_flow(
     assert logout.status_code == 204
     assert client.get("/api/session").status_code == 401
     assert client.get("/api/auth/status").json() == {"authenticated": False}
+
+
+def test_authenticated_agent_lifecycle_api_is_csrf_protected_and_isolated(
+    web_client: tuple[TestClient, _Commands], tmp_path: Path
+) -> None:
+    client, _commands = web_client
+    registry = AgentRegistry(tmp_path)
+    registry.initialize()
+    client.app.state.agent_registry = registry
+    try:
+        login = client.post(
+            "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+        )
+        csrf = login.json()["csrf_token"]
+        mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+        assert client.post(
+            "/api/agents", json={"display_name": "No CSRF"}, headers=SAME_ORIGIN
+        ).status_code == 403
+        created = client.post(
+            "/api/agents",
+            json={"display_name": "API Agent"},
+            headers=mutation,
+        )
+        assert created.status_code == 201
+        agent_id = created.json()["agent_id"]
+        assert created.json()["generation"] == 1
+        assert client.get(f"/api/agents/{agent_id}").status_code == 200
+        upgraded = client.post(
+            f"/api/agents/{agent_id}/upgrade",
+            json={"display_name": "API Agent v2"},
+            headers=mutation,
+        )
+        assert upgraded.status_code == 200
+        assert upgraded.json()["generation"] == 2
+        assert client.delete(
+            f"/api/agents/{PROTOTYPE_AGENT_ID}", headers=mutation
+        ).status_code == 409
+        assert client.delete(f"/api/agents/{agent_id}", headers=mutation).status_code == 204
+        assert client.get(f"/api/agents/{agent_id}").status_code == 404
+    finally:
+        registry.close()
+
+
+def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    agent_id = "a" * 32
+    service = _RunService(agent_id)
+    engines = QueryEngineRegistry(service, agent_id)  # type: ignore[arg-type]
+    commands = _Commands(engines)
+    manager = client.app.state.runtime_manager
+    manager.register(agent_id, service, engines, commands)
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+
+    created = client.post(
+        f"/api/agents/{agent_id}/sessions",
+        json={"title": "Scoped"},
+        headers=mutation,
+    )
+    assert created.status_code == 201
+    session_id = created.json()["session_id"]
+    started = client.post(
+        f"/api/agents/{agent_id}/sessions/{session_id}/runs",
+        json={"message": "isolated"},
+        headers=mutation,
+    )
+    assert started.status_code == 202
+    assert started.json()["agent_id"] == agent_id
+    assert started.json()["events_url"].startswith(
+        f"/api/agents/{agent_id}/runs/"
+    )
+    streamed = client.get(started.json()["events_url"])
+    assert streamed.status_code == 200
+    assert '"agent_id":"' + agent_id + '"' in streamed.text
+    context = client.get(f"/api/agents/{agent_id}/runs/{RUN_ID}/context")
+    assert context.status_code == 200
+    assert context.json()["identity"]["agent_id"] == agent_id
+
+    assert client.get(f"/api/runs/{RUN_ID}/context").status_code == 404
+    assert client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/sessions/{session_id}"
+    ).status_code == 404
 
 
 def test_operator_chosen_access_token_can_create_a_web_session(
@@ -813,7 +950,11 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
     assert payload["content_exposure"] == "withheld"
     assert payload["provider_message_count"] == 2
     assert "provider_messages" not in payload
-    assert payload["renderer"]["version"] == "ordered-sections-v1"
+    assert payload["renderer"]["version"] == "ordered-sections-v2"
+    assert (
+        payload["renderer"]["section_registry_version"]
+        == "prompt-section-registry-v1"
+    )
     assert payload["renderer"]["leading_system_sections_merged"] is True
     assert payload["renderer"]["leading_system_section_count"] == 2
     assert [section["id"] for section in payload["sections"]] == [
@@ -823,7 +964,11 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
     ]
     assert all("content" not in section for section in payload["sections"])
     assert all(
-        "content_bytes" in section and "content_digest" in section
+        "content_bytes" in section
+        and "content_digest" in section
+        and "dependency_digest" in section
+        and "budget_tokens" in section
+        and "truncation_reason" in section
         for section in payload["sections"]
     )
     turn_section = next(
@@ -844,6 +989,92 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
 
     elevated = client.get(f"/api/runs/{RUN_ID}/context?include_content=true")
     assert elevated.status_code == 400
+
+
+def test_context_reveal_requires_independent_token_audits_and_redacts(
+    web_client: tuple[TestClient, _Commands], tmp_path: Path
+) -> None:
+    client, _commands = web_client
+    policy = ContextRevealPolicy(tmp_path, enabled=True)
+    client.app.state.context_reveal = policy
+    try:
+        login = client.post(
+            "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+        )
+        csrf_token = login.json()["csrf_token"]
+        secret = "token=0123456789abcdef0123456789abcdef"
+        assert client.post(
+            "/api/runs",
+            json={"message": f"{secret} visible"},
+            headers={**SAME_ORIGIN, "x-csrf-token": csrf_token},
+        ).status_code == 202
+        endpoint = f"/api/runs/{RUN_ID}/context/reveal"
+        mutation_headers = {**SAME_ORIGIN, "x-csrf-token": csrf_token}
+        assert client.post(endpoint, headers=mutation_headers).status_code == 403
+        token = tmp_path.joinpath(
+            ".runtime", "secrets", "context-reveal-token"
+        ).read_text(encoding="ascii").strip()
+        response = client.post(
+            endpoint,
+            headers={
+                **mutation_headers,
+                "x-context-operator-token": token,
+            },
+        )
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        payload = response.json()
+        assert payload["content_exposure"] == "redacted_excerpt"
+        assert len(payload["audit_id"]) == 32
+        assert secret not in response.text
+        assert "[REDACTED]" in response.text
+        assert payload["sections"][0]["exposure"] == "withheld"
+        assert payload["sections"][1]["exposure"] == "withheld"
+    finally:
+        policy.close()
+
+
+def test_context_reveal_is_hidden_when_disabled_and_rejects_evicted_plan(
+    web_client: tuple[TestClient, _Commands], tmp_path: Path
+) -> None:
+    client, _commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf_token = login.json()["csrf_token"]
+    mutation_headers = {**SAME_ORIGIN, "x-csrf-token": csrf_token}
+    assert client.post(
+        "/api/runs",
+        json={"message": "bounded reveal"},
+        headers=mutation_headers,
+    ).status_code == 202
+    endpoint = f"/api/runs/{RUN_ID}/context/reveal"
+
+    disabled = ContextRevealPolicy(tmp_path, enabled=False)
+    client.app.state.context_reveal = disabled
+    try:
+        assert client.post(endpoint, headers=mutation_headers).status_code == 404
+    finally:
+        disabled.close()
+
+    enabled = ContextRevealPolicy(tmp_path, enabled=True)
+    client.app.state.context_reveal = enabled
+    try:
+        token = tmp_path.joinpath(
+            ".runtime", "secrets", "context-reveal-token"
+        ).read_text(encoding="ascii").strip()
+        client.app.state.run_service.runs.clear()
+        response = client.post(
+            endpoint,
+            headers={
+                **mutation_headers,
+                "x-context-operator-token": token,
+            },
+        )
+        assert response.status_code == 409
+        assert token not in response.text
+    finally:
+        enabled.close()
 
 
 def test_historical_context_falls_back_to_validated_summary_only(

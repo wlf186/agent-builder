@@ -25,6 +25,7 @@ class AgentCapsule:
     runtime_root: Path
     interpreter: Path
     generation: int = 1
+    display_name: str = "Harness V2 Prototype Agent"
 
 
 class CapsuleManager:
@@ -85,7 +86,7 @@ class CapsuleManager:
             raise RuntimeError("secure Capsule metadata requires O_NOFOLLOW")
         return flag
 
-    def _read_manifest(self, path: Path, agent_id: str) -> int:
+    def _read_manifest(self, path: Path, agent_id: str) -> tuple[int, str]:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | self._no_follow_flag())
         try:
             metadata = os.fstat(descriptor)
@@ -108,26 +109,41 @@ class CapsuleManager:
             raise RuntimeError("prototype Agent manifest is invalid") from exc
         if (
             not isinstance(value, dict)
-            or value.get("schema_version") != 1
+            or value.get("schema_version") not in {1, 2}
             or value.get("agent_id") != agent_id
-            or value.get("generation") != 1
+            or not isinstance(value.get("generation"), int)
+            or isinstance(value.get("generation"), bool)
+            or not 1 <= value["generation"] <= 1_000_000_000
+            or not isinstance(value.get("display_name"), str)
+            or not value["display_name"].strip()
+            or len(value["display_name"].encode("utf-8")) > 128
         ):
-            raise RuntimeError("prototype Agent manifest has an unexpected identity")
-        return 1
+            raise RuntimeError("Agent manifest has an unexpected identity")
+        return value["generation"], value["display_name"]
 
-    def _ensure_manifest(self, path: Path, agent_id: str) -> int:
+    def _ensure_manifest(
+        self,
+        path: Path,
+        agent_id: str,
+        *,
+        display_name: str,
+        generation: int,
+    ) -> tuple[int, str]:
         try:
-            return self._read_manifest(path, agent_id)
+            existing = self._read_manifest(path, agent_id)
+            if existing != (generation, display_name):
+                raise RuntimeError("Agent manifest conflicts with the registry")
+            return existing
         except FileNotFoundError:
             pass
 
         payload = (
             json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "agent_id": agent_id,
-                    "display_name": "Harness V2 Prototype Agent",
-                    "generation": 1,
+                    "display_name": display_name,
+                    "generation": generation,
                 },
                 indent=2,
             )
@@ -174,6 +190,56 @@ class CapsuleManager:
                 os.close(parent_descriptor)
         return self._read_manifest(path, agent_id)
 
+    def _replace_manifest(
+        self,
+        path: Path,
+        agent_id: str,
+        *,
+        display_name: str,
+        generation: int,
+    ) -> None:
+        payload = (
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "agent_id": agent_id,
+                    "display_name": display_name,
+                    "generation": generation,
+                },
+                indent=2,
+            )
+            + "\n"
+        ).encode("utf-8")
+        temporary = path.parent / f".manifest.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | self._no_follow_flag(),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            self._write_all(descriptor, payload)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(temporary, path)
+            parent = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        if self._read_manifest(path, agent_id) != (generation, display_name):
+            raise RuntimeError("Agent manifest promotion did not persist")
+
     def _validate_interpreter(self, environment: Path) -> Path:
         self._require_real_directory(environment)
         self._require_real_directory(environment / "bin")
@@ -192,8 +258,16 @@ class CapsuleManager:
             raise RuntimeError("prototype Agent environment has no safe interpreter")
         return interpreter
 
-    def _ensure_environment(self, runtime_root: Path) -> Path:
-        environment = runtime_root / "worker-env"
+    def _environment_root(self, runtime_root: Path, generation: int) -> Path:
+        if generation == 1:
+            return runtime_root / "worker-env"
+        return runtime_root / "generations" / str(generation) / "worker-env"
+
+    def _ensure_environment(self, runtime_root: Path, generation: int = 1) -> Path:
+        if generation > 1:
+            self._ensure_real_directory(runtime_root / "generations")
+            self._ensure_real_directory(runtime_root / "generations" / str(generation))
+        environment = self._environment_root(runtime_root, generation)
         try:
             os.lstat(environment)
         except FileNotFoundError:
@@ -201,7 +275,8 @@ class CapsuleManager:
         else:
             return self._validate_interpreter(environment)
 
-        staging = runtime_root / (
+        staging_parent = environment.parent
+        staging = staging_parent / (
             f".worker-env.staging.{os.getpid()}.{secrets.token_hex(8)}"
         )
         try:
@@ -233,18 +308,25 @@ class CapsuleManager:
     def _validate_capsule(self, capsule: AgentCapsule) -> None:
         expected_data = self.data_agents / capsule.agent_id
         expected_runtime = self.runtime_agents / capsule.agent_id
-        expected_interpreter = expected_runtime / "worker-env" / "bin" / "python"
+        expected_interpreter = (
+            self._environment_root(expected_runtime, capsule.generation)
+            / "bin"
+            / "python"
+        )
         if (
             not SAFE_ID.fullmatch(capsule.agent_id)
+            or not capsule.display_name.strip()
             or capsule.data_root != expected_data
             or capsule.runtime_root != expected_runtime
             or capsule.interpreter != expected_interpreter
-            or capsule.generation != 1
+            or not 1 <= capsule.generation <= 1_000_000_000
         ):
             raise ValueError("Capsule identity is invalid")
         self._require_real_directory(capsule.data_root)
         self._require_real_directory(capsule.runtime_root)
-        self._validate_interpreter(expected_runtime / "worker-env")
+        self._validate_interpreter(
+            self._environment_root(expected_runtime, capsule.generation)
+        )
 
     @staticmethod
     def _run_root_in_use(root: Path) -> bool:
@@ -439,7 +521,29 @@ class CapsuleManager:
         return removed
 
     def ensure_prototype_agent(self) -> AgentCapsule:
-        agent_id = PROTOTYPE_AGENT_ID
+        return self.ensure_agent(
+            PROTOTYPE_AGENT_ID,
+            display_name="Harness V2 Prototype Agent",
+            generation=1,
+        )
+
+    def ensure_agent(
+        self,
+        agent_id: str,
+        *,
+        display_name: str,
+        generation: int,
+    ) -> AgentCapsule:
+        if (
+            not SAFE_ID.fullmatch(agent_id)
+            or not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name.encode("utf-8")) > 128
+            or not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 1 <= generation <= 1_000_000_000
+        ):
+            raise ValueError("invalid Agent identity")
         data_root = self.data_agents / agent_id
         runtime_root = self.runtime_agents / agent_id
         self._ensure_real_directory(data_root)
@@ -450,9 +554,146 @@ class CapsuleManager:
             self._ensure_real_directory(runtime_root / child)
 
         manifest = data_root / "manifest.json"
-        generation = self._ensure_manifest(manifest, agent_id)
-        interpreter = self._ensure_environment(runtime_root)
-        return AgentCapsule(agent_id, data_root, runtime_root, interpreter, generation)
+        manifest_generation, manifest_name = self._ensure_manifest(
+            manifest,
+            agent_id,
+            display_name=display_name,
+            generation=generation,
+        )
+        interpreter = self._ensure_environment(runtime_root, manifest_generation)
+        return AgentCapsule(
+            agent_id,
+            data_root,
+            runtime_root,
+            interpreter,
+            manifest_generation,
+            manifest_name,
+        )
+
+    def load_agent(self, agent_id: str) -> AgentCapsule:
+        if not SAFE_ID.fullmatch(agent_id):
+            raise ValueError("invalid Agent identity")
+        data_root = self.data_agents / agent_id
+        generation, display_name = self._read_manifest(
+            data_root / "manifest.json", agent_id
+        )
+        return self.ensure_agent(
+            agent_id,
+            display_name=display_name,
+            generation=generation,
+        )
+
+    def prepare_generation(
+        self,
+        capsule: AgentCapsule,
+        *,
+        display_name: str,
+    ) -> AgentCapsule:
+        self._validate_capsule(capsule)
+        generation = capsule.generation + 1
+        interpreter = self._ensure_environment(capsule.runtime_root, generation)
+        return AgentCapsule(
+            capsule.agent_id,
+            capsule.data_root,
+            capsule.runtime_root,
+            interpreter,
+            generation,
+            display_name,
+        )
+
+    def promote_generation(
+        self,
+        current: AgentCapsule,
+        prepared: AgentCapsule,
+    ) -> AgentCapsule:
+        self._validate_capsule(current)
+        if (
+            prepared.agent_id != current.agent_id
+            or prepared.data_root != current.data_root
+            or prepared.runtime_root != current.runtime_root
+            or prepared.generation != current.generation + 1
+        ):
+            raise ValueError("prepared Agent generation is invalid")
+        self._validate_interpreter(
+            self._environment_root(prepared.runtime_root, prepared.generation)
+        )
+        runs_root = current.runtime_root / "runs"
+        if any(runs_root.iterdir()):
+            raise RuntimeError("Agent has Run roots during generation promotion")
+        self._replace_manifest(
+            current.data_root / "manifest.json",
+            current.agent_id,
+            display_name=prepared.display_name,
+            generation=prepared.generation,
+        )
+        self._validate_capsule(prepared)
+        return prepared
+
+    def rollback_prepared_generation(self, prepared: AgentCapsule) -> None:
+        environment_generation_root = self._environment_root(
+            prepared.runtime_root, prepared.generation
+        ).parent
+        try:
+            self._require_real_directory(environment_generation_root)
+        except FileNotFoundError:
+            return
+        if self._process_references_roots((environment_generation_root,)):
+            raise RuntimeError("prepared Agent generation is still in use")
+        shutil.rmtree(environment_generation_root)
+
+    def retire_generation(
+        self,
+        *,
+        agent_id: str,
+        runtime_root: Path,
+        generation: int,
+    ) -> None:
+        if (
+            SAFE_ID.fullmatch(agent_id) is None
+            or runtime_root != self.runtime_agents / agent_id
+            or not 1 <= generation <= 1_000_000_000
+        ):
+            raise ValueError("invalid retired Agent generation")
+        environment = self._environment_root(runtime_root, generation)
+        target = environment if generation == 1 else environment.parent
+        try:
+            self._require_real_directory(target)
+        except FileNotFoundError:
+            return
+        if self._process_references_roots((target,)):
+            raise RuntimeError("retired Agent generation is still referenced")
+        shutil.rmtree(target)
+
+    @staticmethod
+    def _process_references_roots(roots: tuple[Path, ...]) -> bool:
+        inspected = 0
+        for process in Path("/proc").iterdir():
+            if not process.name.isdigit():
+                continue
+            inspected += 1
+            if inspected > 32_768:
+                raise RuntimeError("process residual scan exceeded its safety bound")
+            for link in ("cwd", "exe"):
+                try:
+                    value = Path(os.readlink(process / link))
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                if any(value == root or value.is_relative_to(root) for root in roots):
+                    return True
+        return False
+
+    def delete_agent(self, capsule: AgentCapsule) -> None:
+        self._validate_capsule(capsule)
+        self.cleanup_orphan_run_roots(capsule)
+        roots = (capsule.data_root, capsule.runtime_root)
+        if self._process_references_roots(roots):
+            raise RuntimeError("Agent roots are still referenced by a process")
+        for root in roots:
+            self._require_real_directory(root)
+        shutil.rmtree(capsule.runtime_root)
+        shutil.rmtree(capsule.data_root)
+        if any(root.exists() or root.is_symlink() for root in roots):
+            raise RuntimeError("Agent residual cleanup did not converge")
 
     def create_run_root(self, capsule: AgentCapsule, run_id: str) -> Path:
         self._validate_capsule(capsule)

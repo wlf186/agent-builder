@@ -28,6 +28,8 @@ Model Broker 和 SQLite ownership 仍在同一个受信 Python 进程；每个 R
                                 ▼
 ┌──────────── trusted Gateway / Control Plane (one process) ────────┐
 │ web.py       auth, CSRF, session CRUD, limits, static UI, SSE       │
+│ agents.py    persistent Agent registry + generation lifecycle       │
+│ agent_runtime.py lazy per-Agent services + shared model admission   │
 │ commands.py  typed CommandBus                                      │
 │ query_engine.py  bounded identity map + one Engine / Conversation   │
 │ control.py   RunService, Worker supervisor, validator, sequencer   │
@@ -106,9 +108,11 @@ production 无中断轮换或多用户 credential system。
    Worker 只保留运行时内置的同版本 ToolSpec，用于调用校验与本地 Echo 执行。
 8. Broker 为该 Run 独占一个 `OllamaRunSession`，从受信 ContextPlan 渲染 system、
    completed history user/assistant pairs 和当前 user message，并从相同 ToolSpec 生成
-   Ollama Tool schema。模型可请求一次结构化
-   `builtin/echo`，结果按相同 call ID 回流；随后 provider ToolSet 收窄为空，再进行
-   下一轮模型调用。重复 Tool call 按协议错误拒绝。
+   Ollama Tool schema。当前不可变 `TurnRuntimeSnapshot` 固化 Agent generation、模型画像、
+   ContextPlan、Tool manifest/digest、最多 4 次模型调用、最多 2 次顺序 Tool 调用、累计
+   usage 上限和 60 秒 wall deadline。模型可顺序请求两次结构化 `builtin/echo`；每次结果
+   都按原 call ID 回流，第二次预算消费后 provider ToolSet 收窄为空，再进行最终模型调用。
+   call/result 重复、乱序、并行、超预算或 snapshot 漂移都 fail closed。
 9. Ollama session 在完整 provider request 已通过动态 Token/字节 admission、但尚未打开
    HTTP stream 的最后受信边界，计算带 domain separation 的 request digest 和有界元数据。
    Control Plane 把该次调用真实运行时估算的 `provider_usage.started` 与 durable
@@ -146,6 +150,8 @@ executor 使用它，因此不代表已实现有副作用 Tool 或 exactly-once 
 | --- | --- | --- |
 | `web.py` | HTTP/SSE、认证边界、session CRUD、请求/响应限制 | Agent loop、模型 transcript、任意路径 |
 | `auth.py` | token、bounded session、CSRF | 用户业务状态 |
+| `agents.py` | 最多 100 个 Agent 的 registry、provisioning/active/upgrading/deleting 状态和恢复 | live Run/QueryEngine、模型连接 |
+| `agent_runtime.py` | 按 Agent generation 惰性激活/排空独立 RunService 与 QueryEngineRegistry；共享单一 Broker | Agent 持久状态、prompt、第二模型队列 |
 | `commands.py` | 类型化 start/cancel 命令 | request-derived endpoint/process options |
 | `query_engine.py` | 每 Conversation 一个逻辑 Engine、restore/submit/interrupt/delete、Run ownership、retained ContextPlan 元数据检查、最多 100 个实例 | transcript/event/ContextPlan/Worker cache、第二 Agent loop |
 | `control.py` | Run、Worker、Broker 调度、ContextPlan ownership、event validator/sequencer | UI 投影、未隔离 Tool 实现 |
@@ -158,7 +164,7 @@ executor 使用它，因此不代表已实现有副作用 Tool 或 exactly-once 
 | `contracts.py` | command/event 类型与 canonical identity | 持久化策略 |
 | `replay.py` | canonical durable payload/state validator、model call 配对、确定性 UI projector、v1/v2 snapshot codec | SQLite 事务、live stream、ContextPlan transcript |
 | `state.py` | durable semantic append、严格有界 replay、snapshot-only retention | token delta、完整 live Run truth、语义 summary |
-| `capsule.py` | Agent/Run 路径、环境与清理所有权 | 产品级 Agent registry（尚未实现） |
+| `capsule.py` | Agent/Run 路径、generation staging/promotion、环境与清理所有权 | registry、HTTP admission |
 | `sandbox.py` | fail-closed Worker kernel boundary | capability policy UI |
 
 ## 状态所有权
@@ -184,7 +190,8 @@ data/agents/<agent-id>/
     run_journal_state, run-ui-v1/v2 snapshots, operation/provider ledgers
 
 .runtime/agents/<agent-id>/
-  worker-env/, logs/, runs/<run-id>/
+  worker-env/ (generation 1), generations/<n>/worker-env/,
+  logs/, runs/<run-id>/
 ```
 
 Conversation/Turn transcript 可由 SQLite 跨 Gateway 重启恢复；启动时任何遗留
@@ -290,8 +297,8 @@ summary 不能把不同模型/profile 的计数和快照静默复用。
 
 ## 当前不支持
 
-通用 Agent create/upgrade/delete、旧 Worker或模型流跨进程恢复、
-语义 summary/compaction snapshot、workspace `CLAUDE.md` 注入、文件工具、Shell、Skill、MCP、RAG、
+旧 Worker或模型流跨进程恢复、语义 summary/compaction snapshot、workspace `CLAUDE.md`
+注入、文件工具、Shell、Skill、MCP、RAG、
 artifact broker、权限交互、子智能体、多用户、TLS、远程部署、正式 observability 和
 production release qualification 均未实现。路线见
 [runtime rebuild plan](../plans/runtime-rebuild.md)。

@@ -12,12 +12,52 @@ from uuid import uuid4
 SCHEMA_VERSION = "2.2-prototype"
 TERMINAL_KINDS = frozenset({"run.completed", "run.failed", "run.cancelled"})
 MAX_MESSAGE_BYTES = 8_192
+MAX_MODEL_ITERATIONS = 8
+MAX_TOOL_CALLS = 8
 # The Control Plane reserves this complete live sequence band before releasing
 # a Worker. Persisted managed-Run metadata must bind to this exact protocol
 # value so recovery cannot reuse a cursor already observed by an SSE client.
 RUN_CURSOR_RESERVED_THROUGH = 512
 RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
 Durability = Literal["durable", "ephemeral"]
+
+
+@dataclass(frozen=True, slots=True)
+class LoopLimits:
+    """Trusted per-Turn loop limits sent to the isolated Worker."""
+
+    max_model_iterations: int
+    max_tool_calls: int
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.max_model_iterations, int)
+            or isinstance(self.max_model_iterations, bool)
+            or not 1 <= self.max_model_iterations <= MAX_MODEL_ITERATIONS
+            or not isinstance(self.max_tool_calls, int)
+            or isinstance(self.max_tool_calls, bool)
+            or not 0 <= self.max_tool_calls <= MAX_TOOL_CALLS
+            or self.max_tool_calls >= self.max_model_iterations
+        ):
+            raise ValueError("invalid loop limits")
+
+    @classmethod
+    def from_dict(cls, value: object) -> LoopLimits:
+        if not isinstance(value, dict) or set(value) != {
+            "max_model_iterations",
+            "max_tool_calls",
+        }:
+            raise ValueError("invalid loop limits")
+        return cls(
+            max_model_iterations=value["max_model_iterations"],
+            max_tool_calls=value["max_tool_calls"],
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "max_model_iterations": self.max_model_iterations,
+            "max_tool_calls": self.max_tool_calls,
+        }
 
 
 def new_id() -> str:

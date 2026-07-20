@@ -50,6 +50,7 @@ MAX_USAGE_TOKENS = 1_000_000_000
 PROJECTION_VERSION = "run-ui-v2"
 LEGACY_PROJECTION_VERSION = "run-ui-v1"
 MODEL_BOUNDARY_FEATURE = "model-call-boundaries-v1"
+MULTI_TOOL_LOOP_FEATURE = "sequential-multi-tool-v1"
 SANDBOX_POLICY = "harness-v2-worker-v1"
 
 _RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -630,16 +631,23 @@ def _validate_started_payload(payload: object) -> dict[str, object]:
         or payload.get("sandbox") != SANDBOX_POLICY
     ):
         raise ReplayCorruptionError("invalid run.started payload")
-    if "protocol_features" in payload and payload.get("protocol_features") != [
-        MODEL_BOUNDARY_FEATURE
-    ]:
+    if "protocol_features" in payload and payload.get("protocol_features") not in (
+        [MODEL_BOUNDARY_FEATURE],
+        [MODEL_BOUNDARY_FEATURE, MULTI_TOOL_LOOP_FEATURE],
+    ):
         raise ReplayCorruptionError("invalid run.started protocol features")
     _validate_context_plan_metadata(payload.get("context_plan"))
     return payload
 
 
 def _has_model_boundary_feature(started: dict[str, object]) -> bool:
-    return started.get("protocol_features") == [MODEL_BOUNDARY_FEATURE]
+    features = started.get("protocol_features")
+    return isinstance(features, list) and MODEL_BOUNDARY_FEATURE in features
+
+
+def _has_multi_tool_loop_feature(started: dict[str, object]) -> bool:
+    features = started.get("protocol_features")
+    return isinstance(features, list) and MULTI_TOOL_LOOP_FEATURE in features
 
 
 def _validate_model_request_payload(
@@ -664,7 +672,7 @@ def _validate_model_request_payload(
     if not isinstance(context, dict) or not isinstance(visible_tools, list):
         raise ReplayCorruptionError("invalid model request context")
     iteration = _bounded_integer(
-        payload.get("iteration"), minimum=1, maximum=3, field="model iteration"
+        payload.get("iteration"), minimum=1, maximum=8, field="model iteration"
     )
     request_id = _worker_id(payload.get("request_id"), "model request_id")
     result_ids = payload.get("tool_result_call_ids")
@@ -707,10 +715,17 @@ def _validate_model_request_payload(
         maximum=len(visible_tools),
         field="model Tool count",
     )
+    expected_tool_count = (
+        len(visible_tools)
+        if _has_multi_tool_loop_feature(started)
+        and len(validated_result_ids) < 2
+        else (len(visible_tools) if iteration == 1 else 0)
+    )
     if (
         estimated > context.get("input_budget_tokens", 0)
-        or (iteration == 1 and (validated_result_ids or tool_count != len(visible_tools)))
-        or (iteration > 1 and (not validated_result_ids or tool_count != 0))
+        or (iteration == 1 and validated_result_ids)
+        or (iteration > 1 and not validated_result_ids)
+        or tool_count != expected_tool_count
     ):
         raise ReplayCorruptionError("invalid model request capability state")
     return payload
@@ -940,8 +955,9 @@ def _validate_snapshot_document(
         or not isinstance(model_calls, list)
     ):
         raise ReplayCorruptionError("projection document collections are invalid")
-    if len(tools) > 1:
-        raise ReplayCorruptionError("projection has more than one Tool call")
+    maximum_tools = 2 if _has_multi_tool_loop_feature(started) else 1
+    if len(tools) > maximum_tools:
+        raise ReplayCorruptionError("projection has too many Tool calls")
     if len(model_calls) > 3:
         raise ReplayCorruptionError("projection has too many model calls")
     boundary_feature = _has_model_boundary_feature(started)
@@ -1483,7 +1499,14 @@ def project_durable_run(
             )
             if (
                 pending_tool is not None
-                or seen_tools
+                or call_id in seen_tools
+                or (
+                    bool(seen_tools)
+                    and (
+                        started_payload is None
+                        or not _has_multi_tool_loop_feature(started_payload)
+                    )
+                )
                 or open_model_call is not None
                 or (
                     model_boundaries_seen

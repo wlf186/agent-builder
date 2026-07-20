@@ -85,6 +85,7 @@ def _sanitised_environment(source: dict[str, str]) -> dict[str, str]:
         "AGENT_BUILDER_RUNTIME_DIR",
         "HARNESS_V2_HOST",
         "HARNESS_V2_PORT",
+        "HARNESS_V2_CONTEXT_REVEAL",
     }
     return {key: value for key, value in source.items() if key in allowed}
 

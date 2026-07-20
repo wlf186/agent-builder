@@ -14,9 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from .capsule import AgentCapsule, CapsuleManager
+from .capsule import AgentCapsule, CapsuleManager, PROTOTYPE_AGENT_ID, SAFE_ID
 from .context import ConversationMessage, ContextCompiler, ContextPlan
 from .contracts import (
+    LoopLimits,
     RUN_CURSOR_RESERVED_THROUGH,
     TERMINAL_KINDS,
     EventEnvelope,
@@ -24,6 +25,7 @@ from .contracts import (
     new_id,
     utc_now,
 )
+from .runtime import TurnRuntimeSnapshot
 from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
 from .ollama import (
     OllamaBroker,
@@ -78,7 +80,7 @@ RECOVERY_EVENT_RESERVE = 32 * 1024
 # block, start and finish one requested-only Tool, then publish the terminal.
 RECOVERY_EVENT_SLOTS = 4
 MAX_DURABLE_EVENT_BYTES = 65_536
-RUN_WALL_TIMEOUT_SECONDS = 60.0
+RUN_WALL_TIMEOUT_SECONDS = 60
 CANCEL_GRACE_SECONDS = 2.0
 RUN_QUOTA_INTERVAL_SECONDS = 1.0
 MAX_RUN_TREE_ENTRIES = 1_024
@@ -368,6 +370,7 @@ class RunRecord:
     conversation_id: str
     turn_id: str
     run_id: str
+    runtime_snapshot: TurnRuntimeSnapshot | None = None
     user_message: str | None = field(default=None, repr=False)
     conversation_managed: bool = False
     conversation_revision: int | None = None
@@ -440,7 +443,9 @@ class RunService:
         repository_root: Path,
         source_root: Path,
         *,
+        agent_id: str = PROTOTYPE_AGENT_ID,
         model_broker: OllamaBroker | None = None,
+        manage_model_broker: bool | None = None,
         context_compiler: ContextCompiler | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve(strict=True)
@@ -451,11 +456,19 @@ class RunService:
             expected_role="gateway",
             child_role="worker",
         )
+        if SAFE_ID.fullmatch(agent_id) is None:
+            raise ValueError("invalid RunService Agent identity")
+        self.agent_id = agent_id
         self.capsules = CapsuleManager(self.repository_root)
         self.capsule: AgentCapsule | None = None
         self.journal: EventJournal | None = None
         self.conversations: ConversationStore | None = None
         self.model_broker = model_broker or OllamaBroker()
+        self._manage_model_broker = (
+            model_broker is None
+            if manage_model_broker is None
+            else manage_model_broker
+        )
         self.context_compiler = context_compiler or ContextCompiler()
         self.effective_tools = prototype_tool_specs()
         toolset_digest(self.effective_tools)
@@ -490,8 +503,20 @@ class RunService:
     async def initialize(self) -> None:
         try:
             self.sandbox_qualification = await asyncio.to_thread(require_qualified_host)
-            self.model_qualification = await self.model_broker.start()
-            self.capsule = await asyncio.to_thread(self.capsules.ensure_prototype_agent)
+            if self._manage_model_broker:
+                self.model_qualification = await self.model_broker.start()
+            else:
+                self.model_qualification = self.model_broker.qualification
+                if self.model_qualification is None:
+                    raise RuntimeError("shared model broker is not initialized")
+            if self.agent_id == PROTOTYPE_AGENT_ID:
+                self.capsule = await asyncio.to_thread(
+                    self.capsules.ensure_prototype_agent
+                )
+            else:
+                self.capsule = await asyncio.to_thread(
+                    self.capsules.load_agent, self.agent_id
+                )
             await asyncio.to_thread(
                 self.capsules.cleanup_orphan_run_roots,
                 self.capsule,
@@ -514,7 +539,8 @@ class RunService:
                 self.journal = None
             self.sandbox_qualification = None
             self.model_qualification = None
-            await self.model_broker.close()
+            if self._manage_model_broker:
+                await self.model_broker.close()
             raise
 
     async def close(self) -> None:
@@ -546,7 +572,8 @@ class RunService:
             self.conversations = None
         self.model_qualification = None
         self.sandbox_qualification = None
-        await self.model_broker.close()
+        if self._manage_model_broker:
+            await self.model_broker.close()
 
     def _conversation_store(self) -> ConversationStore:
         if self.conversations is None:
@@ -761,6 +788,14 @@ class RunService:
                 capsule_generation=self.capsule.generation,
                 history=context_history,
             )
+            runtime_snapshot = TurnRuntimeSnapshot.create(
+                context_plan=context_plan,
+                loop_limits=LoopLimits(
+                    max_model_iterations=4,
+                    max_tool_calls=2,
+                ),
+                wall_timeout_seconds=RUN_WALL_TIMEOUT_SECONDS,
+            )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
         except BaseException:
@@ -780,7 +815,11 @@ class RunService:
             conversation_revision=snapshot.revision,
             context_plan=context_plan,
             effective_tools=self.effective_tools,
-            deadline_at=asyncio.get_running_loop().time() + RUN_WALL_TIMEOUT_SECONDS,
+            runtime_snapshot=runtime_snapshot,
+            deadline_at=(
+                asyncio.get_running_loop().time()
+                + runtime_snapshot.wall_timeout_seconds
+            ),
         )
         reservation_error: ValueError | None = None
         async with self._lock:
@@ -876,7 +915,10 @@ class RunService:
                     "visible_tools": [
                         spec.tool_id for spec in record.effective_tools
                     ],
-                    "protocol_features": ["model-call-boundaries-v1"],
+                    "protocol_features": [
+                        "model-call-boundaries-v1",
+                        "sequential-multi-tool-v1",
+                    ],
                     "sandbox": SANDBOX_POLICY,
                     "context_plan": context_plan.public_metadata(),
                 },
@@ -1084,6 +1126,7 @@ class RunService:
             arguments = payload.get("arguments")
             spec = self._effective_tool(record, payload.get("tool_id"))
             broker_call = record.broker_pending_tool_calls.get(str(call_id))
+            runtime_snapshot = record.runtime_snapshot
             try:
                 validated_arguments = (
                     spec.validate_arguments(arguments) if spec is not None else None
@@ -1094,6 +1137,9 @@ class RunService:
                 keys != {"call_id", "tool_id", "arguments"}
                 or not self._worker_id(call_id)
                 or call_id in record.seen_tools
+                or runtime_snapshot is None
+                or len(record.seen_tools)
+                >= runtime_snapshot.loop_limits.max_tool_calls
                 or record.pending_tools
                 or spec is None
                 or validated_arguments is None
@@ -1155,6 +1201,7 @@ class RunService:
             ):
                 raise ValueError("invalid tool call finish")
         elif kind == "run.completed":
+            runtime_snapshot = record.runtime_snapshot
             if (
                 keys != {"reason", "model_iterations"}
                 or payload.get("reason") != "end_turn"
@@ -1163,7 +1210,11 @@ class RunService:
                 or payload["model_iterations"] != record.model_request_count
                 or record.model_response_count != record.model_request_count
                 or record.broker_stop_iteration != record.model_request_count
-                or not 1 <= record.model_request_count <= 3
+                or runtime_snapshot is None
+                or not 1 <= record.model_request_count <= (
+                    runtime_snapshot.loop_limits.max_model_iterations
+                )
+                or len(record.seen_tools) > runtime_snapshot.loop_limits.max_tool_calls
                 or record.open_blocks
                 or record.pending_tools
                 or record.broker_pending_tool_calls
@@ -1557,7 +1608,12 @@ class RunService:
                     )
             else:
                 self.journal.append(envelope)
-        except Exception:
+        except Exception as exc:
+            LOGGER.error(
+                "Harness V2 durable publish failed kind=%s exception=%s",
+                kind,
+                type(exc).__name__,
+            )
             record.journal_failed = True
             raise
         record.events.append(envelope)
@@ -1742,11 +1798,13 @@ class RunService:
                 <= metadata.request_bytes
                 <= context_plan.model_profile.request_byte_budget
                 or re.fullmatch(r"[a-f0-9]{64}", metadata.request_digest) is None
-                or (
-                    expected_iteration == 1
-                    and metadata.tool_count != len(context_plan.tools)
+                or metadata.tool_count
+                != (
+                    len(context_plan.tools)
+                    if len(trusted_result_call_ids)
+                    < record.runtime_snapshot.loop_limits.max_tool_calls
+                    else 0
                 )
-                or (expected_iteration > 1 and metadata.tool_count != 0)
             ):
                 raise RuntimeError("trusted model request metadata is invalid")
             await self._publish(
@@ -2004,7 +2062,14 @@ class RunService:
             )
         input_total = current_input + prompt_tokens
         output_total = current_output + output_tokens
-        if input_total > 1_000_000_000 or output_total > 1_000_000_000:
+        runtime_snapshot = record.runtime_snapshot
+        if (
+            input_total > 1_000_000_000
+            or output_total > 1_000_000_000
+            or runtime_snapshot is None
+            or input_total > runtime_snapshot.max_total_input_tokens
+            or output_total > runtime_snapshot.max_total_output_tokens
+        ):
             raise OllamaBrokerError(
                 "model_protocol_error", "Model usage exceeded its bound."
             )
@@ -2137,13 +2202,21 @@ class RunService:
                     diagnostic_stage = "model_session"
                     if record.context_plan is None:
                         raise RuntimeError("Run lost its trusted context plan")
-                    model_session = self.model_broker.new_run(record.context_plan)
+                    if record.runtime_snapshot is None:
+                        raise RuntimeError("Run lost its trusted runtime snapshot")
+                    model_session = self.model_broker.new_run(
+                        record.context_plan,
+                        max_tool_calls=record.runtime_snapshot.loop_limits.max_tool_calls,
+                    )
                     diagnostic_stage = "command_write"
                     process.stdin.write(
                         json.dumps(
                             {
                                 "message": message,
                                 "context_plan": record.context_plan.reference.to_dict(),
+                                "loop_limits": (
+                                    record.runtime_snapshot.loop_limits.to_dict()
+                                ),
                             },
                             ensure_ascii=False,
                             separators=(",", ":"),
@@ -2175,7 +2248,11 @@ class RunService:
                                 raise ValueError("Worker frame must be an object")
                             if raw.get("internal") == "model.request":
                                 model_requests += 1
-                                if model_requests > 3:
+                                if (
+                                    record.runtime_snapshot is None
+                                    or model_requests
+                                    > record.runtime_snapshot.loop_limits.max_model_iterations
+                                ):
                                     raise ValueError("Worker model request limit exceeded")
                                 await self._serve_model_request(
                                     record=record,

@@ -8,7 +8,9 @@ Agent Builder 是一个从零构建的、Claude Code 风格的本地智能体运
 
 - Web Gateway 固定监听 `0.0.0.0:20815`，`GET /health` 是唯一无需登录的运行状态
   入口。监听器目前没有 TLS，只能部署在受信、防火墙保护的网络。
-- 当前只有固定 demo Agent：`00000000-0000-4000-8000-000000000001`。
+- 持久 Agent registry 支持 create/list/get/upgrade/delete；默认 UI 仍使用不可删除的
+  prototype Agent `00000000-0000-4000-8000-000000000001`。每个 active generation 惰性
+  创建独立 RunService/QueryEngineRegistry，所有 Agent 只共享同一个有界模型 Broker。
 - Web UI 和受认证 API 支持会话的新建、列表、读取恢复和删除；同一会话可连续创建
   多个 Turn。公共路径是 `GET|POST /api/sessions`、`GET|DELETE /api/sessions/<id>` 和
   `POST /api/sessions/<id>/runs`。一个会话同时最多有一个 active Run；有活跃 Run 时
@@ -29,7 +31,7 @@ Agent Builder 是一个从零构建的、Claude Code 风格的本地智能体运
   Worker 或模型流。只有 `completed` Turn 的完整 user/assistant pair 会进入后续历史；
   failed、cancelled、interrupted 及任何 partial output 只用于 UI 状态，不进入模型上下文。
   ContextPlan 编译使用带 revision 的历史快照，Turn 接受以 CAS 拒绝编译期间发生的漂移。
-- 受信 Control Plane 为每个 Run 从 platform contract、固定 demo Agent instructions、
+- 受信 Control Plane 为每个 Run 从 platform contract、当前 generation 的 Agent instructions、
   已完成会话历史和本轮 user turn 编译不可变 ContextPlan，并由同一 `ToolSpec` 生成模型
   Tool schema 和执行校验。完整 plan 不进入 Worker；Worker/Model Broker IPC v2 只传
   `plan_id`、plan/toolset digest 等引用。workspace `CLAUDE.md` 尚未接入。
@@ -44,8 +46,9 @@ Agent Builder 是一个从零构建的、Claude Code 风格的本地智能体运
 - 每个 Run 启动一个独立 Worker 进程。Worker 使用 Agent 专属虚拟环境，并强制
   进入 Landlock、seccomp、rlimit、`no_new_privs` 和父进程死亡联动边界。
 - Worker 无网络、不能创建子进程、不能直接写文件。目前唯一工具是输入/结果均不超过
-  `8192` UTF-8 bytes 的只读 `builtin/echo`，且只在首轮向 provider 暴露；结果回流后
-  ToolSet 收窄为空。不得把原型描述为支持任意 Shell、Skill、MCP 或文件编辑。
+  `8192` UTF-8 bytes 的只读 `builtin/echo`。TurnRuntimeSnapshot 固化最多 4 次模型调用、
+  2 次顺序 Tool 调用及 usage/deadline；第二次结果回流后 ToolSet 收窄为空。不得把原型
+  描述为支持任意 Shell、Skill、MCP 或文件编辑。
 - Model Broker 全局最多同时打开 2 路 provider stream；其它请求只能在最多 4 个 active
   Run 的边界内有界等待，30 秒仍未取得 slot 时以可重试 `model_busy` 失败。
 - Provider 最多 4096 个原始流帧会被合并为最多 128 个 content IPC frame；Broker 的
@@ -74,6 +77,7 @@ Agent Builder 是一个从零构建的、Claude Code 风格的本地智能体运
 ./bootstrap.sh                 # 安装固定版本、仅位于 checkout 内的 Python 工具链
 ./bootstrap.sh --offline       # 只使用 checkout 内已有缓存
 ./start.sh                     # 资格检查后启动整套当前系统
+HARNESS_V2_CONTEXT_REVEAL=1 ./start.sh  # 显式启用独立授权/审计的脱敏诊断正文
 ./start.sh --qualification-sync-count  # 仅独占 RR：低写放大 libc sync-call 插桩
 ./stop.sh                      # 停止受管 Gateway 和所有已验证 Worker
 ./stop.sh --force              # 缩短优雅退出期限，仍执行进程身份校验

@@ -28,6 +28,7 @@ from .contracts import (
 )
 from .replay import (
     LEGACY_PROJECTION_VERSION,
+    MULTI_TOOL_LOOP_FEATURE,
     PROJECTION_VERSION,
     ProjectionSnapshot,
     ReplayCorruptionError,
@@ -2793,6 +2794,7 @@ class ConversationStore:
         model_request_count = 0
         open_model_request: tuple[str, int] | None = None
         last_model_outcome: str | None = None
+        multi_tool_loop = False
 
         while True:
             row = cursor.fetchone()
@@ -2883,6 +2885,11 @@ class ConversationStore:
                     raise ConversationConflictError(
                         "running turn has no canonical start event"
                     )
+                features = payload.get("protocol_features")
+                multi_tool_loop = (
+                    isinstance(features, list)
+                    and MULTI_TOOL_LOOP_FEATURE in features
+                )
             elif kind == "run.started":
                 raise ConversationConflictError(
                     "running turn has more than one canonical start event"
@@ -2916,7 +2923,7 @@ class ConversationStore:
                 if (
                     not isinstance(iteration, int)
                     or isinstance(iteration, bool)
-                    or not 1 <= iteration <= 3
+                    or not 1 <= iteration <= 8
                     or request_id != f"model-{iteration}"
                     or iteration != model_request_count + 1
                     or open_model_request is not None
@@ -2959,11 +2966,16 @@ class ConversationStore:
                 ]
                 if (
                     validated_result_ids != finished_call_ids
-                    or (
-                        iteration == 1
-                        and model_payload["tool_count"] != len(_RECOVERY_TOOL_SPECS)
+                    or model_payload["tool_count"]
+                    != (
+                        len(_RECOVERY_TOOL_SPECS)
+                        if multi_tool_loop and len(finished_call_ids) < 2
+                        else (
+                            len(_RECOVERY_TOOL_SPECS)
+                            if iteration == 1
+                            else 0
+                        )
                     )
-                    or (iteration > 1 and model_payload["tool_count"] != 0)
                 ):
                     raise ConversationConflictError(
                         "running turn has inconsistent model capabilities"

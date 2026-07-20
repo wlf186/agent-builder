@@ -61,6 +61,16 @@ def _current_started_payload() -> dict[str, object]:
     }
 
 
+def _multi_tool_started_payload() -> dict[str, object]:
+    return {
+        **_started_payload(),
+        "protocol_features": [
+            "model-call-boundaries-v1",
+            "sequential-multi-tool-v1",
+        ],
+    }
+
+
 def _model_request(
     iteration: int,
     *,
@@ -652,6 +662,42 @@ def test_projector_rejects_second_tool_call_after_toolset_narrows() -> None:
         )
 
 
+def test_projector_accepts_two_sequential_tools_under_advertised_feature() -> None:
+    request_two = _model_request(2, result_call_ids=["echo-1"])
+    request_two["tool_count"] = 1
+    request_three = _model_request(
+        3, result_call_ids=["echo-1", "echo-2"]
+    )
+    request_three["tool_count"] = 0
+    events = (
+        _event(1, "run.started", _multi_tool_started_payload()),
+        _event(2, "model.request.started", _model_request(1)),
+        _event(3, "model.response.finished", _model_response(1, "tool_use", input_tokens=10, output_tokens=1)),
+        _event(4, "tool.call.requested", {"call_id": "echo-1", "tool_id": "builtin/echo", "arguments": {"text": "first"}}),
+        _event(5, "tool.call.started", {"call_id": "echo-1", "tool_id": "builtin/echo"}),
+        _event(6, "tool.call.finished", {"call_id": "echo-1", "outcome": "succeeded", "result": "first"}),
+        _event(7, "model.request.started", request_two),
+        _event(8, "model.response.finished", _model_response(2, "tool_use", input_tokens=10, output_tokens=1)),
+        _event(9, "tool.call.requested", {"call_id": "echo-2", "tool_id": "builtin/echo", "arguments": {"text": "second"}}),
+        _event(10, "tool.call.started", {"call_id": "echo-2", "tool_id": "builtin/echo"}),
+        _event(11, "tool.call.finished", {"call_id": "echo-2", "outcome": "succeeded", "result": "second"}),
+        _event(12, "model.request.started", request_three),
+        _event(13, "model.response.finished", _model_response(3, "end_turn", input_tokens=10, output_tokens=1)),
+        _event(14, "assistant.block.started", {"block_id": "answer", "block_type": "content"}),
+        _event(15, "assistant.block.finished", {"block_id": "answer", "content": "done"}),
+        _event(16, "run.completed", {"reason": "end_turn", "model_iterations": 3, "usage": {"input_tokens": 30, "output_tokens": 3, "last_input_tokens": 10, "complete": True}}),
+    )
+
+    snapshot, gaps = project_durable_run(events)
+
+    assert gaps == ()
+    assert [item["call_id"] for item in snapshot.document["tools"]] == [
+        "echo-1",
+        "echo-2",
+    ]
+    assert snapshot.document["terminal"]["kind"] == "run.completed"
+
+
 @pytest.mark.parametrize(("with_tool", "iterations"), [(False, 2), (True, 1)])
 def test_projector_rejects_completed_iteration_count_that_disagrees_with_tools(
     with_tool: bool, iterations: int
@@ -928,7 +974,7 @@ def test_snapshot_rejects_second_tool_call_with_recomputed_digest() -> None:
     payload["model_iterations"] = 3
     raw = _snapshot_raw_with_recomputed_digest(forged)
 
-    with pytest.raises(ReplayCorruptionError, match="more than one Tool"):
+    with pytest.raises(ReplayCorruptionError, match="too many Tool"):
         decode_projection_snapshot(
             raw,
             expected_identity=snapshot.identity,

@@ -163,6 +163,9 @@ const CONTEXT_SECTION_FIELDS = Object.freeze([
   "provenance",
   "cache",
   "truncation",
+  "dependency_digest",
+  "budget_tokens",
+  "truncation_reason",
   "estimated_tokens",
   "content_bytes",
   "content_digest",
@@ -1160,6 +1163,7 @@ function validateContextInspection(value, runId, sessionId) {
   if (
     !hasExactFields(value.renderer, [
       "version",
+      "section_registry_version",
       "leading_system_sections_merged",
       "leading_system_section_count",
       "description",
@@ -1175,12 +1179,15 @@ function validateContextInspection(value, runId, sessionId) {
     if (
       !hasExactFields(section, CONTEXT_SECTION_FIELDS) ||
       !["system", "user", "assistant"].includes(section.role) ||
-      ["id", "trust", "provenance", "cache", "truncation"].some((field) => (
+      ["id", "trust", "provenance", "cache", "truncation", "truncation_reason"].some((field) => (
         typeof section[field] !== "string" ||
         section[field].length === 0 || section[field].length > 512
       )) ||
       !isNonNegativeInteger(section.estimated_tokens) ||
+      !isNonNegativeInteger(section.budget_tokens) ||
       !isNonNegativeInteger(section.content_bytes) ||
+      typeof section.dependency_digest !== "string" ||
+      !/^[a-f0-9]{64}$/.test(section.dependency_digest) ||
       typeof section.content_digest !== "string" ||
       !/^[a-f0-9]{64}$/.test(section.content_digest)
     ) {
@@ -1194,6 +1201,8 @@ function validateContextInspection(value, runId, sessionId) {
       plan.section_count !== value.sections.length ||
       typeof value.renderer.version !== "string" ||
       value.renderer.version.length === 0 ||
+      typeof value.renderer.section_registry_version !== "string" ||
+      value.renderer.section_registry_version.length === 0 ||
       typeof value.renderer.leading_system_sections_merged !== "boolean" ||
       !isNonNegativeInteger(value.renderer.leading_system_section_count)
     ) {
@@ -1203,6 +1212,7 @@ function validateContextInspection(value, runId, sessionId) {
     if (
       value.content_exposure !== "unavailable" || value.provider_message_count !== null ||
       value.sections.length !== 0 || value.renderer.version !== null ||
+      value.renderer.section_registry_version !== null ||
       value.renderer.leading_system_sections_merged !== null ||
       value.renderer.leading_system_section_count !== null
     ) {
@@ -1262,11 +1272,20 @@ function renderContextInspection(inspection) {
       const trust = document.createElement("span");
       trust.textContent = `trust: ${section.trust} · provenance: ${section.provenance}`;
       const size = document.createElement("span");
-      size.textContent = `${section.estimated_tokens} tokens · ${section.content_bytes} bytes`;
+      size.textContent = (
+        `${section.estimated_tokens} / ${section.budget_tokens} tokens · ` +
+        `${section.content_bytes} bytes`
+      );
       const policy = document.createElement("span");
-      policy.textContent = `cache: ${section.cache} · truncation: ${section.truncation}`;
+      policy.textContent = (
+        `cache: ${section.cache} · truncation: ${section.truncation} · ` +
+        `reason: ${section.truncation_reason}`
+      );
       const digest = document.createElement("code");
-      digest.textContent = `digest: ${section.content_digest.slice(0, 12)}…`;
+      digest.textContent = (
+        `content: ${section.content_digest.slice(0, 12)}… · ` +
+        `dependency: ${section.dependency_digest.slice(0, 12)}…`
+      );
       item.append(heading, trust, size, policy, digest);
       elements.contextSectionList.append(item);
     });

@@ -1,7 +1,7 @@
 ---
 owner: security-maintainers
 status: maintained
-last_reviewed: 2026-07-19
+last_reviewed: 2026-07-20
 review_cycle: quarterly
 ---
 
@@ -45,7 +45,7 @@ review_cycle: quarterly
 - Uvicorn 单 worker、有界并发/backlog/header、短 keep-alive，并关闭 proxy header
   信任与 server banner。
 - 当前 bootstrap token 代表整个本地项目，登录 session 没有独立用户 principal；所有
-  已认证浏览器都能访问固定 demo Agent 的同一组会话。这是 single-operator 边界，
+  已认证浏览器都能管理 registry 中全部 Agent 及其会话。这是 single-operator 边界，
   不是多用户、租户或会话所有者隔离。
 
 不要通过反向代理公开服务，除非同时补齐 TLS、可信代理模型、正确的 forwarded
@@ -67,12 +67,16 @@ failed、cancelled、interrupted、discarded block、ephemeral delta 和 Tool re
 污染下一轮上下文。当前尚未注入 workspace `CLAUDE.md`。完整 plan、provider messages 和
 隐藏指令正文不得进入 Worker、event、日志或浏览器；`run.started` 只公开 plan ID/digest、
 section/历史计数、窗口策略、估算值和预算元数据。认证的
-`GET /api/runs/<run-id>/context` 也只在 RunRecord 仍驻留时返回重新校验的 section 顺序、
-role/trust/provenance、字节/Token 估算和进程内 keyed inspection digest；只有因 Gateway
+`GET /api/runs/<run-id>/context`（通用 Agent 使用 agent-scoped 等价路径）也只在 RunRecord
+仍驻留时返回重新校验的 section 顺序、role/trust/provenance/dependency、独立 budget、
+truncation reason、字节/Token 估算和进程内 keyed inspection digest；只有因 Gateway
 重启或 retention 而不再驻留的 Run 才只返回已验证 `run.started` 摘要。key 不持久、不返回、
 也不复用登录 token，因而浏览器不能把 digest 当作隐藏 section 的离线猜测 oracle。接口
 拒绝 query parameter、强制 `no-store`，两种路径都不返回正文或 provider messages，也不为
-检查另建 prompt 持久状态。
+检查另建 prompt 持久状态。正文提升默认不存在；显式 operator policy 需要独立 256-bit
+secret、browser session、same-origin、CSRF 和单独 header，并在返回前写有界审计。即使提升，
+platform/Agent/workspace 永远隐藏，其它 section 也只有 2048-byte credential-redacted excerpt；
+secret、prompt 和 excerpt 不进入审计、日志或事件。
 保守 admission 会计入实际 renderer、完整 Tool manifest 和 `256` tokens 的 provider
 template reserve，并在每个新 Turn 和后续 provider 调用对完整投影 transcript 重算。
 超过动态 80% 阈值时只从最旧端移出完整 completed Turn pair，直到不高于 60% 目标或
@@ -88,8 +92,9 @@ Tool result、frame schema、行数、总字节、输出字节、轮数和 timeo
 `ToolSpec` 是模型暴露与执行路径的共同契约，包含稳定 Tool/provider ID、版本、严格输入
 schema、读写/风险/并发属性、timeout 和输入输出字节上限。当前有效集合只能是只读
 `builtin/echo`；Control Plane 会校验 plan 的 toolset digest，拒绝 Worker 伪造或漂移
-后的 Tool 集合。Echo 只在首轮 provider 请求中暴露；一次受信结果回流后 provider
-ToolSet 收窄为空，重复 Tool call 按协议错误拒绝。
+后的 Tool 集合。每个 TurnRuntimeSnapshot 目前最多 2 次顺序 Tool 调用；每次结果必须以
+原 call ID 回流，达到预算后 provider ToolSet 收窄为空。重复、乱序、并行或第三次调用
+按协议错误拒绝。
 
 Broker 全局 semaphore 最多允许 2 路并行 Ollama stream。其它模型请求只能在 Control
 Plane 的最多 4 个 active Run 容量内等待；等待 30 秒仍无 slot 时返回可重试
@@ -138,14 +143,15 @@ namespace、跨进程 inspection/signalling、持久 IPC、memfd、`io_uring`、
   `.runtime/agents/<agent-id>/`。各 Agent 之间不共享这些可写路径。
 - Conversation、Turn、canonical Run events、`run_journal_state`、UI snapshot、operation
   ledger 和 provider usage 位于该 Agent 的私有 `state.sqlite`；
-  conversation/run ID 都按固定 Agent scope 查询。浏览器不能指定另一个 Agent ID。
-- Gateway 的有界 `QueryEngineRegistry` 只为固定 demo Agent 构造 Engine；每个 Engine
+  conversation/run ID 都按选定 Agent scope 查询。run-only prototype alias 固定默认 Agent；
+  通用路径必须显式携带 registry 中 active Agent ID。
+- Gateway 为每个 active Agent generation 独立创建有界 `QueryEngineRegistry`；每个 Engine
   永久绑定一个 conversation ID，并在 stream/cancel 前核对 live RunRecord、在 replay 前
   核对 SQLite Run identity 的 Agent 与 Conversation；把 foreign Run 交给错误 Engine handle
   时按不存在处理。该检查是
   内部 identity consistency，不是用户/租户授权：public run-only API 为 live stream/cancel
   使用 RunRecord、为 replay 使用 durable Run identity 找到所属 Engine；当前所有认证
-  session 本来就共享同一 demo Agent。Engine 不缓存消息、event、ContextPlan、模型连接
+  session 本来就共享 single-operator 管理面。Engine 不缓存消息、event、ContextPlan、模型连接
   或 Worker capability，因此不是第二个状态/
   权限事实源；最多 100 个实例，Conversation 删除后旧 handle fail closed 并立即从
   Registry 驱逐。
@@ -172,9 +178,10 @@ namespace、跨进程 inspection/signalling、持久 IPC、memfd、`io_uring`、
   因此该页只是受信代码资格观测，不是面对已攻陷 Worker 的防篡改审计账本，也不参与任何
   运行时授权或安全决策。正常启动不会创建这项 capability。
 
-通用 Agent create/upgrade/delete 尚未实现。P8 要求未来删除 Agent 时同时停止其全部
-Run、验证无进程引用、删除持久目录/环境/日志并做残留审计；在该流程和负面测试完成
-前，不得声称支持安全删除任意 Agent。
+通用 Agent lifecycle 已实现持久 provisioning/active/upgrading/deleting 状态、generation
+staging/promotion、runtime admission fence/drain、进程引用证明、data/runtime/env 删除和
+恢复收敛。逐一 staging/rename/commit 故障注入、完整资产清单、双架构与 SSD workload
+资格仍未关闭，因此只能称为 walking skeleton，不能称为 production 安全删除。
 
 ## 持久化与 SSD 磨损控制
 
@@ -250,7 +257,7 @@ Run、验证无进程引用、删除持久目录/环境/日志并做残留审计
 ## 已知未完成项
 
 - HTTP 没有 TLS，未建立可信 reverse-proxy 模型；
-- 只有固定 demo Agent，没有通用 Capsule provisioning、upgrade、delete；
+- 通用 Capsule lifecycle 已贯通，但逐一崩溃点、双架构、soak/SSD 资格尚未关闭；
 - 没有任意 Skill/Shell/MCP/File capability broker 或独立 Skill sandbox；
 - 已有可跨 Gateway 重启恢复的 durable Conversation/Turn transcript、受限 Run replay/
   UI snapshot，以及 live record 缺失时明确 gap/snapshot 的 SSE durable fallback；但没有

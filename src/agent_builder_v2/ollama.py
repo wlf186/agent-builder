@@ -45,7 +45,7 @@ MAX_NDJSON_LINE_BYTES = 64 * 1024
 MAX_STREAM_BYTES = 512 * 1024
 MAX_STREAM_FRAMES = 4_096
 MAX_OUTPUT_BYTES = 12_288
-MAX_MODEL_TURNS = 3
+MAX_MODEL_TURNS = 8
 MAX_CONCURRENT_MODEL_STREAMS = 2
 MODEL_QUEUE_TIMEOUT_SECONDS = 30.0
 RUNTIME_CONTEXT_TOKEN_CAP = 32_768
@@ -462,12 +462,20 @@ class OllamaBroker:
             )
         return value
 
-    def new_run(self, context_plan: ContextPlan) -> OllamaRunSession:
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> OllamaRunSession:
         if self._qualification is None:
             raise OllamaBrokerError(
                 "model_broker_not_ready", "The model broker is not qualified."
             )
-        return OllamaRunSession(self, context_plan)
+        if (
+            not isinstance(max_tool_calls, int)
+            or isinstance(max_tool_calls, bool)
+            or not 1 <= max_tool_calls <= 8
+        ):
+            raise ValueError("invalid model Tool-call budget")
+        return OllamaRunSession(self, context_plan, max_tool_calls=max_tool_calls)
 
     async def close(self) -> None:
         self._closed = True
@@ -490,7 +498,13 @@ class OllamaBroker:
 class OllamaRunSession:
     """Conversation state that is never shared between Runs."""
 
-    def __init__(self, broker: OllamaBroker, context_plan: ContextPlan) -> None:
+    def __init__(
+        self,
+        broker: OllamaBroker,
+        context_plan: ContextPlan,
+        *,
+        max_tool_calls: int,
+    ) -> None:
         qualification = broker.qualification
         catalog = broker._tool_catalog
         if not isinstance(context_plan, ContextPlan):
@@ -530,6 +544,7 @@ class OllamaRunSession:
         self._turns = 0
         self._in_flight = False
         self._stopped = False
+        self._max_tool_calls = max_tool_calls
 
     @property
     def messages(self) -> tuple[dict[str, Any], ...]:
@@ -611,8 +626,12 @@ class OllamaRunSession:
             )
 
         profile = self._context_plan.model_profile
+        # The immutable Tool set stays available until this Run's frozen call
+        # budget is consumed; then the provider capability is narrowed to zero.
         available_tools = (
-            self._context_plan.tools if self._user_message is None else ()
+            self._context_plan.tools
+            if len(validated_results) < self._max_tool_calls
+            else ()
         )
         try:
             runtime_input_tokens = estimate_provider_input_tokens(

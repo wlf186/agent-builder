@@ -51,6 +51,13 @@ def test_golden_path_streams_tools_and_completes_in_order() -> None:
         "assistant.block.started",
         "assistant.block.delta",
         "assistant.block.delta",
+        "assistant.block.finished",
+        "tool.call.requested",
+        "tool.call.started",
+        "tool.call.finished",
+        "assistant.block.started",
+        "assistant.block.delta",
+        "assistant.block.delta",
         "assistant.block.delta",
         "assistant.block.finished",
         "run.completed",
@@ -62,19 +69,26 @@ def test_golden_path_streams_tools_and_completes_in_order() -> None:
         for event in events
     )
 
-    requested = next(
+    requested_events = [
         event for event in events if event.kind == "tool.call.requested"
-    )
-    started = next(event for event in events if event.kind == "tool.call.started")
-    finished = next(event for event in events if event.kind == "tool.call.finished")
-    assert requested.payload == {
-        "call_id": "prototype-echo-call",
+    ]
+    started_events = [event for event in events if event.kind == "tool.call.started"]
+    finished_events = [event for event in events if event.kind == "tool.call.finished"]
+    assert requested_events[0].payload == {
+        "call_id": "prototype-echo-call-1",
         "tool_id": "builtin/echo",
         "arguments": {"text": "hello harness"},
     }
-    assert started.payload["call_id"] == requested.payload["call_id"]
-    assert finished.payload == {
-        "call_id": "prototype-echo-call",
+    assert requested_events[1].payload == {
+        "call_id": "prototype-echo-call-2",
+        "tool_id": "builtin/echo",
+        "arguments": {"text": "hello harness"},
+    }
+    assert [item.payload["call_id"] for item in started_events] == [
+        item.payload["call_id"] for item in requested_events
+    ]
+    assert finished_events[-1].payload == {
+        "call_id": "prototype-echo-call-2",
         "tool_id": "builtin/echo",
         "outcome": "succeeded",
         "result": "hello harness",
@@ -85,7 +99,10 @@ def test_golden_path_streams_tools_and_completes_in_order() -> None:
         if event.kind == "assistant.block.finished"
     ][-1]
     assert "hello harness" in str(final_block.payload["content"])
-    assert events[-1].payload == {"reason": "end_turn", "model_iterations": 2}
+    assert events[-1].payload == {
+        "reason": "end_turn",
+        "model_iterations": 3,
+    }
     assert kernel.state.open_blocks == {}
     assert kernel.state.pending_tools == set()
     assert kernel.state.terminal_kind == "run.completed"

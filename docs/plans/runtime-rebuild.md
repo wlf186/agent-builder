@@ -316,10 +316,10 @@ ready”的声明。
 | 1 | QE-01 | baseline | Conversation-scoped 逻辑 QueryEngine | — | done |
 | 2 | QUA-01 | P0/parallel | clean-root、多架构、SSD 与 lifecycle 资格 | — | in_progress |
 | 3 | REC-01 | P0 | durable replay、gap、snapshot 与副作用恢复协议 | — | done |
-| 4 | AGT-01 | P0 | 通用 Agent Capsule create/upgrade/delete | REC-01 | not_started |
-| 5 | LOOP-01 | P0 | 有界多步 model → Tool → model loop substrate | REC-01, AGT-01 | in_progress |
-| 6 | CTX-01 | P0/parallel | Prompt section registry | — | not_started |
-| 7 | CTX-02 | P0/parallel | authenticated context inspection | CTX-01 | in_progress |
+| 4 | AGT-01 | P0 | 通用 Agent Capsule create/upgrade/delete | REC-01 | done |
+| 5 | LOOP-01 | P0 | 有界多步 model → Tool → model loop substrate | REC-01, AGT-01 | done |
+| 6 | CTX-01 | P0/parallel | Prompt section registry | — | done |
+| 7 | CTX-02 | P0/parallel | authenticated context inspection | CTX-01 | done |
 | 8 | CTX-03 | P0 | workspace CLAUDE.md | CTX-01, AGT-01 | not_started |
 | 9 | CTX-04 | P0 | bounded Git/date/environment context | CTX-01, AGT-01 | not_started |
 | 10 | TOOL-01 | P0 | Tool contract v2 与 EffectiveToolSet | LOOP-01, AGT-01 | not_started |
@@ -351,7 +351,7 @@ work item 状态。
 | --- | --- | --- |
 | GATE-01 clean-root | in_progress | QUA-01 全部完成；双架构 cold checkout、真实 Run、完整停止、containment、soak 和磁盘基线有证据 |
 | GATE-02 recovery | done | REC-01 完成；所有支持的崩溃点恢复到最后 durable boundary，客户端能区分 replay/gap/live |
-| GATE-03 Agent lifecycle | not_started | AGT-01 完成；create/upgrade/delete 可恢复、可回滚、无跨 Agent 影响或残留 |
+| GATE-03 Agent lifecycle | done | AGT-01 完成；create/upgrade/delete 可恢复、可回滚、无跨 Agent 影响或残留 |
 | GATE-04 capability/read | not_started | LOOP-01、TOOL-01、PERM-01、CMP-01、READ-01、SEARCH-01 完成，Worker 权限未扩大 |
 | GATE-05 context | not_started | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01 完成；projection 可复现、summary 可恢复且 canonical transcript 不变 |
 | GATE-06 tasks/sub-agents | not_started | TASK-01、SUB-01 和纳入范围的执行能力完成；取消/崩溃/重启/删除无 orphan |
@@ -439,69 +439,88 @@ Authority：[event protocol](../design/event-protocol.md)和[架构](../design/a
 
 Authority：[Agent Capsule design](../design/agent-capsule.md)。
 
-- [ ] 持久 Agent registry 和 generation/version 状态机支持 create/list/get/upgrade/delete。
-- [ ] provisioning 仅使用 checkout-local、allowlisted、binary-only 依赖和 Agent 专属环境。
-- [ ] upgrade 使用 staging、资格检查、原子 promotion 和 rollback；旧 generation capability 失效。
-- [ ] delete 实现 draining → process proof → data/runtime/env cleanup → residual audit。
-- [ ] create/upgrade/delete 在每个 staging、rename、registry commit 崩溃点可幂等收敛。
-- [ ] 删除清理 Engine、Conversation、approval、Task、queue、env/cache/log/WAL/SHM/lock
+- [x] 持久 Agent registry 和 generation/version 状态机支持 create/list/get/upgrade/delete。
+- [x] provisioning 仅使用 checkout-local、allowlisted、binary-only 依赖和 Agent 专属环境。
+- [x] upgrade 使用 staging、资格检查、原子 promotion 和 rollback；旧 generation capability 失效。
+- [x] delete 实现 draining → process proof → data/runtime/env cleanup → residual audit。
+- [x] create/upgrade/delete 在每个 staging、rename、registry commit 崩溃点可幂等收敛。
+- [x] 删除清理 Engine、Conversation、approval、Task、queue、env/cache/log/WAL/SHM/lock
   等完整资产清单，且其它 Agent 的目录、进程和 journal 不变。
 
-证据：_待补。_
+证据：`agents.py`、`agent_runtime.py` 与 `capsule.py` 已贯通持久 registry、按 generation
+惰性 runtime、共享有界 Broker、Agent-scoped session/Run/context API、drain/upgrade/delete；
+`tests/test_agents.py`、`tests/test_agent_runtime.py` 和 Capsule/lifecycle tests 覆盖 provisioning、
+promotion、旧 generation retire、active commit、runtime-tree delete 中断恢复，旧 generation
+失效、跨 Agent 不变、live cwd 引用与 residual fail-closed。2026-07-20 真实模型 smoke 在新
+Agent 完成 3 次 provider 调用/2 次 Tool 调用，升级至 generation 2 后恢复原会话，删除返回
+204 且 data/runtime root 均不存在。独立 lifecycle 写入样本：create 的 data/runtime 分配量
+为 16,384/73,728 bytes，upgrade 后为 16,384/81,920 bytes，delete 后两 root 均不存在；
+没有逐 token/chunk 写入或 delete VACUUM。不存在的 approval/Task/queue 资产为零，当前完整
+资产由 Capsule roots、registry row 和惰性 runtime map 覆盖。正式跨平台/长期 SSD 资格仍由
+QUA-01 追踪。
 
 ### LOOP-01 — 有界多步 Agent loop substrate
 
 Authority：[架构](../design/architecture.md)和[event protocol](../design/event-protocol.md)。
 
-- [ ] 每次 submit 固化不可变 TurnRuntimeSnapshot：Agent generation、model profile、当前
+- [x] 每次 submit 固化不可变 TurnRuntimeSnapshot：Agent generation、model profile、当前
   canonical tool manifest/digest、ContextPlan、max turns/tool calls、usage budget 和 deadline。
-- [ ] 将当前 one-shot 路径提炼为通用、有界、顺序执行的多步状态机；动态 EffectiveToolSet
+- [x] 将当前 one-shot 路径提炼为通用、有界、顺序执行的多步状态机；动态 EffectiveToolSet
   与 permission wait 由 TOOL-01/PERM-01 在此 substrate 上启用，不反向成为本项依赖。
-- [ ] 多 Tool call 保持 call/result identity；基础 loop 一律顺序执行，未来只有经
+- [x] 多 Tool call 保持 call/result identity；基础 loop 一律顺序执行，未来只有经
   TOOL-01 明确声明 concurrency-safe 的工具才可并行。
-- [ ] 每次 provider call 都重新做完整 transcript admission，并校验 usage 和 terminal。
-- [ ] model、现有 bounded Tool、cancel、deadline 和 provider failure 均收敛到唯一终态。
-- [ ] 真实模型完成至少两次 Tool 决策再回答；没有第二套 graph、loop 或隐藏持久状态。
+- [x] 每次 provider call 都重新做完整 transcript admission，并校验 usage 和 terminal。
+- [x] model、现有 bounded Tool、cancel、deadline 和 provider failure 均收敛到唯一终态。
+- [x] 真实模型完成至少两次 Tool 决策再回答；没有第二套 graph、loop 或隐藏持久状态。
 
-阶段证据：当前固定 Echo loop 已为每次真实 provider call 增加 exact-request observer、连续
-iteration、runtime admission 估算及严格配对的 request/response durable boundary；错误、
-取消、Gateway recovery 和 replay tamper 负面测试已覆盖。通用 TurnRuntimeSnapshot、动态
-EffectiveToolSet、多 Tool 顺序执行和真实两次 Tool 决策仍未完成，因此本项保持
-`in_progress`。
+证据：`runtime.py`/`contracts.py` 固化 snapshot 与数值预算；`kernel.py`、`ollama.py`、
+`control.py` 和 `replay.py` 以 `sequential-multi-tool-v1` 实现并验证两次顺序 call/result、
+预算耗尽后 ToolSet 收窄、逐调用 admission/usage 与旧协议兼容回放。单元/集成覆盖见
+`tests/test_runtime.py`、`test_kernel.py`、`test_ollama.py`、`test_worker_integration.py`、
+`test_replay.py` 和 Control failure/cancel tests。2026-07-20 在 20815 的真实
+`qwen3.5:2b` smoke 对默认 Agent 和新建 Agent 均得到 3 次 provider request、2 次唯一
+Tool call 和单一 `run.completed`；全量测试与治理结果见本轮验证记录。
 
 ### CTX-01 — Prompt section registry
 
 Authority：[架构](../design/architecture.md)和[安全边界](../../SECURITY.md)。
 
-- [ ] 建立稳定有序的 Prompt section provider registry，记录 trust、provenance、依赖
+- [x] 建立稳定有序的 Prompt section provider registry，记录 trust、provenance、依赖
   digest、独立 budget、cache scope、truncation 和 renderer version。
-- [ ] 平台安全 contract 永不可被 browser、Agent、workspace 或 Worker replace。
-- [ ] 受信平台/Agent/Tool contract 位于动态 workspace/session/Git/history section 之前；
+- [x] 平台安全 contract 永不可被 browser、Agent、workspace 或 Worker replace。
+- [x] 受信平台/Agent/Tool contract 位于动态 workspace/session/Git/history section 之前；
   受信 instruction 保持独立 role/section，绝不伪装成 synthetic user content。
-- [ ] 相同 source/history/profile/generation/policy 产生字节一致的 plan 和 digest；
+- [x] 相同 source/history/profile/generation/policy 产生字节一致的 plan 和 digest；
   单一依赖变化只失效相关 section。
-- [ ] section cache 仅为有界内存优化；当前 Ollama 不支持的 cache API 不用伪 marker 模拟。
+- [x] section cache 仅为有界内存优化；当前 Ollama 不支持的 cache API 不用伪 marker 模拟。
 
-证据：_待补。_
+证据：`PromptSectionRegistry` 以 sealed platform/Agent providers 和稳定顺序装配
+conversation window/history/user section，记录 dependency digest、独立 budget、cache scope、
+truncation reason、renderer/registry version；cache 固定最多 32 项。确定性、单依赖失效、
+顺序、角色和不可替换平台 contract 由 `tests/test_context.py` 覆盖；Web exact inspection 与
+真实 provider request 使用同一不可变 ContextPlan。
 
 ### CTX-02 — Authenticated context inspection
 
 Authority：[架构](../design/architecture.md)、[安全边界](../../SECURITY.md)和
 [event protocol](../design/event-protocol.md)。
 
-- [ ] 提供 typed、authenticated context inspect，展示 section identity/source/digest、
+- [x] 提供 typed、authenticated context inspect，展示 section identity/source/digest、
   bytes/token estimate、history projection、budget 和 truncation reason。
-- [ ] 默认不回显正文、secret、hidden prompt 或可用于重建它们的高精度片段；诊断提升
+- [x] 默认不回显正文、secret、hidden prompt 或可用于重建它们的高精度片段；诊断提升
   必须走独立受信 operator policy、审计和有界 redaction。
-- [ ] inspect projection 与 `run.started` metadata 和实际 provider request digest 可对账，
+- [x] inspect projection 与 `run.started` metadata 和实际 provider request digest 可对账，
   但浏览器不能提交或覆盖任何 provider-bound section。
-- [ ] active Run、历史 Run、restart、deleted Agent 和 foreign Conversation 的授权、404/
+- [x] active Run、历史 Run、restart、deleted Agent 和 foreign Conversation 的授权、404/
   redaction 语义有负面测试，查询与响应大小有硬上限。
 
-阶段证据：已提供认证、`no-store`、默认正文隐藏的 `/api/runs/<run-id>/context` 和按需 Web
-dialog；驻留 Run 返回现场重验的精确 section 元数据，重启/retention 后只返回严格 replay
-验证的 summary，正文提升 query 被拒绝。独立 operator 提升策略/审计、通用 Agent 授权和
-CTX-01 registry 收敛仍未完成，因此本项保持 `in_progress`。
+证据：prototype alias 与 Agent-scoped inspect 都要求认证、`no-store`、拒绝 query 正文提升；
+驻留 Run 返回现场重验的 exact typed 元数据，重启/retention 后只返回严格 replay summary。
+提升默认 404，显式 policy 另需 same-origin、CSRF 和独立 256-bit operator token；受信 section
+永久 withheld，其它 excerpt 每 section 最大 2048 bytes 并做 credential redaction，审计先于
+响应且最多 4096 行。负向测试见 `tests/test_web.py`、`test_context.py`、
+`test_context_audit.py`。2026-07-20 真实 20815 验证 exact registry version、脱敏、审计绑定；
+恢复默认启动后 reveal 为 404。
 
 ### CTX-03 — Workspace CLAUDE.md
 

@@ -8,7 +8,7 @@ from threading import Event
 from typing import Iterator
 
 from .context import ContextPlanReference, ModelContext
-from .contracts import TERMINAL_KINDS, WorkerEvent
+from .contracts import LoopLimits, TERMINAL_KINDS, WorkerEvent
 from .model import FakeStreamingModel, ModelBlock, ModelToolResult, StreamingModel
 from .tools import ToolRegistry, prototype_tools, toolset_digest
 
@@ -18,7 +18,10 @@ class RunState:
     phase: str = "accepted"
     model_iterations: int = 0
     open_blocks: dict[str, list[str]] = field(default_factory=dict)
+    seen_blocks: set[str] = field(default_factory=set)
     pending_tools: set[str] = field(default_factory=set)
+    seen_call_ids: set[str] = field(default_factory=set)
+    tool_calls: int = 0
     tool_results: list[ModelToolResult] = field(default_factory=list)
     terminal_kind: str | None = None
 
@@ -43,10 +46,15 @@ class HarnessKernel:
         model: StreamingModel | None = None,
         tools: ToolRegistry | None = None,
         cancellation: CancellationToken | None = None,
+        loop_limits: LoopLimits | None = None,
     ) -> None:
         self.model = model or FakeStreamingModel()
         self.tools = tools or prototype_tools()
         self.cancellation = cancellation or CancellationToken()
+        self.loop_limits = loop_limits or LoopLimits(
+            max_model_iterations=4,
+            max_tool_calls=2,
+        )
         self.state = RunState()
 
     def _event(
@@ -82,8 +90,9 @@ class HarnessKernel:
         payload = block.payload
         if block.kind == "text.start":
             block_id = str(payload["block_id"])
-            if block_id in self.state.open_blocks:
+            if block_id in self.state.seen_blocks:
                 raise RuntimeError("duplicate content block")
+            self.state.seen_blocks.add(block_id)
             self.state.open_blocks[block_id] = []
             yield self._event(
                 "assistant.block.started",
@@ -113,8 +122,12 @@ class HarnessKernel:
             arguments = payload.get("arguments")
             if not isinstance(arguments, dict):
                 raise RuntimeError("tool arguments must be an object")
-            if call_id in self.state.pending_tools:
+            if call_id in self.state.seen_call_ids:
                 raise RuntimeError("duplicate tool call")
+            if self.state.tool_calls >= self.loop_limits.max_tool_calls:
+                raise RuntimeError("tool call budget exhausted")
+            self.state.seen_call_ids.add(call_id)
+            self.state.tool_calls += 1
             self.state.pending_tools.add(call_id)
             yield self._event(
                 "tool.call.requested",
@@ -178,7 +191,7 @@ class HarnessKernel:
                 context_reference or self._local_context_reference(user_message),
                 user_message,
             )
-            while self.state.model_iterations < 3:
+            while self.state.model_iterations < self.loop_limits.max_model_iterations:
                 if self.cancellation.is_cancelled():
                     yield from self._cancel_events()
                     return

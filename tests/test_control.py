@@ -18,7 +18,12 @@ import pytest
 import agent_builder_v2.control as control_module
 from agent_builder_v2.capsule import AgentCapsule, PROTOTYPE_AGENT_ID
 from agent_builder_v2.context import ContextCompiler, ModelProfile
-from agent_builder_v2.contracts import TERMINAL_KINDS, EventEnvelope, StartRunCommand
+from agent_builder_v2.contracts import (
+    LoopLimits,
+    TERMINAL_KINDS,
+    EventEnvelope,
+    StartRunCommand,
+)
 from agent_builder_v2.control import (
     MAX_ACTIVE_RUNS,
     MAX_DURABLE_BYTES_PER_RUN,
@@ -34,6 +39,7 @@ from agent_builder_v2.control import (
     _marker_from_proc_stat,
 )
 from agent_builder_v2.ollama import OllamaBrokerError, OllamaQualification
+from agent_builder_v2.runtime import TurnRuntimeSnapshot
 from agent_builder_v2.sessions import (
     ConversationNotFoundError,
     ConversationStore,
@@ -111,7 +117,10 @@ class _FailingDelegatingJournal:
 
 
 class _UnusedModelBroker:
-    def new_run(self, _context_plan: object) -> object:
+    def new_run(
+        self, _context_plan: object, *, max_tool_calls: int = 2
+    ) -> object:
+        del max_tool_calls
         return object()
 
     async def close(self) -> None:
@@ -126,11 +135,17 @@ def _record(run_id: str = "1" * 32) -> RunRecord:
         agent_id=PROTOTYPE_AGENT_ID,
         capsule_generation=1,
     )
+    runtime_snapshot = TurnRuntimeSnapshot.create(
+        context_plan=context_plan,
+        loop_limits=LoopLimits(max_model_iterations=4, max_tool_calls=2),
+        wall_timeout_seconds=60,
+    )
     return RunRecord(
         agent_id=PROTOTYPE_AGENT_ID,
         conversation_id="2" * 32,
         turn_id="3" * 32,
         run_id=run_id,
+        runtime_snapshot=runtime_snapshot,
         context_plan=context_plan,
         effective_tools=prototype_tool_specs(),
     )

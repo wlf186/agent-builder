@@ -36,7 +36,7 @@ class StreamingModel(Protocol):
 
 
 class FakeStreamingModel:
-    """Deterministically requests one tool, then consumes its result."""
+    """Deterministically requests two sequential Tools, then answers."""
 
     def stream(
         self,
@@ -44,10 +44,14 @@ class FakeStreamingModel:
         tool_results: tuple[ModelToolResult, ...],
         is_cancelled: Callable[[], bool],
     ) -> Iterator[ModelBlock]:
-        if not tool_results:
-            block_id = "analysis-summary"
+        if len(tool_results) < 2:
+            call_number = len(tool_results) + 1
+            block_id = f"analysis-summary-{call_number}"
             yield ModelBlock("text.start", {"block_id": block_id})
-            for fragment in ("已装配上下文。", "现在调用结构化 Echo 工具。"):
+            for fragment in (
+                "已装配上下文。",
+                f"现在执行第 {call_number} 次结构化 Echo 调用。",
+            ):
                 if is_cancelled():
                     return
                 sleep(0.03)
@@ -58,9 +62,15 @@ class FakeStreamingModel:
             yield ModelBlock(
                 "tool.use",
                 {
-                    "call_id": "prototype-echo-call",
+                    "call_id": f"prototype-echo-call-{call_number}",
                     "tool_id": "builtin/echo",
-                    "arguments": {"text": context.user_message.strip()},
+                    "arguments": {
+                        "text": (
+                            context.user_message.strip()
+                            if not tool_results
+                            else tool_results[-1].content
+                        )
+                    },
                 },
             )
             return
@@ -70,7 +80,7 @@ class FakeStreamingModel:
         fragments = (
             "工具结果已按原调用 ID 回流：",
             tool_results[-1].content,
-            "。这条响应来自同一个 HarnessKernel 的第二次模型迭代。",
+            "。这条响应来自同一个 HarnessKernel 的第三次模型迭代。",
         )
         for fragment in fragments:
             if is_cancelled():

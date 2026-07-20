@@ -11,7 +11,7 @@ import sys
 from typing import Any
 
 from .context import ContextPlanError, ContextPlanReference
-from .contracts import MAX_MESSAGE_BYTES
+from .contracts import LoopLimits, MAX_MESSAGE_BYTES
 from .kernel import CancellationToken, HarnessKernel
 from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES, BrokeredStreamingModel
 from .sandbox import (
@@ -111,7 +111,11 @@ def _read_command() -> dict[str, Any]:
     if len(raw) > MAX_COMMAND_BYTES:
         raise ValueError("command is too large")
     value = json.loads(raw)
-    if not isinstance(value, dict) or set(value) != {"message", "context_plan"}:
+    if not isinstance(value, dict) or set(value) != {
+        "message",
+        "context_plan",
+        "loop_limits",
+    }:
         raise ValueError("command must be an object")
     message = value.get("message")
     if (
@@ -126,6 +130,10 @@ def _read_command() -> dict[str, Any]:
     except ContextPlanError as exc:
         raise ValueError("invalid context plan reference") from exc
     value["context_plan"] = context_reference
+    try:
+        value["loop_limits"] = LoopLimits.from_dict(value.get("loop_limits"))
+    except ValueError as exc:
+        raise ValueError("invalid loop limits") from exc
     return value
 
 
@@ -159,7 +167,11 @@ def main() -> int:
         return 2
 
     model = BrokeredStreamingModel(sys.stdin.buffer, sys.stdout.buffer)
-    kernel = HarnessKernel(model=model, cancellation=cancellation)
+    kernel = HarnessKernel(
+        model=model,
+        cancellation=cancellation,
+        loop_limits=command["loop_limits"],
+    )
     for event in kernel.run(command["message"], command["context_plan"]):
         _write_json(event.to_dict())
     return 0

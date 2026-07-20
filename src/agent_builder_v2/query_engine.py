@@ -24,6 +24,7 @@ from .context import (
     ContextPlan,
     ContextPlanError,
     ContextPlanInspection,
+    PromptSectionReveal,
 )
 from .contracts import EventEnvelope, RESOURCE_ID, StartRunCommand
 from .control import RunRecord
@@ -140,6 +141,22 @@ class QueryContextInspection:
             "identity": self.identity.to_dict(),
             "availability": self.availability,
             **payload,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class QueryContextReveal:
+    """Bounded redacted excerpts after independent operator authorization."""
+
+    identity: QueryRunHandle
+    sections: tuple[PromptSectionReveal, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "identity": self.identity.to_dict(),
+            "availability": "exact",
+            "content_exposure": "redacted_excerpt",
+            "sections": [section.to_dict() for section in self.sections],
         }
 
 
@@ -936,6 +953,28 @@ class QueryEngineRegistry:
             raise QueryContextUnavailableError(
                 "retained Run durable identity is unavailable"
             ) from exc
+
+    async def reveal_retained_context(self, run_id: str) -> QueryContextReveal:
+        """Return bounded excerpts; authentication and audit remain Web-owned."""
+
+        exact = await self.inspect_retained_context(run_id)
+        engine = await self._for_run(run_id, distinguish_not_retained=True)
+        record = engine._owned_record(run_id, distinguish_not_retained=True)
+        plan = record.context_plan
+        if (
+            not isinstance(plan, ContextPlan)
+            or engine._handle(record) != exact.identity
+        ):
+            raise QueryContextUnavailableError(
+                "retained Run context is unavailable"
+            )
+        try:
+            sections = plan.operator_redacted_reveal()
+        except ContextPlanError as exc:
+            raise QueryContextUnavailableError(
+                "retained Run context is unavailable"
+            ) from exc
+        return QueryContextReveal(exact.identity, sections)
 
     async def resolve_run_identity(self, run_id: str) -> QueryRunHandle:
         """Resolve a durable Run without requiring a retained live record."""

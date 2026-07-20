@@ -44,7 +44,7 @@ class _FakeModelSession:
                     iteration=iteration,
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
-                    tool_count=len(self.context_plan.tools) if iteration == 1 else 0,
+                    tool_count=len(self.context_plan.tools),
                     estimated_input_tokens=(
                         self.context_plan.estimated_input_tokens
                         + (123 if iteration == 2 else 0)
@@ -105,7 +105,10 @@ class _FakeModelBroker:
     async def start(self) -> OllamaQualification:
         return self.qualification
 
-    def new_run(self, context_plan: ContextPlan) -> _FakeModelSession:
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _FakeModelSession:
+        assert max_tool_calls == 2
         assert context_plan.model_profile == self.qualification.model_profile
         self.plans.append(context_plan)
         return _FakeModelSession(context_plan)
@@ -144,7 +147,10 @@ class _BusyModelSession:
 
 
 class _BusyModelBroker(_FakeModelBroker):
-    def new_run(self, context_plan: ContextPlan) -> _BusyModelSession:
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _BusyModelSession:
+        assert max_tool_calls == 2
         assert context_plan.model_profile == self.qualification.model_profile
         return _BusyModelSession(context_plan)
 
@@ -185,7 +191,10 @@ class _CancellableModelBroker(_FakeModelBroker):
         super().__init__()
         self.entered = asyncio.Event()
 
-    def new_run(self, context_plan: ContextPlan) -> _CancellableModelSession:
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _CancellableModelSession:
+        assert max_tool_calls == 2
         assert context_plan.model_profile == self.qualification.model_profile
         return _CancellableModelSession(context_plan, self.entered)
 
@@ -266,7 +275,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             assert model_events[2].payload["tool_result_call_ids"] == [
                 "real-broker-call"
             ]
-            assert model_events[2].payload["tool_count"] == 0
+            assert model_events[2].payload["tool_count"] == 1
             assert model_events[3].payload["outcome"] == "end_turn"
             assert record.process is None
             assert not (

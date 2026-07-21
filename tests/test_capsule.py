@@ -1,4 +1,4 @@
-"""Containment checks for the prototype Agent Capsule paths."""
+"""Containment checks for Agent Capsule paths."""
 
 from __future__ import annotations
 

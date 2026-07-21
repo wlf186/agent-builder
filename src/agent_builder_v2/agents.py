@@ -11,11 +11,18 @@ import threading
 from typing import Protocol
 from uuid import uuid4
 
-from .capsule import AgentCapsule, CapsuleManager, PROTOTYPE_AGENT_ID, SAFE_ID
+from .capsule import (
+    AgentCapsule,
+    CapsuleManager,
+    PROTOTYPE_AGENT_ID,
+    SAFE_ID,
+    SYSTEM_AGENT_DISPLAY_NAME,
+)
 
 
 MAX_AGENTS = 100
 _STATES = frozenset({"provisioning", "active", "upgrading", "deleting"})
+_LEGACY_SYSTEM_AGENT_DISPLAY_NAME = "Harness V2 Prototype Agent"
 
 
 def _now() -> str:
@@ -148,7 +155,7 @@ class AgentRegistry:
                     "INSERT INTO agents VALUES (?,?,?,?,?,?,?)",
                     (
                         PROTOTYPE_AGENT_ID,
-                        "Harness V2 Prototype Agent",
+                        SYSTEM_AGENT_DISPLAY_NAME,
                         1,
                         None,
                         "provisioning",
@@ -158,7 +165,36 @@ class AgentRegistry:
                 )
                 self._connection.commit()
                 prototype = self._get_locked(PROTOTYPE_AGENT_ID)
-            self._recover_locked(prototype)
+            recovered = self._recover_locked(prototype)
+            if recovered is None:
+                timestamp = _now()
+                self._connection.execute(
+                    "INSERT INTO agents VALUES (?,?,?,?,?,?,?)",
+                    (
+                        PROTOTYPE_AGENT_ID,
+                        SYSTEM_AGENT_DISPLAY_NAME,
+                        1,
+                        None,
+                        "provisioning",
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                self._connection.commit()
+                recovered = self._recover_locked(
+                    self._get_locked(PROTOTYPE_AGENT_ID)
+                )
+                assert recovered is not None
+            if recovered.display_name == _LEGACY_SYSTEM_AGENT_DISPLAY_NAME:
+                prototype = self._set_state_locked(
+                    recovered.agent_id,
+                    state="upgrading",
+                    generation=recovered.generation,
+                    target_generation=recovered.generation + 1,
+                    display_name=SYSTEM_AGENT_DISPLAY_NAME,
+                )
+                migrated = self._recover_locked(prototype)
+                assert migrated is not None
             for record in self.list():
                 if record.agent_id != PROTOTYPE_AGENT_ID and record.state != "active":
                     self._recover_locked(record)

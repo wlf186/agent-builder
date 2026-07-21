@@ -15,7 +15,10 @@ from fastapi.testclient import TestClient
 
 from agent_builder_v2.auth import SessionService
 from agent_builder_v2.agents import AgentRegistry
-from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
+from agent_builder_v2.capsule import (
+    PROTOTYPE_AGENT_ID,
+    SYSTEM_AGENT_DISPLAY_NAME,
+)
 from agent_builder_v2.commands import CommandBus
 from agent_builder_v2.context import ContextCompiler, ContextPlan, ModelProfile
 from agent_builder_v2.context_audit import ContextRevealPolicy
@@ -29,6 +32,7 @@ from agent_builder_v2.replay import (
     RunIdentity,
     project_durable_run,
 )
+from agent_builder_v2.research import ResearchEnvironmentRecord
 from agent_builder_v2.web import (
     CSRF_COOKIE,
     MAX_JSON_BODY_BYTES,
@@ -178,6 +182,7 @@ class _LifecycleManager:
     def __init__(self) -> None:
         self.draining: set[str] = set()
         self.runtimes: dict[str, object] = {}
+        self.research_environments: dict[str, ResearchEnvironmentRecord] = {}
         catalog = default_model_catalog()
         profile = _context_plan("catalog").model_profile
         qualification = SimpleNamespace(
@@ -217,6 +222,33 @@ class _LifecycleManager:
 
     async def end_drain(self, agent_id: str) -> None:
         self.draining.discard(agent_id)
+
+    async def research_environment_status(
+        self, agent_id: str
+    ) -> ResearchEnvironmentRecord | None:
+        if agent_id not in self.runtimes:
+            raise KeyError("Agent not found")
+        return self.research_environments.get(agent_id)
+
+    async def install_research_environment(
+        self, agent_id: str
+    ) -> ResearchEnvironmentRecord:
+        if agent_id not in self.runtimes:
+            raise KeyError("Agent not found")
+        record = ResearchEnvironmentRecord(
+            "research-documents",
+            "1",
+            ("pypdf==6.14.2", "python-docx==1.2.0"),
+            "a" * 64,
+            "2026-07-21T00:00:00.000Z",
+        )
+        self.research_environments[agent_id] = record
+        return record
+
+    async def delete_research_environment(self, agent_id: str) -> None:
+        if agent_id not in self.runtimes:
+            raise KeyError("Agent not found")
+        self.research_environments.pop(agent_id, None)
 
 
 class _RunService:
@@ -698,6 +730,38 @@ def test_skill_install_and_delete_are_authenticated_and_csrf_bound(
     assert client.get(f"/api/agents/{agent}/skills").json()["skills"] == []
 
 
+def test_research_environment_is_agent_scoped_authenticated_and_csrf_bound(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    endpoint = f"/api/agents/{PROTOTYPE_AGENT_ID}/research-environment"
+    assert client.get(endpoint).status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+    assert client.get(endpoint).json() == {
+        "agent_id": PROTOTYPE_AGENT_ID,
+        "installed": False,
+        "environment": None,
+    }
+    assert client.post(endpoint, json={}, headers=SAME_ORIGIN).status_code == 403
+    installed = client.post(endpoint, json={}, headers=mutation)
+    assert installed.status_code == 200
+    assert installed.json()["installed"] is True
+    assert installed.json()["environment"]["reuse_scope"] == (
+        "agent-generation-across-conversations"
+    )
+    assert "endpoint" not in installed.text
+    assert client.get(endpoint).json()["installed"] is True
+    assert client.delete(endpoint, headers=mutation).status_code == 204
+    assert client.get(endpoint).json()["installed"] is False
+    assert client.get(
+        f"/api/agents/{'f' * 32}/research-environment"
+    ).status_code == 404
+
+
 def test_timeline_exposes_complete_events_as_inert_text(
     web_client: tuple[TestClient, _Commands],
 ) -> None:
@@ -997,6 +1061,10 @@ def test_authenticated_agent_lifecycle_api_is_csrf_protected_and_isolated(
         )
         csrf = login.json()["csrf_token"]
         mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+        listed = client.get("/api/agents")
+        assert listed.status_code == 200
+        assert listed.json()["agents"][0]["agent_id"] == PROTOTYPE_AGENT_ID
+        assert listed.json()["agents"][0]["display_name"] == SYSTEM_AGENT_DISPLAY_NAME
         assert client.post(
             "/api/agents", json={"display_name": "No CSRF"}, headers=SAME_ORIGIN
         ).status_code == 403
@@ -1016,9 +1084,11 @@ def test_authenticated_agent_lifecycle_api_is_csrf_protected_and_isolated(
         )
         assert upgraded.status_code == 200
         assert upgraded.json()["generation"] == 2
-        assert client.delete(
+        protected = client.delete(
             f"/api/agents/{PROTOTYPE_AGENT_ID}", headers=mutation
-        ).status_code == 409
+        )
+        assert protected.status_code == 409
+        assert protected.json()["detail"] == "the system Agent cannot be deleted"
         assert client.delete(f"/api/agents/{agent_id}", headers=mutation).status_code == 204
         assert client.get(f"/api/agents/{agent_id}").status_code == 404
     finally:

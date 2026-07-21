@@ -7,11 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .agents import AgentRegistry
+from .capsule import CapsuleManager
 from .commands import CommandBus
 from .control import RunService
 from .extensions import ExtensionCatalog
 from .ollama import OllamaBroker, OllamaQualification
 from .query_engine import QueryEngineRegistry
+from .research import (
+    ResearchEnvironmentManager,
+    ResearchEnvironmentRecord,
+)
 from .subagents import SubagentCoordinator
 
 
@@ -46,6 +51,7 @@ class AgentRuntimeManager:
         self.repository_root = repository_root.resolve(strict=True)
         self.source_root = source_root.resolve(strict=True)
         self.registry = registry
+        self.capsules = CapsuleManager(self.repository_root)
         self.model_broker = model_broker or OllamaBroker()
         self.extension_catalog = extension_catalog or ExtensionCatalog.empty()
         self._runtimes: dict[str, AgentRuntime] = {}
@@ -129,6 +135,8 @@ class AgentRuntimeManager:
         async with self._lock:
             if self._closing:
                 raise RuntimeError("Agent runtime manager is closing")
+            if agent_id in self._draining:
+                raise RuntimeError("Agent runtime is already draining")
             self._draining.add(agent_id)
             runtime = self._runtimes.pop(agent_id, None)
         if runtime is not None:
@@ -141,6 +149,88 @@ class AgentRuntimeManager:
 
         async with self._lock:
             self._draining.discard(agent_id)
+
+    async def research_environment_status(
+        self, agent_id: str
+    ) -> ResearchEnvironmentRecord | None:
+        """Read one Agent generation's curated environment without activating it."""
+
+        async with self._lock:
+            if self._closing:
+                raise RuntimeError("Agent runtime manager is closing")
+            if agent_id in self._draining:
+                raise RuntimeError("Agent runtime is draining")
+            runtime = self._runtimes.get(agent_id)
+            environment = (
+                runtime.run_service.research_environment
+                if runtime is not None
+                else None
+            )
+        if environment is not None:
+            return await asyncio.to_thread(environment.status)
+        record = await asyncio.to_thread(self.registry.get, agent_id)
+        if record.state != "active":
+            raise RuntimeError("Agent is not active")
+        capsule = await asyncio.to_thread(self.capsules.load_agent, agent_id)
+        if capsule.generation != record.generation:
+            raise RuntimeError("Agent generation changed during inspection")
+        manager = ResearchEnvironmentManager(self.repository_root, capsule)
+        return await asyncio.to_thread(manager.status)
+
+    async def install_research_environment(
+        self, agent_id: str
+    ) -> ResearchEnvironmentRecord:
+        existing = await self.research_environment_status(agent_id)
+        if existing is not None:
+            return existing
+        result = await self._mutate_research_environment(agent_id, install=True)
+        assert result is not None
+        return result
+
+    async def delete_research_environment(self, agent_id: str) -> None:
+        if await self.research_environment_status(agent_id) is None:
+            return
+        await self._mutate_research_environment(agent_id, install=False)
+
+    async def _mutate_research_environment(
+        self, agent_id: str, *, install: bool
+    ) -> ResearchEnvironmentRecord | None:
+        """Fence one generation so package publication cannot race a Run."""
+
+        async with self._lock:
+            if self._closing:
+                raise RuntimeError("Agent runtime manager is closing")
+            if agent_id in self._draining:
+                raise RuntimeError("Agent runtime is draining")
+            runtime = self._runtimes.get(agent_id)
+            if runtime is not None and any(
+                record.terminal_kind is None
+                for record in runtime.run_service.runs.values()
+            ):
+                raise RuntimeError(
+                    "research environment cannot change while a Run is active"
+                )
+            self._draining.add(agent_id)
+            runtime = self._runtimes.pop(agent_id, None)
+        try:
+            if runtime is not None:
+                await self.subagents.cancel_agent(agent_id)
+                await runtime.query_engines.close()
+                await runtime.run_service.close()
+            record = await asyncio.to_thread(self.registry.get, agent_id)
+            if record.state != "active":
+                raise RuntimeError("Agent is not active")
+            capsule = await asyncio.to_thread(self.capsules.load_agent, agent_id)
+            if capsule.generation != record.generation:
+                raise RuntimeError("Agent generation changed during environment change")
+            manager = ResearchEnvironmentManager(self.repository_root, capsule)
+            if install:
+                return await asyncio.to_thread(manager.install)
+            await asyncio.to_thread(manager.delete)
+            return None
+        finally:
+            async with self._lock:
+                self._draining.discard(agent_id)
 
     async def close(self) -> None:
         async with self._lock:

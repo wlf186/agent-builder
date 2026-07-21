@@ -80,6 +80,18 @@ def _safe_system_executable(path: Path) -> os.stat_result:
     return metadata
 
 
+def _safe_read_directory(path: Path) -> tuple[int, int, int, int]:
+    metadata = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or path.resolve(strict=True) != path
+    ):
+        raise CommandExecutionError("allowlisted environment directory is unsafe")
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_uid
+
+
 def _file_digest(path: Path, maximum: int) -> str:
     descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -252,7 +264,8 @@ class PreparedCommandExecutor:
         bash_path: Path,
         bash_identity: tuple[int, int, int, str],
         python_home: Path,
-        module_path: Path,
+        module_paths: tuple[Path, ...],
+        environment_root: Path,
     ) -> None:
         self._capsule = capsule
         self._source_root = source_root
@@ -263,7 +276,9 @@ class PreparedCommandExecutor:
         self._bash_path = bash_path
         self._bash_identity = bash_identity
         self._python_home = python_home
-        self._module_path = module_path
+        self._module_paths = module_paths
+        self._environment_root = environment_root
+        self._environment_identity = _safe_read_directory(environment_root)
         runner_id = str(prepared["runner_id"])
         self.identity_digest = _digest(
             b"agent-builder-command-executor-instance-v1",
@@ -359,6 +374,8 @@ class PreparedCommandExecutor:
             or current_executable_identity != self._executable_identity
         ):
             raise CommandExecutionError("allowlisted executable identity changed")
+        if _safe_read_directory(self._environment_root) != self._environment_identity:
+            raise CommandExecutionError("allowlisted environment identity changed")
         if list(_empty_output_identity(self._run_root / "output")) != prepared.get(
             "output_identity"
         ):
@@ -442,7 +459,7 @@ class PreparedCommandExecutor:
                 "PYTHONHASHSEED": "0",
                 "PYTHONNOUSERSITE": "1",
                 "PYTHONHOME": str(self._python_home),
-                "PYTHONPATH": str(self._module_path),
+                "PYTHONPATH": os.pathsep.join(str(path) for path in self._module_paths),
                 "AGENT_BUILDER_RUNNER_ID": runner_id,
                 "AGENT_BUILDER_RUNNER_SOURCE": str(self._source_root),
                 "AGENT_BUILDER_RUNNER_OUTPUT": str(self._run_root / "output"),
@@ -452,6 +469,7 @@ class PreparedCommandExecutor:
                 "AGENT_BUILDER_RUNNER_RELEASE_FD": str(release_read),
                 "AGENT_BUILDER_RUNNER_PARENT_PID": str(os.getpid()),
                 "AGENT_BUILDER_RUNNER_MODE": str(command_id),
+                "AGENT_BUILDER_RUNNER_ENVIRONMENT": str(self._environment_root),
             }
             pass_descriptors = [ready_write, release_read, executable_fd]
             if command_id == BOUNDED_BASH_ID:
@@ -794,7 +812,8 @@ class CommandExecutor:
                 self._bash_path,
                 self._bash_identity,
                 self._executable_path.parent.parent,
-                self._source_root.parent,
+                (self._source_root.parent,),
+                self._executable_path.parent.parent,
             ),
         )
 
@@ -808,12 +827,19 @@ class CommandExecutor:
         interpreter: Path,
         input_value: dict[str, object],
         run_root: Path,
+        package_namespace: str = "skills",
+        environment_id: str | None = None,
     ) -> tuple[dict[str, object], str, PreparedCommandExecutor]:
+        if package_namespace not in {"skills", "dependencies"}:
+            raise CommandExecutionError("package namespace is not allowlisted")
+        environment_id = skill_id if environment_id is None else environment_id
+        if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", environment_id) is None:
+            raise CommandExecutionError("package environment identity is invalid")
         source_root = package_root.resolve(strict=True)
         try:
-            source_root.relative_to(self._capsule.data_root / "skills")
+            source_root.relative_to(self._capsule.data_root / package_namespace)
         except ValueError as exc:
-            raise CommandExecutionError("Skill package escaped its Capsule") from exc
+            raise CommandExecutionError("package escaped its Capsule") from exc
         if not (source_root / "main.py").is_file():
             raise CommandExecutionError("Skill entrypoint is missing")
         input_json = _canonical(input_value)
@@ -826,13 +852,14 @@ class CommandExecutor:
         output_identity = _empty_output_identity(run_root / "output")
         catalog_digest = _digest(
             b"agent-builder-skill-executor-catalog-v1",
-            f"{skill_id}\0{skill_version}\0{package_digest}\0{RUNNER_POLICY}".encode(),
+            f"{package_namespace}\0{environment_id}\0{skill_id}\0{skill_version}\0{package_digest}\0{RUNNER_POLICY}".encode(),
         )
         executable_path = interpreter.resolve(strict=True)
+        environment_root = self._capsule.runtime_root / package_namespace / environment_id
         try:
-            executable_path.relative_to(self._capsule.runtime_root / "skills" / skill_id)
+            executable_path.relative_to(environment_root)
         except ValueError as exc:
-            raise CommandExecutionError("Skill interpreter escaped its environment") from exc
+            raise CommandExecutionError("package interpreter escaped its environment") from exc
         executable_metadata = _safe_regular(executable_path, executable=True)
         executable_identity = (
             executable_metadata.st_dev,
@@ -848,6 +875,15 @@ class CommandExecutor:
             self._capsule.generation,
             self._capsule.display_name,
         )
+        site_packages = tuple(
+            path
+            for path in sorted((environment_root / "lib").glob("python*/site-packages"))
+            if path.is_dir() and path.resolve(strict=True).is_relative_to(
+                environment_root.resolve(strict=True)
+            )
+        )
+        if len(site_packages) != 1:
+            raise CommandExecutionError("package site-packages identity is invalid")
         prepared = {
             "schema_version": 1,
             "command_id": SKILL_RUN_ID,
@@ -893,7 +929,8 @@ class CommandExecutor:
                 self._bash_path,
                 self._bash_identity,
                 self._executable_path.parent.parent,
-                self._source_root.parent,
+                (self._source_root.parent, site_packages[0]),
+                environment_root,
             ),
         )
 

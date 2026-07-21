@@ -43,6 +43,11 @@ from .file_search import FileSearchExecutor
 from .file_write import FileMutationExecutor, FileWriteError, FullReadReceipt
 from .extensions import ExtensionCatalog, ExtensionError, ExtensionExecutor
 from .command_exec import CommandExecutionError, CommandExecutor
+from .research import (
+    ResearchDocumentExecutor,
+    ResearchEnvironmentError,
+    ResearchEnvironmentManager,
+)
 from .permissions import (
     CapabilityBroker,
     CapabilityPolicy,
@@ -527,7 +532,7 @@ class RunService:
         self.subagent_coordinator = subagent_coordinator
         self.tool_catalog = runtime_tool_catalog()
         self.tool_policy = runtime_tool_policy()
-        unavailable_optional = {"skill/run"}
+        unavailable_optional = {"skill/run", "document/extract_text"}
         if not self.extension_catalog.public_metadata():
             unavailable_optional.add("extension/call")
         if unavailable_optional:
@@ -554,7 +559,13 @@ class RunService:
         self.effective_tools = self.effective_toolset.specs
         self.capability_policy = CapabilityPolicy(
             revision="capability-policy-v4",
-            allow=("file/glob", "file/grep", "file/read_text", "file/stat"),
+            allow=(
+                "document/extract_text",
+                "file/glob",
+                "file/grep",
+                "file/read_text",
+                "file/stat",
+            ),
             ask=(
                 "agent/delegate", "exec/run", "extension/call", "file/edit", "file/write", "skill/run"
             ),
@@ -565,6 +576,8 @@ class RunService:
         self.file_search_executor: FileSearchExecutor | None = None
         self.file_mutation_executor: FileMutationExecutor | None = None
         self.command_executor: CommandExecutor | None = None
+        self.research_environment: ResearchEnvironmentManager | None = None
+        self.research_executor: ResearchDocumentExecutor | None = None
         self.extension_executor: ExtensionExecutor | None = None
         self.task_store: TaskStore | None = None
         self.task_manager: BackgroundTaskManager | None = None
@@ -609,9 +622,14 @@ class RunService:
                 if self.model_qualification is None:
                     raise RuntimeError("shared model broker is not initialized")
             if self.agent_id == PROTOTYPE_AGENT_ID:
-                self.capsule = await asyncio.to_thread(
-                    self.capsules.ensure_prototype_agent
-                )
+                try:
+                    self.capsule = await asyncio.to_thread(
+                        self.capsules.load_agent, self.agent_id
+                    )
+                except FileNotFoundError:
+                    self.capsule = await asyncio.to_thread(
+                        self.capsules.ensure_prototype_agent
+                    )
             else:
                 self.capsule = await asyncio.to_thread(
                     self.capsules.load_agent, self.agent_id
@@ -639,6 +657,12 @@ class RunService:
             self.command_executor = CommandExecutor(
                 self.repository_root, self.source_root, self.capsule
             )
+            self.research_environment = ResearchEnvironmentManager(
+                self.repository_root, self.capsule
+            )
+            self.research_executor = ResearchDocumentExecutor(
+                self.research_environment, self.command_executor
+            )
             # External endpoints are operator construction, never request data.
             # The default release catalog is intentionally empty/fail-closed.
             self.extension_executor = ExtensionExecutor(self.extension_catalog)
@@ -650,8 +674,7 @@ class RunService:
             self.skill_executor = SkillExecutor(
                 self.skill_registry, self.command_executor
             )
-            if self.skill_registry.list():
-                self._set_skill_tool_available(True)
+            self._refresh_optional_tools()
             self.task_store = TaskStore(
                 self.capsule.data_root / "state.sqlite", self.capsule.agent_id
             )
@@ -689,6 +712,8 @@ class RunService:
             self.file_search_executor = None
             self.file_mutation_executor = None
             self.command_executor = None
+            self.research_environment = None
+            self.research_executor = None
             self.extension_executor = None
             if self.skill_registry is not None:
                 self.skill_registry.close()
@@ -746,6 +771,8 @@ class RunService:
         self.file_search_executor = None
         self.file_mutation_executor = None
         self.command_executor = None
+        self.research_environment = None
+        self.research_executor = None
         self.extension_executor = None
         self.model_qualification = None
         self.sandbox_qualification = None
@@ -757,12 +784,17 @@ class RunService:
             raise RuntimeError("conversation store is unavailable")
         return self.conversations
 
-    def _set_skill_tool_available(self, available: bool) -> None:
+    def _refresh_optional_tools(self) -> None:
         catalog = runtime_tool_catalog()
         policy = runtime_tool_policy()
         excluded = set()
-        if not available:
+        if self.skill_registry is None or not self.skill_registry.list():
             excluded.add("skill/run")
+        if (
+            self.research_environment is None
+            or self.research_environment.status() is None
+        ):
+            excluded.add("document/extract_text")
         if not self.extension_catalog.public_metadata():
             excluded.add("extension/call")
         self.tool_catalog = type(catalog).create(
@@ -792,14 +824,14 @@ class RunService:
         record = await asyncio.to_thread(
             self.skill_registry.install, raw, expected_digest
         )
-        self._set_skill_tool_available(True)
+        self._refresh_optional_tools()
         return record
 
     async def delete_skill(self, skill_id: str) -> None:
         if self._closing or self.skill_registry is None:
             raise RuntimeError("Skill registry is unavailable")
         await asyncio.to_thread(self.skill_registry.delete, skill_id)
-        self._set_skill_tool_available(bool(self.skill_registry.list()))
+        self._refresh_optional_tools()
 
     async def create_conversation(self, title: str = "新会话") -> Conversation:
         if self._closing:
@@ -2309,6 +2341,7 @@ class RunService:
             or tool_id not in {
                 "file/stat", "file/read_text", "file/glob", "file/grep",
                 "file/edit", "file/write", "exec/run", "extension/call", "skill/run",
+                "document/extract_text",
                 "agent/delegate",
             }
             or spec is None
@@ -2423,6 +2456,30 @@ class RunService:
                     tool_id=tool_id,
                     outcome="failed",
                     content="Skill preparation failed closed.",
+                )
+                return
+        elif tool_id == "document/extract_text":
+            if self.research_executor is None:
+                raise RuntimeError("research document executor is unavailable")
+            try:
+                capability_arguments, capability_preview, executor = (
+                    self.research_executor.prepare(
+                        validated,
+                        self.capsule.runtime_root / "runs" / record.run_id,
+                    )
+                )
+            except ResearchEnvironmentError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "Document extraction preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="Document extraction preparation failed closed.",
                 )
                 return
         elif tool_id == "agent/delegate":

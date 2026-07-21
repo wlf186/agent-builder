@@ -183,12 +183,26 @@ label,
   gap: 1rem;
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.agent-panel,
 .session-panel {
   min-width: 0;
   padding: 0;
   overflow: clip;
 }
 
+.agent-drawer-summary,
 .session-drawer-summary {
   display: grid;
   grid-template-columns: minmax(12rem, 1fr) minmax(7rem, auto) auto;
@@ -200,10 +214,12 @@ label,
   list-style: none;
 }
 
+.agent-drawer-summary::-webkit-details-marker,
 .session-drawer-summary::-webkit-details-marker {
   display: none;
 }
 
+.agent-drawer-summary::after,
 .session-drawer-summary::after {
   content: "▾";
   color: var(--muted);
@@ -211,6 +227,7 @@ label,
   transition: transform 140ms ease;
 }
 
+.agent-drawer[open] .agent-drawer-summary::after,
 .session-drawer[open] .session-drawer-summary::after {
   transform: rotate(180deg);
 }
@@ -324,21 +341,25 @@ label,
   justify-content: flex-end;
 }
 
+.agent-drawer-summary:focus-visible,
 .session-drawer-summary:focus-visible {
   outline: 0.14rem solid var(--accent);
   outline-offset: -0.2rem;
 }
 
+.agent-current,
 .session-current {
   display: grid;
   min-width: 0;
   gap: 0.1rem;
 }
 
+.agent-current .section-label,
 .session-current .section-label {
   margin: 0;
 }
 
+.agent-current strong,
 .session-current strong {
   overflow: hidden;
   font-size: 0.92rem;
@@ -346,32 +367,39 @@ label,
   white-space: nowrap;
 }
 
+.agent-drawer-hint,
 .session-drawer-hint {
   color: var(--muted);
   font-size: 0.72rem;
   white-space: nowrap;
 }
 
+.agent-drawer-body,
 .session-drawer-body {
   padding: 1rem;
   border-top: 1px solid var(--line);
   background: rgba(8, 11, 9, 0.42);
 }
 
+.agent-heading,
 .session-heading {
   align-items: flex-start;
 }
 
+.agent-heading h2,
 .session-heading h2 {
   margin-bottom: 0;
 }
 
+.agent-list-status,
+.agent-empty,
 .session-list-status,
 .session-empty {
   margin: 0.75rem 0;
   font-size: 0.8rem;
 }
 
+.agent-list,
 .session-list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr));
@@ -381,6 +409,135 @@ label,
   padding: 0;
   overflow: auto;
   list-style: none;
+}
+
+.agent-create-form {
+  display: grid;
+  grid-template-columns: minmax(12rem, 20rem) auto;
+  gap: 0.55rem;
+}
+
+.agent-list {
+  max-height: 18rem;
+}
+
+.agent-item {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: #0e110f;
+}
+
+.agent-item.active {
+  border-color: rgba(184, 242, 74, 0.7);
+  box-shadow: inset 0.2rem 0 var(--accent);
+}
+
+.agent-item-heading,
+.agent-item-actions,
+.agent-badges {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.agent-item-heading {
+  justify-content: space-between;
+  min-width: 0;
+}
+
+.agent-item-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-badge {
+  padding: 0.14rem 0.35rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.62rem;
+  white-space: nowrap;
+}
+
+.agent-badge.system {
+  color: var(--accent);
+  border-color: rgba(184, 242, 74, 0.45);
+}
+
+.agent-meta {
+  display: grid;
+  gap: 0.2rem;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.68rem;
+}
+
+.agent-item-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+.agent-item-actions button {
+  padding: 0.4rem 0.55rem;
+  font-size: 0.7rem;
+}
+
+.agent-boundary-note {
+  margin: 0.8rem 0 0;
+  font-size: 0.75rem;
+}
+
+.research-environment {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.9rem;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.65rem;
+  background: color-mix(in srgb, var(--panel) 94%, var(--accent) 6%);
+}
+
+.research-environment-heading,
+.research-environment-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+
+.research-environment-heading h3,
+.research-environment-copy,
+.research-environment-packages {
+  margin: 0;
+}
+
+.research-environment-heading h3 {
+  font-size: 0.92rem;
+}
+
+.research-environment-copy,
+.research-environment-packages {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.research-environment-packages {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.research-environment-actions {
+  justify-content: flex-end;
+}
+
+.research-environment-actions button {
+  padding: 0.42rem 0.6rem;
+  font-size: 0.72rem;
 }
 
 .session-item {
@@ -434,11 +591,6 @@ label,
   align-self: center;
   padding: 0.4rem 0.5rem;
   font-size: 0.68rem;
-}
-
-.agent-id {
-  display: block;
-  margin-top: 1rem;
 }
 
 .replay-grid {
@@ -1504,20 +1656,26 @@ code {
     padding: 1rem;
   }
 
+  .agent-panel,
   .session-panel {
     padding: 0;
   }
 
+  .agent-drawer-summary,
   .session-drawer-summary {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 0.55rem;
   }
 
+  .agent-drawer-summary #agent-id,
+  .agent-drawer-hint,
   .session-drawer-summary #session-id,
   .session-drawer-hint {
     display: none;
   }
 
+  .agent-create-form,
+  .agent-list,
   .session-list {
     grid-template-columns: 1fr;
     max-height: 20rem;

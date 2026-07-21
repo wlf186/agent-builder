@@ -47,6 +47,7 @@ from .query_engine import (
     QueryRunNotRetainedError,
 )
 from .replay import DurableReplay, MAX_REPLAY_PAGE, MAX_REPLAY_SEQUENCE
+from .research import ResearchEnvironmentError
 from .sessions import (
     Conversation,
     ConversationConflictError,
@@ -406,6 +407,14 @@ async def _runtime_for_agent(request: Request, agent_id: str) -> AgentRuntime:
         raise HTTPException(409, "Agent runtime is unavailable") from exc
 
 
+async def _bind_system_runtime(request: Request) -> None:
+    manager: AgentRuntimeManager = request.app.state.runtime_manager
+    runtime = await manager.for_agent(PROTOTYPE_AGENT_ID)
+    request.app.state.run_service = runtime.run_service
+    request.app.state.query_engines = runtime.query_engines
+    request.app.state.commands = runtime.commands
+
+
 def _replay_query_integer(
     request: Request,
     name: str,
@@ -642,7 +651,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             agent_registry.close()
 
     app = FastAPI(
-        title="Harness V2 Prototype",
+        title="Agent Builder Harness",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -708,7 +717,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         return {
             "status": "ok",
             "release": "0.2.0",
-            # Compatibility marker for the pinned default Agent, not the
+            # Compatibility marker for the pinned system Agent, not the
             # support status of the whole release.
             "prototype": True,
             "agent_ready": ready,
@@ -874,11 +883,13 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         ):
             raise HTTPException(400, "invalid Agent upgrade body")
         if agent_id == PROTOTYPE_AGENT_ID:
-            raise HTTPException(409, "the prototype Agent cannot be upgraded")
+            raise HTTPException(409, "the system Agent cannot be upgraded")
         registry: AgentRegistry = request.app.state.agent_registry
         manager: AgentRuntimeManager = request.app.state.runtime_manager
+        draining = False
         try:
             await manager.begin_drain(agent_id)
+            draining = True
             record = await asyncio.to_thread(
                 registry.upgrade,
                 agent_id,
@@ -891,25 +902,108 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
         finally:
-            await manager.end_drain(agent_id)
+            if draining:
+                await manager.end_drain(agent_id)
         return record.to_dict()
 
     @app.delete("/api/agents/{agent_id}", status_code=204)
     async def delete_agent(agent_id: str, request: Request) -> Response:
         _require_csrf(request)
         if agent_id == PROTOTYPE_AGENT_ID:
-            raise HTTPException(409, "the prototype Agent cannot be deleted")
+            raise HTTPException(409, "the system Agent cannot be deleted")
         registry: AgentRegistry = request.app.state.agent_registry
         manager: AgentRuntimeManager = request.app.state.runtime_manager
+        draining = False
         try:
             await manager.begin_drain(agent_id)
+            draining = True
             await asyncio.to_thread(registry.delete, agent_id)
         except KeyError as exc:
             raise HTTPException(404, "Agent not found") from exc
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
         finally:
-            await manager.end_drain(agent_id)
+            if draining:
+                await manager.end_drain(agent_id)
+        return Response(status_code=204)
+
+    @app.get("/api/agents/{agent_id}/research-environment")
+    async def get_agent_research_environment(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if SAFE_ID.fullmatch(agent_id) is None:
+            raise HTTPException(404, "Agent not found")
+        if request.query_params:
+            raise HTTPException(400, "unsupported research environment query parameter")
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        try:
+            record = await manager.research_environment_status(agent_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except (RuntimeError, ResearchEnvironmentError) as exc:
+            raise HTTPException(409, "research environment is unavailable") from exc
+        return {
+            "agent_id": agent_id,
+            "installed": record is not None,
+            "environment": record.public_metadata() if record is not None else None,
+        }
+
+    @app.post("/api/agents/{agent_id}/research-environment")
+    async def install_agent_research_environment(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if SAFE_ID.fullmatch(agent_id) is None:
+            raise HTTPException(404, "Agent not found")
+        body = await _read_json_object(request)
+        if body:
+            raise HTTPException(400, "research environment body must be empty")
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        try:
+            try:
+                record = await manager.install_research_environment(agent_id)
+            finally:
+                if agent_id == PROTOTYPE_AGENT_ID:
+                    await _bind_system_runtime(request)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except (RuntimeError, ResearchEnvironmentError) as exc:
+            detail = (
+                str(exc)
+                if str(exc) == "research environment cannot change while a Run is active"
+                else "research environment installation failed closed"
+            )
+            raise HTTPException(409, detail) from exc
+        return {
+            "agent_id": agent_id,
+            "installed": True,
+            "environment": record.public_metadata(),
+        }
+
+    @app.delete("/api/agents/{agent_id}/research-environment", status_code=204)
+    async def delete_agent_research_environment(
+        agent_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if SAFE_ID.fullmatch(agent_id) is None:
+            raise HTTPException(404, "Agent not found")
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        try:
+            try:
+                await manager.delete_research_environment(agent_id)
+            finally:
+                if agent_id == PROTOTYPE_AGENT_ID:
+                    await _bind_system_runtime(request)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except (RuntimeError, ResearchEnvironmentError) as exc:
+            detail = (
+                str(exc)
+                if str(exc) == "research environment cannot change while a Run is active"
+                else "research environment deletion failed closed"
+            )
+            raise HTTPException(409, detail) from exc
         return Response(status_code=204)
 
     @app.get("/api/agents/{agent_id}/permissions")

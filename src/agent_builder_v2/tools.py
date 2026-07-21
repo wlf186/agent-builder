@@ -974,6 +974,48 @@ SKILL_RUN_SPEC = ToolSpec(
     max_provider_projection_bytes=8_192,
 )
 
+
+DOCUMENT_EXTRACT_TEXT_SPEC = ToolSpec(
+    tool_id="document/extract_text",
+    provider_name="document_extract_text",
+    contract_version="3",
+    description=(
+        "Extract one bounded UTF-8 text window from a PDF, DOCX, Markdown, "
+        "HTML, or text file in this Agent's workspace. The parser runs "
+        "without network access in the Agent's isolated research environment."
+    ),
+    input_fields=(
+        ToolInputField("path", "string", maximum_utf8_bytes=1_024),
+        ToolInputField(
+            "offset_chars",
+            "integer",
+            required=False,
+            minimum_integer=0,
+            maximum_integer=1_000_000,
+        ),
+        ToolInputField(
+            "max_chars",
+            "integer",
+            required=False,
+            minimum_integer=1,
+            maximum_integer=4_096,
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=True,
+    destructive=False,
+    concurrency="serialized",
+    risk="read_only",
+    timeout_seconds=15,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="document/extract_text",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
 AGENT_DELEGATE_SPEC = ToolSpec(
     tool_id="agent/delegate",
     provider_name="agent_delegate",
@@ -1026,6 +1068,7 @@ def runtime_tool_catalog() -> ToolCatalog:
         (
             PROTOTYPE_ECHO_SPEC,
             AGENT_DELEGATE_SPEC,
+            DOCUMENT_EXTRACT_TEXT_SPEC,
             EXEC_RUN_SPEC,
             EXTENSION_CALL_SPEC,
             SKILL_RUN_SPEC,
@@ -1043,7 +1086,7 @@ def runtime_tool_policy() -> ToolPolicy:
     return ToolPolicy(
         revision="runtime-execution-policy-v1",
         allowed_tool_ids=(
-            "agent/delegate", "builtin/echo", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
+            "agent/delegate", "builtin/echo", "document/extract_text", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
             "file/read_text", "file/stat", "file/write", "skill/run"
         ),
         allowed_risks=("execution", "mutation", "read_only"),
@@ -1250,6 +1293,7 @@ __all__ = [
     "FILE_GREP_SPEC",
     "FILE_EDIT_SPEC",
     "FILE_WRITE_SPEC",
+    "DOCUMENT_EXTRACT_TEXT_SPEC",
     "EXEC_RUN_SPEC",
     "EXEC_RUN_SPEC_V1",
     "EXTENSION_CALL_SPEC",

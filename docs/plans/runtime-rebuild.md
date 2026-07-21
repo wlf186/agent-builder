@@ -1246,7 +1246,7 @@ Authority：[README](../../README.md)、[安全边界](../../SECURITY.md)、
   才关闭 GATE-07 并以冻结的 single-operator 本地支持合同替换早期阶段免责声明。
 
 证据：首发 scope 已冻结在 [release contract](../design/release.md)：`0.2.0` 只支持
-GNU/Linux x86_64、受信防火墙网络和 single operator；任意 Shell/package/stdio MCP、默认
+GNU/Linux x86_64、受信防火墙网络和 single operator；任意 Shell/请求可控 package/stdio MCP、默认
 extension、RAG、TLS/可信反代、多用户/HA、`aarch64` 与长期 soak 均明确 deferred。
 `backup.sh`/`restore.sh` 只操作 checkout 内私有 `data/`、`backups/`、staging/recovery；6 个
 专项测试覆盖 private round-trip、旧 data 保留、source symlink/hardlink、archive traversal、
@@ -1271,6 +1271,24 @@ CycloneDX 1.4 SBOM。checkout-local source archive 为 571967 bytes，SHA-256
 分别在 workload 前被 argparse 拒绝，失败目录已移入 checkout-local quarantine；新增 EXIT
 恢复保证后 Gateway 均保持健康，未把失败记录伪装为 PASS。GATE-01 至 GATE-06 已先关闭，
 本项通过后 GATE-07 和全部 28 项同步关闭。
+
+### Follow-on record — Agent-scoped research environment
+
+这不是冻结路线的第 29 项，也不改变上方 28 项的完成口径。2026-07-21 在已关闭 gate 上追加
+固定 `research-documents` capability：认证 Agent-scoped API/管理抽屉负责显式安装与删除；
+Control Plane 以 checkout-local uv、精确版本、binary-only/no-deps 原子发布 Agent 私有
+dependency source/venv，相同 identity 跨 Conversation 幂等复用。只有环境完整有效时，
+`document/extract_text` 才进入未来 Turn ToolSet；PDF/DOCX/HTML/Markdown/text 使用
+descriptor-anchored snapshot 和现有 singleton Landlock/seccomp runner，运行期无网络、
+无 fork/exec、无 workspace/跨 Agent 直接访问，Run staging 在终态删除。
+
+验收证据：全量 `562 passed`；governance 扫描 13 个 Markdown、11 个 shell、132 个文本文件
+通过；`pip-audit==2.10.1` 对实际 research site-packages 报告 0 known vulnerability。20815
+实机首次安装固定 `lxml/pypdf/python-docx/typing-extensions` 后重复 POST 保持相同
+`installed_at`；真实 `python-docx` 文件在 sandbox 中成功提取且 staging residual 为 0。临时
+第二 Agent 默认未安装，删除后 data/runtime residual 均为 0，同时系统 Agent 环境保持有效。
+当前系统 Agent bundle metadata 16 KiB、可重建 venv 81 MiB；安装按 Agent 显式发生，不按
+Conversation/Run 重建，也没有逐 token/chunk 写盘。
 
 ### 强制负面测试矩阵
 

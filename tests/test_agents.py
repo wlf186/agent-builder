@@ -10,7 +10,10 @@ import sys
 import pytest
 
 from agent_builder_v2.agents import AgentRegistry
-from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
+from agent_builder_v2.capsule import (
+    PROTOTYPE_AGENT_ID,
+    SYSTEM_AGENT_DISPLAY_NAME,
+)
 
 
 class _Hooks:
@@ -38,6 +41,48 @@ def _tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
+def test_legacy_prototype_identity_migrates_to_the_system_agent_generation(
+    tmp_path: Path,
+) -> None:
+    legacy_name = "Harness V2 Prototype Agent"
+    registry = AgentRegistry(tmp_path)
+    registry.capsules.ensure_agent(
+        PROTOTYPE_AGENT_ID,
+        display_name=legacy_name,
+        generation=1,
+    )
+    registry._connection.execute(
+        "INSERT INTO agents VALUES (?,?,?,?,?,?,?)",
+        (
+            PROTOTYPE_AGENT_ID,
+            legacy_name,
+            1,
+            None,
+            "active",
+            "2026-01-01T00:00:00.000Z",
+            "2026-01-01T00:00:00.000Z",
+        ),
+    )
+    registry._connection.commit()
+    registry.close()
+
+    migrated = AgentRegistry(tmp_path)
+    try:
+        migrated.initialize()
+        record = migrated.get(PROTOTYPE_AGENT_ID)
+        capsule = migrated.capsules.load_agent(PROTOTYPE_AGENT_ID)
+
+        assert record.display_name == SYSTEM_AGENT_DISPLAY_NAME
+        assert record.generation == 2
+        assert record.state == "active"
+        assert capsule.display_name == SYSTEM_AGENT_DISPLAY_NAME
+        assert capsule.generation == 2
+        assert migrated.capsules.ensure_prototype_agent().generation == 2
+        assert not capsule.runtime_root.joinpath("worker-env").exists()
+    finally:
+        migrated.close()
+
+
 def test_create_upgrade_delete_isolated_capsules_and_invalidates_generation(
     tmp_path: Path,
 ) -> None:
@@ -45,7 +90,9 @@ def test_create_upgrade_delete_isolated_capsules_and_invalidates_generation(
     registry = AgentRegistry(tmp_path, hooks=hooks)
     try:
         registry.initialize()
-        assert registry.get(PROTOTYPE_AGENT_ID).state == "active"
+        system = registry.get(PROTOTYPE_AGENT_ID)
+        assert system.state == "active"
+        assert system.display_name == SYSTEM_AGENT_DISPLAY_NAME
         first = registry.create("First Agent")
         second = registry.create("Second Agent")
         first_capsule = registry.capsules.load_agent(first.agent_id)

@@ -26,11 +26,54 @@ def test_session_ui_exposes_create_restore_delete_and_multiturn_surfaces() -> No
     html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
 
     assert required_ids <= html_ids
-    assert 'api("/api/sessions"' in SCRIPT
-    assert "`/api/sessions/${encodeURIComponent(sessionId)}`" in SCRIPT
-    assert "`/api/sessions/${encodeURIComponent(sessionId)}/runs`" in SCRIPT
+    assert 'api(agentApiPath("/sessions")' in SCRIPT
+    assert "agentApiPath(`/sessions/${encodeURIComponent(sessionId)}`)" in SCRIPT
+    assert "`/sessions/${encodeURIComponent(sessionId)}/runs`" in SCRIPT
     assert 'method: "DELETE"' in SCRIPT
     assert "preserveTimeline: true" in SCRIPT
+
+
+def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
+    required_ids = {
+        "agent-drawer",
+        "active-agent-title",
+        "agent-id",
+        "new-agent-form",
+        "new-agent-name",
+        "new-agent-button",
+        "agent-list-status",
+        "agent-list",
+        "research-environment-status",
+        "research-environment-packages",
+        "research-environment-install",
+        "research-environment-delete",
+    }
+    html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
+    renderer = _function_body("renderAgentList")
+    creator = _function_body("createAgent")
+    upgrader = _function_body("upgradeAgent")
+    deletion = _function_body("deleteAgent")
+
+    assert required_ids <= html_ids
+    assert "系统 Agent 是正式默认运行时" in INDEX
+    assert 'const SYSTEM_AGENT_ID = "00000000-0000-4000-8000-000000000001"' in SCRIPT
+    assert 'api("/api/agents")' in SCRIPT
+    assert "function agentApiPath" in SCRIPT
+    assert "textContent = agent.display_name" in renderer
+    assert "switchAgent(agent.agent_id)" in renderer
+    assert "clearSelectedSession()" in _function_body("loadAgentSurface")
+    assert "await refreshCommands()" in _function_body("loadAgentSurface")
+    assert "await refreshSessions(null)" in _function_body("loadAgentSurface")
+    assert 'method: "POST"' in creator
+    assert 'method: "POST"' in upgrader
+    assert 'method: "DELETE"' in deletion
+    assert "agent.agent_id === SYSTEM_AGENT_ID" in upgrader
+    assert "agent.agent_id === SYSTEM_AGENT_ID" in deletion
+    assert "其会话、Skill、Task、环境和沙箱数据都会清除" in deletion
+    assert "PDF / DOCX 依赖可跨会话复用" in INDEX
+    assert 'agentApiPath("/research-environment")' in SCRIPT
+    assert "await refreshResearchEnvironment()" in _function_body("loadAgentSurface")
+    assert '.innerHTML' not in renderer
 
 
 def test_every_javascript_element_reference_exists_in_the_page() -> None:
@@ -237,7 +280,9 @@ def test_context_inspector_is_explicit_lazy_and_content_withholding() -> None:
     assert "prompt 和其它隐藏 prompt 不暴露" in INDEX
     assert "void inspectSelectedRunContext(elements.contextInspectButton)" in SCRIPT
     assert "void inspectSelectedRunContext(elements.eventInspectorContextButton)" in SCRIPT
-    assert "`/api/runs/${encodeURIComponent(runId)}/context`" in inspector
+    assert "`/api/agents/${encodeURIComponent(contextAgentId)}/runs/`" in inspector
+    assert "`${encodeURIComponent(runId)}/context`" in inspector
+    assert "contextAgentId" in inspector
     assert "include_content" not in SCRIPT
     assert "JSON.stringify(inspection, null, 2)" in renderer
     assert "elements.contextInspectJson.textContent =" in SCRIPT

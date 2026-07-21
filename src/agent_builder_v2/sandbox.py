@@ -862,6 +862,7 @@ def apply_singleton_command_sandbox(
     output_root: Path,
     work_root: Path,
     *,
+    environment_root: Path | None = None,
     expected_parent_pid: int,
 ) -> SandboxAttestation:
     """Install the fail-closed sandbox for one fixed, in-process command.
@@ -877,7 +878,13 @@ def apply_singleton_command_sandbox(
     source = _capture_rule_root(source_root, expect_directory=True)
     output = _capture_rule_root(output_root, expect_directory=True)
     work = _capture_rule_root(work_root, expect_directory=True)
-    for root in (source, output, work):
+    environment = (
+        _capture_rule_root(environment_root, expect_directory=True)
+        if environment_root is not None
+        else None
+    )
+    owned_roots = (source, output, work) + ((environment,) if environment else ())
+    for root in owned_roots:
         metadata = os.stat(root.path, follow_symlinks=False)
         if metadata.st_uid != os.getuid():
             raise SandboxUnavailableError("command sandbox root has the wrong owner")
@@ -888,6 +895,8 @@ def apply_singleton_command_sandbox(
         raise SandboxUnavailableError("command sandbox roots overlap")
 
     readable = [source, work, _capture_rule_root(Path(sys.base_prefix), expect_directory=True)]
+    if environment is not None:
+        readable.append(environment)
     for candidate in _SYSTEM_READABLE_CANDIDATES:
         captured = _optional_rule_root(candidate)
         if captured is not None:

@@ -143,7 +143,7 @@ def main() -> int:
         "AGENT_BUILDER_RUNNER_OUTPUT", "AGENT_BUILDER_RUNNER_WORK",
         "AGENT_BUILDER_RUNNER_SOURCE_DIGEST", "AGENT_BUILDER_RUNNER_READY_FD",
         "AGENT_BUILDER_RUNNER_RELEASE_FD", "AGENT_BUILDER_RUNNER_PARENT_PID",
-        "AGENT_BUILDER_RUNNER_MODE",
+        "AGENT_BUILDER_RUNNER_MODE", "AGENT_BUILDER_RUNNER_ENVIRONMENT",
     }
     if mode == "bounded-bash":
         expected_environment.update(
@@ -185,6 +185,9 @@ def main() -> int:
     source_root = Path(_required_environment("AGENT_BUILDER_RUNNER_SOURCE"))
     output_root = Path(_required_environment("AGENT_BUILDER_RUNNER_OUTPUT"))
     work_root = Path(_required_environment("AGENT_BUILDER_RUNNER_WORK"))
+    environment_root = Path(
+        _required_environment("AGENT_BUILDER_RUNNER_ENVIRONMENT")
+    )
     expected_source_digest = _required_environment("AGENT_BUILDER_RUNNER_SOURCE_DIGEST")
     ready_fd = int(_required_environment("AGENT_BUILDER_RUNNER_READY_FD"))
     release_fd = int(_required_environment("AGENT_BUILDER_RUNNER_RELEASE_FD"))
@@ -243,6 +246,7 @@ def main() -> int:
             source_root,
             output_root,
             work_root,
+            environment_root=environment_root,
             expected_parent_pid=expected_parent,
         )
     _emit_ready(

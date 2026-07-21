@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 PROTOTYPE_AGENT_ID = "00000000-0000-4000-8000-000000000001"
+SYSTEM_AGENT_DISPLAY_NAME = "Harness System Agent"
 SAFE_ID = re.compile(r"^[a-f0-9-]{32,36}$")
 
 
@@ -25,7 +26,7 @@ class AgentCapsule:
     runtime_root: Path
     interpreter: Path
     generation: int = 1
-    display_name: str = "Harness V2 Prototype Agent"
+    display_name: str = SYSTEM_AGENT_DISPLAY_NAME
 
 
 class CapsuleManager:
@@ -97,16 +98,16 @@ class CapsuleManager:
                 or stat.S_IMODE(metadata.st_mode) != 0o600
                 or metadata.st_size > 4_096
             ):
-                raise RuntimeError("prototype Agent manifest is unsafe")
+                raise RuntimeError("Agent manifest is unsafe")
             raw = os.read(descriptor, 4_097)
             if len(raw) > 4_096 or os.read(descriptor, 1):
-                raise RuntimeError("prototype Agent manifest is too large")
+                raise RuntimeError("Agent manifest is too large")
         finally:
             os.close(descriptor)
         try:
             value = json.loads(raw)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("prototype Agent manifest is invalid") from exc
+            raise RuntimeError("Agent manifest is invalid") from exc
         if (
             not isinstance(value, dict)
             or value.get("schema_version") not in {1, 2}
@@ -249,13 +250,13 @@ class CapsuleManager:
             expected = Path(sys.executable).resolve(strict=True)
             metadata = resolved.stat()
         except FileNotFoundError as exc:
-            raise RuntimeError("prototype Agent interpreter is missing") from exc
+            raise RuntimeError("Agent interpreter is missing") from exc
         if (
             resolved != expected
             or not stat.S_ISREG(metadata.st_mode)
             or not os.access(resolved, os.X_OK)
         ):
-            raise RuntimeError("prototype Agent environment has no safe interpreter")
+            raise RuntimeError("Agent environment has no safe interpreter")
         return interpreter
 
     def _environment_root(self, runtime_root: Path, generation: int) -> Path:
@@ -521,11 +522,14 @@ class CapsuleManager:
         return removed
 
     def ensure_prototype_agent(self) -> AgentCapsule:
-        return self.ensure_agent(
-            PROTOTYPE_AGENT_ID,
-            display_name="Harness V2 Prototype Agent",
-            generation=1,
-        )
+        try:
+            return self.load_agent(PROTOTYPE_AGENT_ID)
+        except FileNotFoundError:
+            return self.ensure_agent(
+                PROTOTYPE_AGENT_ID,
+                display_name=SYSTEM_AGENT_DISPLAY_NAME,
+                generation=1,
+            )
 
     def ensure_agent(
         self,
@@ -548,9 +552,9 @@ class CapsuleManager:
         runtime_root = self.runtime_agents / agent_id
         self._ensure_real_directory(data_root)
         self._ensure_real_directory(runtime_root)
-        for child in ("workspace", "artifacts", "skills"):
+        for child in ("workspace", "artifacts", "skills", "dependencies"):
             self._ensure_real_directory(data_root / child)
-        for child in ("runs", "tasks", "logs", "skills"):
+        for child in ("runs", "tasks", "logs", "skills", "dependencies"):
             self._ensure_real_directory(runtime_root / child)
 
         manifest = data_root / "manifest.json"

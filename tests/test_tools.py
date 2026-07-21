@@ -156,7 +156,7 @@ def test_runtime_catalog_brokers_capabilities_and_rejects_surrogates() -> None:
 
     specs = runtime_tool_specs()
     assert [item.tool_id for item in specs] == [
-        "agent/delegate", "builtin/echo", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
+        "agent/delegate", "builtin/echo", "document/extract_text", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
         "file/read_text", "file/stat", "file/write", "skill/run",
     ]
     registry = runtime_tools(specs, brokered)  # type: ignore[arg-type]

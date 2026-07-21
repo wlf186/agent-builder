@@ -48,6 +48,65 @@
       </section>
 
       <section id="workspace" class="workspace" hidden>
+        <details id="agent-drawer" class="panel agent-panel agent-drawer">
+          <summary class="agent-drawer-summary">
+            <span class="agent-current">
+              <span class="section-label">AGENT</span>
+              <strong id="active-agent-title">正在读取 Agent…</strong>
+            </span>
+            <code id="agent-id">未选择</code>
+            <span class="agent-drawer-hint">Agent 管理</span>
+          </summary>
+          <div class="agent-drawer-body" aria-labelledby="agents-title">
+            <div class="section-heading agent-heading">
+              <div>
+                <p class="section-label">AGENTS</p>
+                <h2 id="agents-title">Agent</h2>
+              </div>
+              <form id="new-agent-form" class="agent-create-form">
+                <label class="sr-only" for="new-agent-name">新 Agent 名称</label>
+                <input
+                  id="new-agent-name"
+                  name="display_name"
+                  type="text"
+                  maxlength="128"
+                  autocomplete="off"
+                  placeholder="输入新 Agent 名称"
+                  required
+                />
+                <button id="new-agent-button" type="submit">新建 Agent</button>
+              </form>
+            </div>
+            <p id="agent-list-status" class="agent-list-status" role="status">
+              正在读取 Agent…
+            </p>
+            <ol id="agent-list" class="agent-list" aria-label="已有 Agent"></ol>
+            <p id="agent-empty" class="agent-empty" hidden>
+              当前没有可用 Agent。
+            </p>
+            <p class="agent-boundary-note">
+              系统 Agent 是正式默认运行时，始终保留；普通 Agent 可独立创建、切换、升级和删除。
+            </p>
+            <section class="research-environment" aria-labelledby="research-environment-title">
+              <div class="research-environment-heading">
+                <div>
+                  <p class="section-label">PERSISTENT ENVIRONMENT</p>
+                  <h3 id="research-environment-title">研究与文档环境</h3>
+                </div>
+                <span id="research-environment-status" class="agent-badge">正在读取</span>
+              </div>
+              <p class="research-environment-copy">
+                安装在当前 Agent Capsule 内，PDF / DOCX 依赖可跨会话复用；不会进入其他 Agent，删除 Agent 时一并清理。
+              </p>
+              <p id="research-environment-packages" class="research-environment-packages"></p>
+              <div class="research-environment-actions">
+                <button id="research-environment-install" type="button">安装研究环境</button>
+                <button id="research-environment-delete" class="danger" type="button">删除研究环境</button>
+              </div>
+            </section>
+          </div>
+        </details>
+
         <details id="session-drawer" class="panel session-panel session-drawer">
           <summary class="session-drawer-summary">
             <span class="session-current">
@@ -72,7 +131,6 @@
             <p id="session-empty" class="session-empty" hidden>
               还没有会话。新建一个会话后即可开始对话。
             </p>
-            <code id="agent-id" class="agent-id"></code>
           </div>
         </details>
 

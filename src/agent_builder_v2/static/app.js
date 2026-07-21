@@ -2,6 +2,8 @@
 
 const TERMINAL_EVENTS = new Set(["run.completed", "run.failed", "run.cancelled"]);
 const RUN_ID_PATTERN = /^[a-f0-9]{32}$/;
+const AGENT_ID_PATTERN = /^[a-f0-9-]{32,36}$/;
+const SYSTEM_AGENT_ID = "00000000-0000-4000-8000-000000000001";
 const MODEL_ID_PATTERN = /^[A-Za-z0-9._:/+-]{1,128}$/;
 const MAX_SSE_RECONNECTS = 3;
 const SSE_RECONNECT_DELAY_MS = 250;
@@ -182,6 +184,8 @@ const CONTEXT_SECTION_FIELDS = Object.freeze([
 const state = {
   csrfToken: null,
   agentId: null,
+  agents: [],
+  researchEnvironment: null,
   models: [],
   commands: [],
   selectedModelId: null,
@@ -225,6 +229,18 @@ const elements = {
   logoutButton: document.querySelector("#logout-button"),
   workspace: document.querySelector("#workspace"),
   agentId: document.querySelector("#agent-id"),
+  activeAgentTitle: document.querySelector("#active-agent-title"),
+  agentDrawer: document.querySelector("#agent-drawer"),
+  agentList: document.querySelector("#agent-list"),
+  agentListStatus: document.querySelector("#agent-list-status"),
+  agentEmpty: document.querySelector("#agent-empty"),
+  newAgentForm: document.querySelector("#new-agent-form"),
+  newAgentName: document.querySelector("#new-agent-name"),
+  newAgentButton: document.querySelector("#new-agent-button"),
+  researchEnvironmentStatus: document.querySelector("#research-environment-status"),
+  researchEnvironmentPackages: document.querySelector("#research-environment-packages"),
+  researchEnvironmentInstall: document.querySelector("#research-environment-install"),
+  researchEnvironmentDelete: document.querySelector("#research-environment-delete"),
   newSessionButton: document.querySelector("#new-session-button"),
   sessionList: document.querySelector("#session-list"),
   sessionListStatus: document.querySelector("#session-list-status"),
@@ -289,6 +305,17 @@ function selectedSession() {
   return state.sessions.find((session) => session.session_id === state.sessionId) || null;
 }
 
+function selectedAgent() {
+  return state.agents.find((agent) => agent.agent_id === state.agentId) || null;
+}
+
+function agentApiPath(suffix = "") {
+  if (typeof state.agentId !== "string" || !AGENT_ID_PATTERN.test(state.agentId)) {
+    throw new Error("当前 Agent 身份无效");
+  }
+  return `/api/agents/${encodeURIComponent(state.agentId)}${suffix}`;
+}
+
 function setContextInspectControl() {
   const disabled = (
     state.csrfToken === null || state.selectedTimelineRunId === null ||
@@ -347,6 +374,10 @@ function setRunControls() {
   const hasSession = state.sessionId !== null;
   const selectedIsActive = sessionIsActive(selectedSession());
   elements.newSessionButton.disabled = locked;
+  elements.newAgentName.disabled = locked;
+  elements.newAgentButton.disabled = locked;
+  elements.researchEnvironmentInstall.disabled = locked || state.researchEnvironment?.installed === true;
+  elements.researchEnvironmentDelete.disabled = locked || state.researchEnvironment?.installed !== true;
   // Keep the command line available during an active Run so /status,
   // /permissions and /cancel remain explicit control-plane actions.
   elements.messageInput.disabled = state.mutationPending || !hasSession;
@@ -365,6 +396,9 @@ function setRunControls() {
     button.disabled = locked || (
       button.classList.contains("session-delete") && button.dataset.sessionActive === "true"
     );
+  }
+  for (const button of elements.agentList.querySelectorAll("button")) {
+    button.disabled = locked || button.dataset.agentState !== "active";
   }
 }
 
@@ -428,6 +462,7 @@ function setAuthenticated(session) {
   state.csrfToken = session.csrf_token;
   state.agentId = session.agent_id;
   elements.agentId.textContent = session.agent_id;
+  elements.activeAgentTitle.textContent = "正在读取 Agent…";
   elements.statusDot.classList.add("online");
   setStatus("控制面已连接");
   elements.loginPanel.hidden = true;
@@ -439,6 +474,8 @@ function setUnauthenticated(message = "尚未认证") {
   state.activeRun?.controller?.abort();
   state.csrfToken = null;
   state.agentId = null;
+  state.agents = [];
+  state.researchEnvironment = null;
   state.models = [];
   state.commands = [];
   state.selectedModelId = null;
@@ -454,6 +491,13 @@ function setUnauthenticated(message = "尚未认证") {
   elements.workspace.hidden = true;
   elements.logoutButton.hidden = true;
   elements.sessionList.replaceChildren();
+  elements.agentList.replaceChildren();
+  elements.agentListStatus.textContent = "";
+  elements.agentEmpty.hidden = true;
+  elements.activeAgentTitle.textContent = "未选择 Agent";
+  elements.agentId.textContent = "未选择";
+  elements.researchEnvironmentStatus.textContent = "未连接";
+  elements.researchEnvironmentPackages.textContent = "";
   elements.modelSelect.replaceChildren(new Option("需要先登录", ""));
   elements.commandHelpList.replaceChildren();
   elements.commandResult.hidden = true;
@@ -487,8 +531,340 @@ async function api(path, options = {}) {
   return response;
 }
 
+function normalizeAgent(value) {
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    typeof value.agent_id !== "string" || !AGENT_ID_PATTERN.test(value.agent_id) ||
+    typeof value.display_name !== "string" || !value.display_name.trim() ||
+    new TextEncoder().encode(value.display_name).length > 128 ||
+    !Number.isSafeInteger(value.generation) || value.generation < 1 ||
+    !["provisioning", "active", "upgrading", "deleting"].includes(value.state) ||
+    typeof value.created_at !== "string" || typeof value.updated_at !== "string"
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function setAgentIdentity(agent) {
+  state.agentId = agent.agent_id;
+  elements.agentId.textContent = agent.agent_id;
+  elements.activeAgentTitle.textContent = agent.display_name;
+}
+
+function renderAgentList() {
+  elements.agentList.replaceChildren();
+  elements.agentEmpty.hidden = state.agents.length !== 0;
+  for (const agent of state.agents) {
+    const system = agent.agent_id === SYSTEM_AGENT_ID;
+    const item = document.createElement("li");
+    item.className = "agent-item";
+    item.classList.toggle("active", agent.agent_id === state.agentId);
+
+    const heading = document.createElement("div");
+    heading.className = "agent-item-heading";
+    const name = document.createElement("strong");
+    name.textContent = agent.display_name;
+    const badges = document.createElement("span");
+    badges.className = "agent-badges";
+    if (system) {
+      const badge = document.createElement("span");
+      badge.className = "agent-badge system";
+      badge.textContent = "系统 Agent";
+      badges.append(badge);
+    }
+    const stateBadge = document.createElement("span");
+    stateBadge.className = "agent-badge";
+    stateBadge.textContent = agent.state;
+    badges.append(stateBadge);
+    heading.append(name, badges);
+
+    const metadata = document.createElement("div");
+    metadata.className = "agent-meta";
+    const identity = document.createElement("span");
+    identity.textContent = agent.agent_id;
+    const generation = document.createElement("span");
+    generation.textContent = `generation ${agent.generation}`;
+    metadata.append(identity, generation);
+
+    const actions = document.createElement("div");
+    actions.className = "agent-item-actions";
+    if (agent.agent_id !== state.agentId) {
+      const select = document.createElement("button");
+      select.type = "button";
+      select.className = "quiet agent-select";
+      select.textContent = "切换";
+      select.dataset.agentState = agent.state;
+      select.addEventListener("click", () => void switchAgent(agent.agent_id));
+      actions.append(select);
+    }
+    if (!system) {
+      const upgrade = document.createElement("button");
+      upgrade.type = "button";
+      upgrade.className = "quiet agent-upgrade";
+      upgrade.textContent = "重命名 / 升级";
+      upgrade.dataset.agentState = agent.state;
+      upgrade.addEventListener("click", () => void upgradeAgent(agent));
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "danger agent-delete";
+      remove.textContent = "删除";
+      remove.dataset.agentState = agent.state;
+      remove.addEventListener("click", () => void deleteAgent(agent));
+      actions.append(upgrade, remove);
+    }
+    item.append(heading, metadata, actions);
+    elements.agentList.append(item);
+  }
+  setRunControls();
+}
+
+async function refreshAgents(preferredAgentId = state.agentId) {
+  elements.agentListStatus.textContent = "正在读取 Agent…";
+  const response = await api("/api/agents");
+  const body = await response.json();
+  if (!body || !Array.isArray(body.agents) || body.agents.length > 100) {
+    throw new Error("Agent 列表格式无效");
+  }
+  const agents = body.agents.map(normalizeAgent).filter((item) => item !== null);
+  if (agents.length !== body.agents.length || new Set(
+    agents.map((agent) => agent.agent_id),
+  ).size !== agents.length) {
+    throw new Error("Agent 列表条目无效");
+  }
+  state.agents = agents;
+  const target = agents.find((agent) => (
+    agent.agent_id === preferredAgentId && agent.state === "active"
+  )) || agents.find((agent) => (
+    agent.agent_id === SYSTEM_AGENT_ID && agent.state === "active"
+  )) || agents.find((agent) => agent.state === "active") || null;
+  if (!target) throw new Error("没有可用的 active Agent");
+  setAgentIdentity(target);
+  elements.agentListStatus.textContent = `${agents.length} 个 Agent`;
+  renderAgentList();
+  return target;
+}
+
+async function loadAgentSurface(preferredAgentId, successMessage) {
+  clearSelectedSession();
+  state.sessions = [];
+  renderSessionList();
+  renderPermissions([]);
+  await refreshAgents(preferredAgentId);
+  await refreshResearchEnvironment();
+  await refreshCommands();
+  await refreshSessions(null);
+  if (successMessage) setStatus(successMessage);
+}
+
+function normalizeResearchEnvironment(value) {
+  if (
+    !value || typeof value !== "object" || Array.isArray(value) ||
+    value.agent_id !== state.agentId || typeof value.installed !== "boolean" ||
+    (value.installed && (!value.environment || typeof value.environment !== "object" ||
+      !Array.isArray(value.environment.requirements) ||
+      value.environment.requirements.length < 1 || value.environment.requirements.length > 16 ||
+      value.environment.requirements.some((item) => typeof item !== "string" || item.length > 128))) ||
+    (!value.installed && value.environment !== null)
+  ) return null;
+  return value;
+}
+
+function renderResearchEnvironment() {
+  const value = state.researchEnvironment;
+  if (value?.installed) {
+    elements.researchEnvironmentStatus.textContent = "已安装 / 可复用";
+    elements.researchEnvironmentPackages.textContent = value.environment.requirements.join(" · ");
+  } else {
+    elements.researchEnvironmentStatus.textContent = value ? "未安装" : "状态未知";
+    elements.researchEnvironmentPackages.textContent = value
+      ? "安装后将启用 document/extract_text，运行期断网且仅只读当前 Agent 文档。"
+      : "";
+  }
+  setRunControls();
+}
+
+async function refreshResearchEnvironment() {
+  state.researchEnvironment = null;
+  renderResearchEnvironment();
+  const response = await api(agentApiPath("/research-environment"));
+  const value = normalizeResearchEnvironment(await response.json());
+  if (!value) throw new Error("研究环境响应格式无效");
+  state.researchEnvironment = value;
+  renderResearchEnvironment();
+}
+
+async function installResearchEnvironment() {
+  if (state.mutationPending || state.activeRun !== null || state.researchEnvironment?.installed) return;
+  state.mutationPending = true;
+  setRunControls();
+  setStatus("正在当前 Agent 内安装固定版本研究依赖…");
+  try {
+    await api(agentApiPath("/research-environment"), {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await refreshResearchEnvironment();
+    await refreshCommands();
+    setStatus("研究环境已安装；后续会话会直接复用，不会重复下载");
+  } catch (error) {
+    if (state.csrfToken !== null) setStatus(error.message);
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
+async function deleteResearchEnvironment() {
+  if (state.mutationPending || state.activeRun !== null || !state.researchEnvironment?.installed) return;
+  if (!window.confirm("删除当前 Agent 的研究依赖环境吗？工作区文档与历史会话不会删除。")) return;
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    await api(agentApiPath("/research-environment"), { method: "DELETE" });
+    await refreshResearchEnvironment();
+    await refreshCommands();
+    setStatus("当前 Agent 的研究依赖环境已彻底清理");
+  } catch (error) {
+    if (state.csrfToken !== null) setStatus(error.message);
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
+async function switchAgent(agentId) {
+  if (
+    !AGENT_ID_PATTERN.test(agentId) || agentId === state.agentId ||
+    state.settling || state.mutationPending || state.activeRun !== null
+  ) {
+    return;
+  }
+  const previousAgentId = state.agentId;
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    await loadAgentSurface(agentId, `已切换到 ${selectedAgent()?.display_name || "Agent"}`);
+    elements.agentDrawer.open = false;
+  } catch (error) {
+    if (state.csrfToken !== null && previousAgentId) {
+      await loadAgentSurface(previousAgentId, null).catch(() => null);
+      setStatus(`Agent 切换失败：${error.message}`);
+    }
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
+function validAgentDisplayName(value) {
+  return typeof value === "string" && value.trim() &&
+    new TextEncoder().encode(value).length <= 128;
+}
+
+async function createAgent(displayName) {
+  if (!validAgentDisplayName(displayName)) {
+    setStatus("Agent 名称必须为 1–128 UTF-8 bytes");
+    return;
+  }
+  if (state.settling || state.mutationPending || state.activeRun !== null) return;
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    const response = await api("/api/agents", {
+      method: "POST",
+      body: JSON.stringify({ display_name: displayName.trim() }),
+    });
+    const agent = normalizeAgent(await response.json());
+    if (!agent || agent.state !== "active") throw new Error("新建 Agent 响应格式无效");
+    elements.newAgentName.value = "";
+    await loadAgentSurface(agent.agent_id, `Agent“${agent.display_name}”已创建并切换`);
+    elements.agentDrawer.open = false;
+  } catch (error) {
+    if (state.csrfToken !== null) setStatus(error.message);
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
+async function upgradeAgent(agent) {
+  if (
+    agent.agent_id === SYSTEM_AGENT_ID || agent.state !== "active" ||
+    state.settling || state.mutationPending || state.activeRun !== null
+  ) {
+    return;
+  }
+  const displayName = window.prompt("输入升级后的 Agent 名称", agent.display_name);
+  if (displayName === null) return;
+  if (!validAgentDisplayName(displayName)) {
+    setStatus("Agent 名称必须为 1–128 UTF-8 bytes");
+    return;
+  }
+  if (!window.confirm(`确定升级“${agent.display_name}”并切换到新的 generation 吗？`)) return;
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    const response = await api(
+      `/api/agents/${encodeURIComponent(agent.agent_id)}/upgrade`,
+      { method: "POST", body: JSON.stringify({ display_name: displayName.trim() }) },
+    );
+    const upgraded = normalizeAgent(await response.json());
+    if (!upgraded || upgraded.state !== "active") throw new Error("Agent 升级响应格式无效");
+    if (agent.agent_id === state.agentId) {
+      await loadAgentSurface(
+        state.agentId,
+        `Agent 已升级到 generation ${upgraded.generation}`,
+      );
+    } else {
+      await refreshAgents(state.agentId);
+      setStatus(`Agent 已升级到 generation ${upgraded.generation}`);
+    }
+  } catch (error) {
+    if (state.csrfToken !== null) setStatus(error.message);
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
+async function deleteAgent(agent) {
+  if (
+    agent.agent_id === SYSTEM_AGENT_ID || agent.state !== "active" ||
+    state.settling || state.mutationPending || state.activeRun !== null
+  ) {
+    return;
+  }
+  if (!window.confirm(
+    `确定删除 Agent“${agent.display_name}”吗？其会话、Skill、Task、环境和沙箱数据都会清除，且不可撤销。`,
+  )) return;
+  const deletingSelected = agent.agent_id === state.agentId;
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    await api(`/api/agents/${encodeURIComponent(agent.agent_id)}`, { method: "DELETE" });
+    if (deletingSelected) {
+      await loadAgentSurface(
+        SYSTEM_AGENT_ID,
+        `Agent“${agent.display_name}”已删除且残留已清理`,
+      );
+    } else {
+      await refreshAgents(state.agentId);
+      setStatus(`Agent“${agent.display_name}”已删除且残留已清理`);
+    }
+  } catch (error) {
+    if (state.csrfToken !== null) {
+      await refreshAgents(state.agentId).catch(() => null);
+      setStatus(error.message);
+    }
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
 async function refreshCommands() {
-  const response = await api("/api/commands");
+  const response = await api(agentApiPath("/commands"));
   const body = await response.json();
   if (
     !body || body.schema_version !== 1 || !Array.isArray(body.commands) ||
@@ -589,7 +965,9 @@ async function pollPendingPermissions(runContext) {
 }
 
 async function executeSlashCommand(sessionId, command) {
-  const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/commands`, {
+  const response = await api(agentApiPath(
+    `/sessions/${encodeURIComponent(sessionId)}/commands`,
+  ), {
     method: "POST",
     body: JSON.stringify({ command }),
   });
@@ -1132,10 +1510,14 @@ async function loadDurableTimeline(runId, sessionRequest, timelineRequest, sessi
   const ordered = [];
   let insertionOrder = 0;
   while (pages < 5) {
-    const replayPath = runMetadata?.kind === "subagent"
-      ? `/api/agents/${encodeURIComponent(runMetadata.childAgentId)}/runs/` +
-        `${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`
-      : `/api/runs/${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`;
+    const replayAgentId = runMetadata?.kind === "subagent"
+      ? runMetadata.childAgentId
+      : state.agentId;
+    if (typeof replayAgentId !== "string" || !AGENT_ID_PATTERN.test(replayAgentId)) {
+      throw new Error("历史事件 Agent 身份无效");
+    }
+    const replayPath = `/api/agents/${encodeURIComponent(replayAgentId)}/runs/` +
+      `${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`;
     const response = await api(
       replayPath,
     );
@@ -1280,7 +1662,7 @@ async function selectSession(
   elements.activeSessionTitle.textContent = "正在恢复会话…";
   elements.sessionId.textContent = sessionId;
   try {
-    const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+    const response = await api(agentApiPath(`/sessions/${encodeURIComponent(sessionId)}`));
     const detail = await response.json();
     if (requestNumber !== state.sessionRequest || state.sessionId !== sessionId) return null;
     const session = normalizeSession(detail.session);
@@ -1419,14 +1801,14 @@ function isNonNegativeInteger(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-function validateContextInspection(value, runId, sessionId) {
+function validateContextInspection(value, runId, sessionId, agentId = state.agentId) {
   if (!hasExactFields(value, CONTEXT_RESPONSE_FIELDS)) {
     throw new Error("invalid context inspection");
   }
   const identity = value.identity;
   if (
     !hasExactFields(identity, ["agent_id", "conversation_id", "turn_id", "run_id"]) ||
-    identity.agent_id !== state.agentId || identity.conversation_id !== sessionId ||
+    identity.agent_id !== agentId || identity.conversation_id !== sessionId ||
     identity.run_id !== runId || typeof identity.turn_id !== "string"
   ) {
     throw new Error("invalid context identity");
@@ -1624,10 +2006,14 @@ async function inspectSelectedRunContext(trigger) {
     const expectedConversationId = runMetadata?.kind === "subagent"
       ? runMetadata.childConversationId
       : sessionId;
-    const contextPath = runMetadata?.kind === "subagent"
-      ? `/api/agents/${encodeURIComponent(runMetadata.childAgentId)}/runs/` +
-        `${encodeURIComponent(runId)}/context`
-      : `/api/runs/${encodeURIComponent(runId)}/context`;
+    const contextAgentId = runMetadata?.kind === "subagent"
+      ? runMetadata.childAgentId
+      : state.agentId;
+    if (typeof contextAgentId !== "string" || !AGENT_ID_PATTERN.test(contextAgentId)) {
+      throw new Error("上下文 Agent 身份无效");
+    }
+    const contextPath = `/api/agents/${encodeURIComponent(contextAgentId)}/runs/` +
+      `${encodeURIComponent(runId)}/context`;
     const response = await api(contextPath);
     const body = await response.json();
     if (
@@ -1641,7 +2027,12 @@ async function inspectSelectedRunContext(trigger) {
     ) {
       return;
     }
-    renderContextInspection(validateContextInspection(body, runId, expectedConversationId));
+    renderContextInspection(validateContextInspection(
+      body,
+      runId,
+      expectedConversationId,
+      contextAgentId,
+    ));
   } catch (_error) {
     if (
       contextLoadIsCurrent(
@@ -1680,7 +2071,7 @@ async function inspectSelectedRunContext(trigger) {
 
 async function refreshSessions(preferredSessionId = state.sessionId) {
   elements.sessionListStatus.textContent = "正在读取会话…";
-  const response = await api("/api/sessions");
+  const response = await api(agentApiPath("/sessions"));
   const body = await response.json();
   if (!body || !Array.isArray(body.sessions)) throw new Error("会话列表格式无效");
   state.sessions = body.sessions.map(normalizeSession).filter((item) => item !== null);
@@ -1699,7 +2090,7 @@ async function refreshSessions(preferredSessionId = state.sessionId) {
 }
 
 async function refreshSessionSummaries() {
-  const response = await api("/api/sessions");
+  const response = await api(agentApiPath("/sessions"));
   const body = await response.json();
   if (!body || !Array.isArray(body.sessions)) throw new Error("会话列表格式无效");
   state.sessions = body.sessions.map(normalizeSession).filter((item) => item !== null);
@@ -1720,7 +2111,7 @@ async function createSession() {
   state.mutationPending = true;
   setRunControls();
   try {
-    const response = await api("/api/sessions", {
+    const response = await api(agentApiPath("/sessions"), {
       method: "POST",
       body: JSON.stringify({}),
     });
@@ -1746,7 +2137,7 @@ async function deleteSession(session) {
   setRunControls();
   let deleted = false;
   try {
-    await api(`/api/sessions/${encodeURIComponent(session.session_id)}`, {
+    await api(agentApiPath(`/sessions/${encodeURIComponent(session.session_id)}`), {
       method: "DELETE",
     });
     deleted = true;
@@ -1785,8 +2176,10 @@ async function restoreLoginSession() {
     return;
   }
   try {
-    await refreshCommands();
     await refreshModels();
+    await refreshAgents(session.agent_id);
+    await refreshResearchEnvironment();
+    await refreshCommands();
     await refreshSessions(null);
   } catch (error) {
     if (state.csrfToken !== null) setStatus(error.message);
@@ -1803,10 +2196,13 @@ elements.loginForm.addEventListener("submit", async (event) => {
       method: "POST",
       body: JSON.stringify({ token }),
     });
-    setAuthenticated(await response.json());
+    const session = await response.json();
+    setAuthenticated(session);
     try {
-      await refreshCommands();
       await refreshModels();
+      await refreshAgents(session.agent_id);
+      await refreshResearchEnvironment();
+      await refreshCommands();
       await refreshSessions(null);
     } catch (error) {
       if (state.csrfToken !== null) setStatus(error.message);
@@ -1826,6 +2222,19 @@ elements.logoutButton.addEventListener("click", async () => {
 
 elements.newSessionButton.addEventListener("click", () => {
   void createSession();
+});
+
+elements.newAgentForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void createAgent(elements.newAgentName.value);
+});
+
+elements.researchEnvironmentInstall.addEventListener("click", () => {
+  void installResearchEnvironment();
+});
+
+elements.researchEnvironmentDelete.addEventListener("click", () => {
+  void deleteResearchEnvironment();
 });
 
 elements.commandResultClose.addEventListener("click", () => {
@@ -2669,7 +3078,7 @@ async function reconnectDelay(runContext, attempt) {
 }
 
 async function streamWithReconnect(runContext) {
-  const eventsUrl = `/api/runs/${encodeURIComponent(runContext.runId)}/events`;
+  const eventsUrl = agentApiPath(`/runs/${encodeURIComponent(runContext.runId)}/events`);
   let lastError = new Error("事件流在终态前结束");
   for (let attempt = 0; attempt <= MAX_SSE_RECONNECTS; attempt += 1) {
     try {
@@ -2844,7 +3253,9 @@ elements.runForm.addEventListener("submit", async (event) => {
   setRunControls();
   let runContext = null;
   try {
-    const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/runs`, {
+    const response = await api(agentApiPath(
+      `/sessions/${encodeURIComponent(sessionId)}/runs`,
+    ), {
       method: "POST",
       body: JSON.stringify({
         message,
@@ -2859,7 +3270,9 @@ elements.runForm.addEventListener("submit", async (event) => {
     ) {
       throw new Error("Run 响应格式无效");
     }
-    const expectedEventsUrl = `/api/runs/${encodeURIComponent(run.run_id)}/events`;
+    const expectedEventsUrl = agentApiPath(
+      `/runs/${encodeURIComponent(run.run_id)}/events`,
+    );
     if (run.events_url !== expectedEventsUrl) throw new Error("Run 事件地址无效");
     runContext = {
       runId: run.run_id,
@@ -2902,7 +3315,7 @@ elements.cancelButton.addEventListener("click", async () => {
   runContext.cancelPending = true;
   setRunControls();
   try {
-    await api(`/api/runs/${encodeURIComponent(runContext.runId)}/cancel`, {
+    await api(agentApiPath(`/runs/${encodeURIComponent(runContext.runId)}/cancel`), {
       method: "POST",
     });
     setStatus("取消请求已发送，正在等待 Run 收敛");

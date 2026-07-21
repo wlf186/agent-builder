@@ -145,6 +145,11 @@ def test_context_plan_is_ordered_reproducible_and_provider_renderable() -> None:
     assert [message["role"] for message in messages] == ["system", "user"]
     assert "[platform.contract]" in messages[0]["content"]
     assert "[agent.instructions]" in messages[0]["content"]
+    assert "Answer directly without a Tool by default" in messages[0]["content"]
+    assert (
+        "creative writing and self-contained questions never need a Tool"
+        in messages[0]["content"]
+    )
     assert messages[1] == {"role": "user", "content": "请回显这一条"}
     assert "请回显这一条" not in repr(first.sections[-1])
 

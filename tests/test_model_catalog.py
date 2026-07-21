@@ -17,6 +17,7 @@ from agent_builder_v2.model_catalog import (
     ModelCatalog,
     ModelCatalogEntry,
     ModelCatalogError,
+    ModelTimeoutProfile,
     ProviderEndpoint,
     default_model_catalog,
 )
@@ -71,11 +72,54 @@ def test_default_catalog_is_stable_and_withholds_network_target() -> None:
 
     assert first.digest == second.digest
     assert first.select().provider_model == "qwen3.5:2b"
+    assert first.select().output_token_cap == 4_096
     public = first.public_metadata()
     assert public["default_model_id"] == "qwen3.5:2b"
     assert "endpoints" not in public
     assert "host" not in str(public)
     assert "11434" not in str(public)
+    assert first.select().timeouts == ModelTimeoutProfile(
+        queue_seconds=30.0,
+        first_frame_seconds=60.0,
+        stream_idle_seconds=20.0,
+        turn_seconds=120.0,
+        first_frame_attempts=2,
+    )
+
+
+@pytest.mark.parametrize(
+    "timeouts",
+    [
+        ModelTimeoutProfile(first_frame_attempts=1),
+        pytest.param(None, id="missing-profile"),
+    ],
+)
+def test_catalog_entry_binds_a_validated_timeout_profile(
+    timeouts: ModelTimeoutProfile | None,
+) -> None:
+    entry = _catalog().select()
+    if timeouts is None:
+        with pytest.raises(ModelCatalogError):
+            replace(entry, timeouts=timeouts)  # type: ignore[arg-type]
+    else:
+        changed = replace(entry, timeouts=timeouts)
+        assert changed.canonical_manifest()["timeouts"] == timeouts.canonical_manifest()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"first_frame_seconds": 0.0},
+        {"stream_idle_seconds": 301.0},
+        {"turn_seconds": 20.0, "first_frame_seconds": 20.0},
+        {"first_frame_attempts": 3},
+    ],
+)
+def test_timeout_profile_rejects_unbounded_or_incoherent_values(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ModelCatalogError):
+        ModelTimeoutProfile(**changes)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

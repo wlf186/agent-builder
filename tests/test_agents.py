@@ -125,6 +125,100 @@ def test_create_upgrade_delete_isolated_capsules_and_invalidates_generation(
         registry.close()
 
 
+def test_rename_preserves_generation_environment_and_runtime_data(
+    tmp_path: Path,
+) -> None:
+    hooks = _Hooks()
+    registry = AgentRegistry(tmp_path, hooks=hooks)
+    try:
+        registry.initialize()
+        created = registry.create("Before rename")
+        capsule = registry.capsules.load_agent(created.agent_id)
+        marker = capsule.data_root / "workspace" / "marker.txt"
+        marker.write_text("preserved", encoding="utf-8")
+        interpreter = capsule.interpreter
+        interpreter_inode = interpreter.stat().st_ino
+
+        renamed = registry.rename(
+            created.agent_id, display_name="After rename"
+        )
+
+        current = registry.capsules.load_agent(created.agent_id)
+        assert renamed.display_name == "After rename"
+        assert renamed.generation == created.generation == 1
+        assert current.display_name == "After rename"
+        assert current.generation == 1
+        assert current.interpreter == interpreter
+        assert current.interpreter.stat().st_ino == interpreter_inode
+        assert marker.read_text(encoding="utf-8") == "preserved"
+        assert not capsule.runtime_root.joinpath("generations").exists()
+        assert hooks.drained == []
+        assert hooks.retired == []
+        assert registry.rename(
+            created.agent_id, display_name="After rename"
+        ) == renamed
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("failure_boundary", ["manifest", "active_commit"])
+def test_rename_recovers_before_or_after_manifest_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+) -> None:
+    registry = AgentRegistry(tmp_path)
+    registry.initialize()
+    created = registry.create("Before interrupted rename")
+    if failure_boundary == "manifest":
+        original = registry.capsules.rename_agent
+
+        def fail_manifest_once(*args: object, **kwargs: object) -> object:
+            monkeypatch.setattr(registry.capsules, "rename_agent", original)
+            raise OSError("simulated rename interruption")
+
+        monkeypatch.setattr(
+            registry.capsules, "rename_agent", fail_manifest_once
+        )
+    else:
+        original_state = registry._set_state_locked
+
+        def fail_active_commit(
+            agent_id: str, **kwargs: object
+        ) -> object:
+            if kwargs.get("state") == "active" and kwargs.get(
+                "display_name"
+            ) == "After interrupted rename":
+                raise OSError("simulated rename interruption")
+            return original_state(agent_id, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(registry, "_set_state_locked", fail_active_commit)
+
+    with pytest.raises(OSError, match="rename interruption"):
+        registry.rename(
+            created.agent_id, display_name="After interrupted rename"
+        )
+    pending = registry.get(created.agent_id)
+    assert pending.state == "renaming"
+    assert pending.generation == 1
+    registry.close()
+    monkeypatch.undo()
+
+    recovered = AgentRegistry(tmp_path)
+    try:
+        recovered.initialize()
+        record = recovered.get(created.agent_id)
+        capsule = recovered.capsules.load_agent(created.agent_id)
+        assert record.state == "active"
+        assert record.display_name == "After interrupted rename"
+        assert record.generation == 1
+        assert capsule.display_name == record.display_name
+        assert capsule.generation == record.generation
+        assert not capsule.runtime_root.joinpath("generations").exists()
+    finally:
+        recovered.close()
+
+
 def test_upgrade_and_delete_recover_from_durable_intermediate_states(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

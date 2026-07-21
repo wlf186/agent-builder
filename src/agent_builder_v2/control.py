@@ -124,7 +124,7 @@ RECOVERY_EVENT_RESERVE = 32 * 1024
 # block, start and finish one requested-only Tool, then publish the terminal.
 RECOVERY_EVENT_SLOTS = 4
 MAX_DURABLE_EVENT_BYTES = 65_536
-RUN_WALL_TIMEOUT_SECONDS = 60
+RUN_WALL_TIMEOUT_SECONDS = 240
 CANCEL_GRACE_SECONDS = 2.0
 RUN_QUOTA_INTERVAL_SECONDS = 1.0
 MAX_RUN_TREE_ENTRIES = 1_024
@@ -2965,6 +2965,7 @@ class RunService:
                         prompt_tokens, output_tokens = self._validated_model_usage(
                             record, frame.payload["usage"]
                         )
+                        assistant_content = "".join(trusted_content)
                         await finish_response(
                             "end_turn",
                             input_tokens=prompt_tokens,
@@ -2975,8 +2976,14 @@ class RunService:
                         self._apply_validated_model_usage(
                             record, prompt_tokens, output_tokens
                         )
+                        if not assistant_content.strip():
+                            raise OllamaBrokerError(
+                                "model_empty_response",
+                                "The model returned no visible assistant content.",
+                                retryable=True,
+                            )
                         record.broker_stop_iteration = expected_iteration
-                        record.final_assistant_content = "".join(trusted_content)
+                        record.final_assistant_content = assistant_content
                         saw_terminal_frame = True
                         await self._write_model_response(
                             stream,

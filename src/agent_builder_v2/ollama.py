@@ -55,7 +55,7 @@ from .tools import (
     ToolResultProjection,
     ToolSpec,
     project_tool_result,
-    runtime_tool_specs,
+    runtime_tool_catalog,
     validate_tool_result_projection,
 )
 
@@ -75,9 +75,8 @@ MAX_STREAM_FRAMES = 4_096
 MAX_OUTPUT_BYTES = 12_288
 MAX_MODEL_TURNS = 8
 MAX_CONCURRENT_MODEL_STREAMS = 2
-MODEL_QUEUE_TIMEOUT_SECONDS = 30.0
 RUNTIME_CONTEXT_TOKEN_CAP = 32_768
-MODEL_NUM_PREDICT = 2_048
+MODEL_NUM_PREDICT = 4_096
 CONTENT_COALESCE_BYTES = 256
 CONTENT_COALESCE_SECONDS = 0.05
 MAX_NORMALIZED_CONTENT_FRAMES = MAX_BROKER_RESPONSE_FRAMES - 1
@@ -85,11 +84,15 @@ MAX_TAIL_CONTENT_FRAMES = 2
 MAX_CONTENT_JSON_STRING_BYTES = MAX_BROKER_FRAME_BYTES - 16 * 1024
 CANCEL_POLL_SECONDS = 0.05
 QUALIFICATION_TIMEOUT_SECONDS = 8.0
-TURN_TIMEOUT_SECONDS = 25.0
 REQUEST_DIGEST_DOMAIN = b"agent-builder-ollama-request-v1\0"
 SUMMARY_TIMEOUT_SECONDS = 15.0
 SUMMARY_CIRCUIT_FAILURES = 3
 SUMMARY_CIRCUIT_SECONDS = 60.0
+TOOL_FINALIZATION_INSTRUCTION = (
+    "Trusted runtime finalization: The Tool-call budget is exhausted. "
+    "Do not call or mention any Tool. Respond now with only the final answer "
+    "to the user's original request as ordinary assistant text."
+)
 
 _SAFE_CALL_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -286,7 +289,7 @@ def _model_profile(
     )
     output_tokens = min(
         entry.output_token_cap,
-        max(256, operational_context_tokens // 16),
+        max(256, operational_context_tokens // 8),
     )
     try:
         return ModelProfile(
@@ -349,9 +352,11 @@ class OllamaBroker:
         if not isinstance(semantic_summary_enabled, bool):
             raise TypeError("semantic_summary_enabled must be bool")
         self._semantic_summary_enabled = semantic_summary_enabled
-        self._tool_catalog = {
-            spec.tool_id: spec for spec in runtime_tool_specs()
-        }
+        # Admission uses the full immutable catalog; the Control Plane's frozen
+        # EffectiveToolSet decides what a new Run may actually expose.  Keeping
+        # catalog and policy separate also lets old Echo-bearing Run fixtures be
+        # validated after Echo leaves the release policy.
+        self._tool_catalog = runtime_tool_catalog().by_id()
         self._client: httpx.AsyncClient | None = None
         self._qualification: OllamaQualification | None = None
         self._qualifications: dict[str, OllamaQualification] = {}
@@ -1006,6 +1011,16 @@ class OllamaRunSession:
             if len(validated_results) < self._max_tool_calls
             else ()
         )
+        if not available_tools and len(validated_results) >= self._max_tool_calls:
+            # A schema-free request alone is not a reliable phase transition for
+            # small models: the preceding assistant/tool transcript can prime a
+            # stale Tool call even though `tools` is empty.  Put the trusted
+            # transition immediately after the last untrusted Tool result, where
+            # it is both unambiguous to the model and bound into the exact request
+            # digest/admission checks below.
+            candidate_messages.append(
+                {"role": "system", "content": TOOL_FINALIZATION_INSTRUCTION}
+            )
         try:
             runtime_input_tokens = estimate_provider_input_tokens(
                 candidate_messages, available_tools
@@ -1104,8 +1119,8 @@ class OllamaRunSession:
                 for call in tool_calls:
                     if not available_tools:
                         raise OllamaBrokerError(
-                            "model_protocol_error",
-                            "Ollama requested a Tool after capabilities were narrowed.",
+                            "model_tool_loop",
+                            "The model requested a Tool after the Tool phase ended.",
                         )
                     if provider_call is not None:
                         raise OllamaBrokerError(
@@ -1243,8 +1258,9 @@ class OllamaRunSession:
         if is_cancelled():
             raise OllamaCancelledError()
         client = self._broker._require_client()
+        timeouts = self._catalog_entry.timeouts
         loop = asyncio.get_running_loop()
-        queue_deadline = loop.time() + MODEL_QUEUE_TIMEOUT_SECONDS
+        queue_deadline = loop.time() + timeouts.queue_seconds
         while True:
             if is_cancelled():
                 raise OllamaCancelledError()
@@ -1264,7 +1280,46 @@ class OllamaRunSession:
         try:
             if is_cancelled():
                 raise OllamaCancelledError()
-            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+            for attempt in range(timeouts.first_frame_attempts):
+                frame_seen = False
+                try:
+                    async for frame in self._stream_response_attempt(
+                        client, encoded_request, is_cancelled
+                    ):
+                        frame_seen = True
+                        yield frame
+                    return
+                except OllamaBrokerError as exc:
+                    if (
+                        exc.code == "model_first_frame_timeout"
+                        and not frame_seen
+                        and attempt + 1 < timeouts.first_frame_attempts
+                    ):
+                        continue
+                    raise
+        finally:
+            self._broker._model_slots.release()
+
+    async def _stream_response_attempt(
+        self,
+        client: httpx.AsyncClient,
+        encoded_request: bytes,
+        is_cancelled: CancelCheck,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run one HTTP attempt with distinct first-frame, idle and total bounds."""
+
+        timeouts = self._catalog_entry.timeouts
+        loop = asyncio.get_running_loop()
+        first_frame_deadline = loop.time() + timeouts.first_frame_seconds
+        frame_seen = False
+        request_timeout = httpx.Timeout(
+            connect=3.0,
+            read=timeouts.first_frame_seconds,
+            write=5.0,
+            pool=2.0,
+        )
+        try:
+            async with asyncio.timeout(timeouts.turn_seconds):
                 async with client.stream(
                     "POST",
                     "/api/chat",
@@ -1273,6 +1328,7 @@ class OllamaRunSession:
                         "Accept": "application/x-ndjson",
                         "Content-Type": "application/json",
                     },
+                    timeout=request_timeout,
                 ) as response:
                     if response.is_redirect:
                         raise OllamaBrokerError(
@@ -1287,7 +1343,13 @@ class OllamaRunSession:
                             "Ollama returned an invalid streaming content type.",
                         )
                     seen_done = False
-                    async for frame in self._iter_ndjson(response, is_cancelled):
+                    async for frame in self._iter_ndjson(
+                        response,
+                        is_cancelled,
+                        first_frame_deadline=first_frame_deadline,
+                        stream_idle_seconds=timeouts.stream_idle_seconds,
+                    ):
+                        frame_seen = True
                         if frame.get("model") != self._qualification.model:
                             raise OllamaBrokerError(
                                 "model_protocol_error", "Ollama returned the wrong model."
@@ -1314,27 +1376,55 @@ class OllamaRunSession:
                         )
         except OllamaBrokerError:
             raise
-        except (TimeoutError, httpx.TimeoutException) as exc:
+        except httpx.ReadTimeout as exc:
             raise OllamaBrokerError(
-                "model_timeout", "The model request timed out.", retryable=True
+                (
+                    "model_stream_idle_timeout"
+                    if frame_seen
+                    else "model_first_frame_timeout"
+                ),
+                "The model stream became inactive.",
+                retryable=not frame_seen,
+            ) from exc
+        except TimeoutError as exc:
+            raise OllamaBrokerError(
+                "model_turn_deadline",
+                "The model call exceeded its total deadline.",
+                retryable=not frame_seen,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise OllamaBrokerError(
+                "model_transport_timeout",
+                "The model transport timed out.",
+                retryable=not frame_seen,
             ) from exc
         except httpx.RequestError as exc:
             raise OllamaBrokerError(
                 "model_unavailable", "The model request failed.", retryable=True
             ) from exc
-        finally:
-            self._broker._model_slots.release()
 
     async def _iter_ndjson(
-        self, response: httpx.Response, is_cancelled: CancelCheck
+        self,
+        response: httpx.Response,
+        is_cancelled: CancelCheck,
+        *,
+        first_frame_deadline: float,
+        stream_idle_seconds: float,
     ) -> AsyncIterator[dict[str, Any]]:
         iterator = response.aiter_bytes().__aiter__()
         buffered = bytearray()
         total_bytes = 0
         frame_count = 0
+        frame_deadline = first_frame_deadline
+        timeout_code = "model_first_frame_timeout"
         while True:
             try:
-                chunk = await self._next_with_cancel(iterator, is_cancelled)
+                chunk = await self._next_with_cancel(
+                    iterator,
+                    is_cancelled,
+                    deadline=frame_deadline,
+                    timeout_code=timeout_code,
+                )
             except StopAsyncIteration:
                 break
             total_bytes += len(chunk)
@@ -1357,6 +1447,10 @@ class OllamaRunSession:
                         "model_protocol_error", "Ollama stream had too many frames."
                     )
                 yield self._decode_line(line)
+                frame_deadline = (
+                    asyncio.get_running_loop().time() + stream_idle_seconds
+                )
+                timeout_code = "model_stream_idle_timeout"
             if len(buffered) > MAX_NDJSON_LINE_BYTES:
                 raise OllamaBrokerError(
                     "model_protocol_error", "An Ollama stream line was too large."
@@ -1375,7 +1469,11 @@ class OllamaRunSession:
 
     @staticmethod
     async def _next_with_cancel(
-        iterator: AsyncIterator[bytes], is_cancelled: CancelCheck
+        iterator: AsyncIterator[bytes],
+        is_cancelled: CancelCheck,
+        *,
+        deadline: float,
+        timeout_code: str,
     ) -> bytes:
         pending = asyncio.ensure_future(iterator.__anext__())
         try:
@@ -1384,8 +1482,17 @@ class OllamaRunSession:
                     pending.cancel()
                     await asyncio.gather(pending, return_exceptions=True)
                     raise OllamaCancelledError()
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
+                    raise OllamaBrokerError(
+                        timeout_code,
+                        "The model stream became inactive.",
+                        retryable=timeout_code == "model_first_frame_timeout",
+                    )
                 done, _pending = await asyncio.wait(
-                    {pending}, timeout=CANCEL_POLL_SECONDS
+                    {pending}, timeout=min(CANCEL_POLL_SECONDS, remaining)
                 )
                 if pending in done:
                     return pending.result()

@@ -27,7 +27,6 @@ from agent_builder_v2.sessions import (
     ConversationConflictError,
     ConversationNotFoundError,
 )
-from agent_builder_v2.tools import project_tool_result
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -65,31 +64,18 @@ class _FakeModelSession:
                 "tool.use",
                 {
                     "call_id": "real-broker-call",
-                    "tool_id": "builtin/echo",
-                    "arguments": {"text": user_message},
+                    "tool_id": "file/glob",
+                    "arguments": {"pattern": "**/*", "max_results": 1},
                     "usage": {"prompt_eval_count": 8, "eval_count": 2},
                 },
             )
             return
         assert len(tool_results) == 1
         result = tool_results[0]
-        echo_spec = next(
-            item for item in self.context_plan.tools if item.tool_id == "builtin/echo"
-        )
-        projection = project_tool_result(
-            echo_spec, "real-broker-call", user_message
-        )
-        assert result == OllamaToolResult(
-            call_id="real-broker-call",
-            tool_id="builtin/echo",
-            content=projection.content,
-            outcome="succeeded",
-            original_bytes=projection.original_bytes,
-            content_digest=projection.content_digest,
-            truncated=projection.truncated,
-            truncation_reason=projection.truncation_reason,
-            projection_digest=projection.projection_digest,
-        )
+        assert result.call_id == "real-broker-call"
+        assert result.tool_id == "file/glob"
+        assert result.outcome == "succeeded"
+        assert result.content
         yield OllamaFrame("content", {"text": f"broker result: {user_message}"})
         yield OllamaFrame(
             "stop",
@@ -303,6 +289,46 @@ class _BusyModelBroker(_FakeModelBroker):
         assert max_tool_calls == 2
         assert context_plan.model_profile == self.qualification.model_profile
         return _BusyModelSession(context_plan)
+
+
+class _EmptyModelSession:
+    def __init__(self, context_plan: ContextPlan) -> None:
+        self.context_plan = context_plan
+
+    async def stream_turn(
+        self,
+        _user_message: str,
+        _tool_results: tuple[OllamaToolResult, ...] = (),
+        _is_cancelled: object = None,
+        on_request: object = None,
+    ) -> object:
+        if on_request is not None:
+            await on_request(  # type: ignore[operator]
+                OllamaRequestMetadata(
+                    iteration=1,
+                    message_count=len(self.context_plan.provider_messages()),
+                    tool_count=len(self.context_plan.tools),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens,
+                    request_bytes=512,
+                    request_digest="7" * 64,
+                )
+            )
+        yield OllamaFrame(
+            "stop",
+            {
+                "reason": "end_turn",
+                "usage": {"prompt_eval_count": 1472, "eval_count": 33},
+            },
+        )
+
+
+class _EmptyModelBroker(_FakeModelBroker):
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _EmptyModelSession:
+        assert max_tool_calls == 2
+        assert context_plan.model_profile == self.qualification.model_profile
+        return _EmptyModelSession(context_plan)
 
 
 class _CancellableModelSession:
@@ -695,7 +721,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
                 "model.response.finished",
             ]
             assert model_events[0].payload["tool_result_call_ids"] == []
-            assert model_events[0].payload["tool_count"] == 9
+            assert model_events[0].payload["tool_count"] == 8
             assert model_events[0].payload["request_digest"] == "c" * 64
             assert model_events[1].payload == {
                 "request_id": "model-1",
@@ -712,7 +738,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             assert model_events[2].payload["tool_result_call_ids"] == [
                 "real-broker-call"
             ]
-            assert model_events[2].payload["tool_count"] == 9
+            assert model_events[2].payload["tool_count"] == 8
             assert model_events[3].payload["outcome"] == "end_turn"
             assert record.process is None
             assert not (
@@ -963,6 +989,74 @@ def test_control_plane_preserves_trusted_model_error_semantics(
             assert usage[0].status == "incomplete"
             assert usage[0].input_tokens is None
             assert usage[0].output_tokens is None
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_empty_model_response_fails_cleanly_and_preserves_usage(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        service = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_EmptyModelBroker(),  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            record = await service.start(
+                StartRunCommand(PROTOTYPE_AGENT_ID, "return no visible content")
+            )
+            events = [
+                event
+                async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+
+            assert [event.kind for event in events if event.kind.startswith("model.")] == [
+                "model.request.started",
+                "model.response.finished",
+            ]
+            assert events[-2].payload == {
+                "request_id": "model-1",
+                "iteration": 1,
+                "attempt": 0,
+                "recovery_id": None,
+                "provider_call_index": 1,
+                "outcome": "end_turn",
+                "input_tokens": 1472,
+                "output_tokens": 33,
+                "usage_complete": True,
+                "error_code": None,
+            }
+            assert events[-1].kind == "run.failed"
+            assert events[-1].payload == {
+                "code": "model_empty_response",
+                "message": "The trusted model broker could not complete the request.",
+                "retryable": True,
+                "usage": {
+                    "input_tokens": 1472,
+                    "output_tokens": 33,
+                    "last_input_tokens": 1472,
+                    "complete": True,
+                },
+            }
+            assert record.journal_failed is False
+            assert record.model_failure == ("model_empty_response", True)
+            restored = await service.get_conversation(record.conversation_id)
+            assert restored.turns[-1].status == "failed"
+            assert service.conversations is not None
+            journal_state = service.conversations.get_run_journal_state(record.run_id)
+            assert journal_state.availability == "full"
+            assert journal_state.terminal_kind == "run.failed"
+            assert journal_state.usage_complete is True
+            usage = service.conversations.provider_usage_for_run(record.run_id)
+            assert len(usage) == 1
+            assert usage[0].status == "complete"
+            assert usage[0].input_tokens == 1472
+            assert usage[0].output_tokens == 33
         finally:
             await service.close()
 

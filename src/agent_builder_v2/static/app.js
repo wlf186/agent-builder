@@ -180,6 +180,13 @@ const CONTEXT_SECTION_FIELDS = Object.freeze([
   "content_bytes",
   "content_digest",
 ]);
+const MODEL_ERROR_LABELS = Object.freeze({
+  model_first_frame_timeout: "等待模型首帧超时；零输出重试仍未恢复",
+  model_stream_idle_timeout: "模型已开始响应，但流式传输长时间无新帧",
+  model_turn_deadline: "模型持续响应，但单次调用超过总时限",
+  model_transport_timeout: "模型网络传输阶段超时",
+  model_busy: "本地有界模型队列等待超时",
+});
 
 const state = {
   csrfToken: null,
@@ -204,6 +211,10 @@ const state = {
   settling: false,
   mutationPending: false,
   conversationMessages: [],
+  conversationFollowLatest: true,
+  conversationScrollTimer: null,
+  sessionContextUsage: null,
+  sessionTurnUsage: null,
   blocks: new Map(),
   liveAssistantContent: null,
   liveAssistantMessage: null,
@@ -222,12 +233,21 @@ const state = {
 const elements = {
   statusDot: document.querySelector("#status-dot"),
   statusText: document.querySelector("#status-text"),
+  composerStatus: document.querySelector("#composer-status"),
   loginPanel: document.querySelector("#login-panel"),
   loginForm: document.querySelector("#login-form"),
   loginError: document.querySelector("#login-error"),
   tokenInput: document.querySelector("#token-input"),
   logoutButton: document.querySelector("#logout-button"),
   workspace: document.querySelector("#workspace"),
+  navigationRail: document.querySelector("#navigation-rail"),
+  navigationToggle: document.querySelector("#navigation-toggle"),
+  navigationClose: document.querySelector("#navigation-close"),
+  workspaceBackdrop: document.querySelector("#workspace-backdrop"),
+  runtimeInspectorButton: document.querySelector("#runtime-inspector-button"),
+  runtimeInspectorClose: document.querySelector("#runtime-inspector-close"),
+  runtimeEventBadge: document.querySelector("#runtime-event-badge"),
+  replayWorkbench: document.querySelector("#replay-workbench"),
   agentId: document.querySelector("#agent-id"),
   activeAgentTitle: document.querySelector("#active-agent-title"),
   agentDrawer: document.querySelector("#agent-drawer"),
@@ -263,6 +283,15 @@ const elements = {
   runId: document.querySelector("#run-id"),
   conversationMessages: document.querySelector("#conversation-messages"),
   conversationEmpty: document.querySelector("#conversation-empty"),
+  conversationLatestButton: document.querySelector("#conversation-latest-button"),
+  contextUsage: document.querySelector("#context-usage"),
+  contextUsageLabel: document.querySelector("#context-usage-label"),
+  contextUsageValue: document.querySelector("#context-usage-value"),
+  contextUsageMeter: document.querySelector("#context-usage-meter"),
+  contextUsageFill: document.querySelector("#context-usage-fill"),
+  contextUsageDetail: document.querySelector("#context-usage-detail"),
+  turnTokenUsageLabel: document.querySelector("#turn-token-usage-label"),
+  turnTokenUsageValue: document.querySelector("#turn-token-usage-value"),
   subagentPanel: document.querySelector("#subagent-panel"),
   subagentList: document.querySelector("#subagent-list"),
   eventList: document.querySelector("#event-list"),
@@ -295,6 +324,326 @@ const elements = {
 
 function setStatus(message) {
   elements.statusText.textContent = message;
+  elements.composerStatus.textContent = message;
+}
+
+function narrowWorkspace() {
+  return window.matchMedia("(max-width: 860px)").matches;
+}
+
+function setRuntimeInspector(open, { focus = false } = {}) {
+  const next = Boolean(open);
+  elements.workspace.classList.toggle("runtime-open", next);
+  elements.runtimeInspectorButton.setAttribute("aria-expanded", String(next));
+  elements.replayWorkbench.setAttribute("aria-hidden", String(!next));
+  elements.replayWorkbench.inert = !next;
+  if (next) {
+    elements.workspace.classList.remove("navigation-open");
+    if (focus) elements.runtimeInspectorClose.focus();
+  } else if (focus) {
+    elements.runtimeInspectorButton.focus();
+  }
+}
+
+function setNavigation(open) {
+  if (narrowWorkspace()) {
+    elements.workspace.classList.toggle("navigation-open", Boolean(open));
+    elements.navigationToggle.setAttribute("aria-expanded", String(Boolean(open)));
+    if (open) setRuntimeInspector(false);
+    return;
+  }
+  elements.workspace.classList.toggle("sidebar-collapsed", !open);
+  elements.navigationToggle.setAttribute("aria-expanded", String(Boolean(open)));
+}
+
+function closeNavigationOnNarrowScreen() {
+  if (narrowWorkspace()) setNavigation(false);
+}
+
+function resizeComposer() {
+  elements.messageInput.style.height = "auto";
+  elements.messageInput.style.height = `${Math.min(elements.messageInput.scrollHeight, 192)}px`;
+}
+
+function conversationIsNearLatest() {
+  const remaining = (
+    elements.conversationMessages.scrollHeight -
+    elements.conversationMessages.scrollTop -
+    elements.conversationMessages.clientHeight
+  );
+  return remaining <= 96;
+}
+
+function updateConversationLatestControl() {
+  elements.conversationLatestButton.hidden = (
+    state.conversationMessages.length === 0 || state.conversationFollowLatest
+  );
+}
+
+function scheduleConversationLatest({ force = false } = {}) {
+  if (force) state.conversationFollowLatest = true;
+  if (!state.conversationFollowLatest) {
+    updateConversationLatestControl();
+    return;
+  }
+  const scroll = () => {
+    state.conversationScrollTimer = null;
+    elements.conversationMessages.scrollTop = elements.conversationMessages.scrollHeight;
+    state.conversationFollowLatest = true;
+    updateConversationLatestControl();
+  };
+  if (force) {
+    if (state.conversationScrollTimer !== null) {
+      window.clearTimeout(state.conversationScrollTimer);
+      state.conversationScrollTimer = null;
+    }
+    scroll();
+  } else if (state.conversationScrollTimer === null) {
+    state.conversationScrollTimer = window.setTimeout(scroll, 0);
+  }
+}
+
+function selectedModel() {
+  return state.models.find((model) => model.model_id === state.selectedModelId) || null;
+}
+
+function latestConversationRunId() {
+  return state.timelineRuns.filter((run) => run.kind !== "subagent").at(-1)?.runId || null;
+}
+
+function formatTokens(value) {
+  return new Intl.NumberFormat("zh-CN").format(value);
+}
+
+function renderSessionContextUsage() {
+  const plan = state.sessionContextUsage;
+  const usage = state.sessionTurnUsage;
+  const fallbackModel = selectedModel();
+  const total = plan?.totalTokens || fallbackModel?.operational_context_tokens || null;
+  const modelId = plan?.modelId || fallbackModel?.model_id || null;
+  elements.contextUsageLabel.textContent = modelId
+    ? `下一条消息预算 · ${modelId}`
+    : "下一条消息预算";
+  const providerProjectionAvailable = (
+    plan && usage && usage.runId === plan.runId &&
+    usage.terminalKind === "run.completed" && usage.complete &&
+    Number.isSafeInteger(usage.firstInputTokens) && usage.firstInputTokens >= 0 &&
+    Number.isSafeInteger(usage.finalOutputTokens) && usage.finalOutputTokens >= 0
+  );
+  if (!providerProjectionAvailable || !total) {
+    elements.contextUsageValue.textContent = "等待上一轮 Provider 结算";
+    elements.contextUsageDetail.textContent = plan
+      ? (
+        `窗口 ${formatTokens(total)} · 自动压缩阈值 ${formatTokens(plan.compactAtTokens)} · ` +
+        `硬输入上限 ${formatTokens(plan.inputBudgetTokens)}`
+      )
+      : "发送并完成一轮对话后，将使用 Provider 实际 token 推导。";
+    elements.contextUsageMeter.setAttribute(
+      "aria-valuemax",
+      String(plan?.compactAtTokens || total || 100),
+    );
+    elements.contextUsageMeter.setAttribute("aria-valuenow", "0");
+    elements.contextUsageMeter.setAttribute("aria-valuetext", elements.contextUsageValue.textContent);
+    elements.contextUsageFill.style.width = "0%";
+    elements.contextUsage.dataset.level = "empty";
+    elements.contextUsage.title = (
+      "下一轮尚未实际提交，Provider 无法精确计数；完成一轮后会用其实际 usage 推导。"
+    );
+    return;
+  }
+  const projectedTokens = usage.firstInputTokens + usage.finalOutputTokens;
+  const compactRemaining = Math.max(0, plan.compactAtTokens - projectedTokens);
+  const hardRemaining = Math.max(0, plan.inputBudgetTokens - projectedTokens);
+  const percent = Math.min(100, (projectedTokens / plan.compactAtTokens) * 100);
+  const percentText = percent < 10 ? percent.toFixed(1) : Math.round(percent).toString();
+  elements.contextUsageValue.textContent = (
+    compactRemaining > 0
+      ? `触发压缩前约可写 ${formatTokens(compactRemaining)} tokens`
+      : "下一条消息将触发压缩"
+  );
+  elements.contextUsageDetail.textContent = (
+    `Provider 实测推导占用约 ${formatTokens(projectedTokens)} / ${formatTokens(total)} · ` +
+    `首次完整请求 ${formatTokens(usage.firstInputTokens)} in + ` +
+    `最终回答 ${formatTokens(usage.finalOutputTokens)} out · ` +
+    `硬输入余量约 ${formatTokens(hardRemaining)} · 压缩阈值占用 ${percentText}%`
+  );
+  elements.contextUsageMeter.setAttribute("aria-valuemax", String(plan.compactAtTokens));
+  elements.contextUsageMeter.setAttribute(
+    "aria-valuenow",
+    String(Math.min(projectedTokens, plan.compactAtTokens)),
+  );
+  elements.contextUsageMeter.setAttribute("aria-valuetext", elements.contextUsageValue.textContent);
+  elements.contextUsageFill.style.width = `${percent}%`;
+  elements.contextUsage.dataset.level = percent >= 90
+    ? "critical"
+    : percent >= 75 ? "warning" : "normal";
+  elements.contextUsage.title = (
+    "下轮基线取上一轮第一次完整 ToolSet 请求的实际 input，加最终回答调用的实际 output；" +
+    "中间 Tool 调用及其重复读取只计入本轮累计用量，不叠加为持久会话上下文；" +
+    "下轮消息和模板尚未送入 Provider，因此这是实际 usage 推导值，不是精确预先计数。"
+  );
+}
+
+function renderSessionTurnUsage() {
+  const usage = state.sessionTurnUsage;
+  elements.turnTokenUsageLabel.textContent = usage?.terminalKind
+    ? "上一轮 Provider 实际用量"
+    : "本轮 Provider 实际用量";
+  if (!usage || !usage.hasUsage) {
+    elements.turnTokenUsageValue.textContent = "等待模型响应";
+    elements.turnTokenUsageValue.title = (
+      "Ollama 在每次模型响应结束时返回实际 input/output token，用量不会按流式文本逐 token 估算。"
+    );
+    return;
+  }
+  const total = usage.inputTokens + usage.outputTokens;
+  const accounting = usage.terminalKind
+    ? (usage.complete ? "已结算" : "部分统计")
+    : "响应中";
+  elements.turnTokenUsageValue.textContent = (
+    `${formatTokens(total)} total · ${formatTokens(usage.inputTokens)} in + ` +
+    `${formatTokens(usage.outputTokens)} out · ${accounting}`
+  );
+  elements.turnTokenUsageValue.title = (
+    "本轮所有已完成模型调用的实际供应商用量；Tool 循环会重复计算共享上下文，" +
+    "因此这是计算量/成本辅助信息，不是下一轮上下文占用。"
+  );
+}
+
+function clearSessionContextUsage() {
+  state.sessionContextUsage = null;
+  state.sessionTurnUsage = null;
+  renderSessionContextUsage();
+  renderSessionTurnUsage();
+}
+
+function captureSessionContextUsage(envelope) {
+  if (
+    envelope?.kind !== "run.started" || envelope.agent_id !== state.agentId ||
+    envelope.conversation_id !== state.sessionId ||
+    envelope.run_id !== latestConversationRunId()
+  ) {
+    return;
+  }
+  const plan = envelope.payload?.context_plan;
+  const modelId = envelope.payload?.model_id || envelope.payload?.model;
+  if (
+    !plan || typeof plan !== "object" || Array.isArray(plan) ||
+    typeof modelId !== "string" || !MODEL_ID_PATTERN.test(modelId) ||
+    !Number.isSafeInteger(plan.estimated_input_tokens) || plan.estimated_input_tokens < 0 ||
+    !Number.isSafeInteger(plan.operational_context_tokens) ||
+    plan.operational_context_tokens < 2048 ||
+    !Number.isSafeInteger(plan.input_budget_tokens) ||
+    plan.input_budget_tokens < 0 || plan.input_budget_tokens > plan.operational_context_tokens ||
+    !Number.isSafeInteger(plan.compact_at_tokens) ||
+    plan.compact_at_tokens < 0 || plan.compact_at_tokens > plan.input_budget_tokens ||
+    plan.estimated_input_tokens > plan.input_budget_tokens
+  ) {
+    return;
+  }
+  state.sessionContextUsage = {
+    runId: envelope.run_id,
+    modelId,
+    usedTokens: plan.estimated_input_tokens,
+    totalTokens: plan.operational_context_tokens,
+    inputBudgetTokens: plan.input_budget_tokens,
+    compactAtTokens: plan.compact_at_tokens,
+  };
+  state.sessionTurnUsage = {
+    runId: envelope.run_id,
+    inputTokens: 0,
+    outputTokens: 0,
+    complete: true,
+    hasUsage: false,
+    terminalKind: null,
+    firstInputTokens: null,
+    finalOutputTokens: null,
+    providerResponseCount: 0,
+    seenEventIds: new Set(),
+  };
+  renderSessionContextUsage();
+  renderSessionTurnUsage();
+}
+
+function captureSessionTurnUsage(envelope) {
+  if (
+    !envelope || envelope.agent_id !== state.agentId ||
+    envelope.conversation_id !== state.sessionId ||
+    envelope.run_id !== latestConversationRunId() ||
+    !["model.response.finished", "run.completed", "run.failed", "run.cancelled"].includes(
+      envelope.kind,
+    )
+  ) {
+    return;
+  }
+  let usage = state.sessionTurnUsage;
+  if (!usage || usage.runId !== envelope.run_id) {
+    usage = {
+      runId: envelope.run_id,
+      inputTokens: 0,
+      outputTokens: 0,
+      complete: true,
+      hasUsage: false,
+      terminalKind: null,
+      firstInputTokens: null,
+      finalOutputTokens: null,
+      providerResponseCount: 0,
+      seenEventIds: new Set(),
+    };
+    state.sessionTurnUsage = usage;
+  }
+  if (envelope.kind === "model.response.finished") {
+    const payload = envelope.payload;
+    const eventIdentity = typeof envelope.event_id === "string"
+      ? envelope.event_id
+      : `${envelope.run_id}:${envelope.seq}`;
+    if (
+      usage.seenEventIds.has(eventIdentity) || !payload ||
+      !Number.isSafeInteger(payload.input_tokens) || payload.input_tokens < 0 ||
+      !Number.isSafeInteger(payload.output_tokens) || payload.output_tokens < 0 ||
+      typeof payload.usage_complete !== "boolean"
+    ) {
+      return;
+    }
+    usage.seenEventIds.add(eventIdentity);
+    usage.inputTokens += payload.input_tokens;
+    usage.outputTokens += payload.output_tokens;
+    if (!Number.isSafeInteger(usage.firstInputTokens)) {
+      usage.firstInputTokens = payload.input_tokens;
+    }
+    usage.finalOutputTokens = payload.output_tokens;
+    usage.providerResponseCount += 1;
+    usage.complete = usage.complete && payload.usage_complete;
+    usage.hasUsage = true;
+  } else {
+    const aggregate = envelope.payload?.usage;
+    if (
+      !aggregate || typeof aggregate !== "object" || Array.isArray(aggregate) ||
+      !Number.isSafeInteger(aggregate.input_tokens) || aggregate.input_tokens < 0 ||
+      !Number.isSafeInteger(aggregate.output_tokens) || aggregate.output_tokens < 0 ||
+      !Number.isSafeInteger(aggregate.last_input_tokens) || aggregate.last_input_tokens < 0 ||
+      typeof aggregate.complete !== "boolean"
+    ) {
+      return;
+    }
+    usage.inputTokens = aggregate.input_tokens;
+    usage.outputTokens = aggregate.output_tokens;
+    if (
+      usage.providerResponseCount === 0 &&
+      aggregate.input_tokens === aggregate.last_input_tokens
+    ) {
+      // A snapshot-only single-call Run has no intermediate Tool loop, so the
+      // aggregate also describes the first request and final answer.
+      usage.firstInputTokens = aggregate.last_input_tokens;
+      usage.finalOutputTokens = aggregate.output_tokens;
+      usage.providerResponseCount = 1;
+    }
+    usage.complete = aggregate.complete;
+    usage.hasUsage = true;
+    usage.terminalKind = envelope.kind;
+  }
+  renderSessionContextUsage();
+  renderSessionTurnUsage();
 }
 
 function sessionIsActive(session) {
@@ -403,12 +752,18 @@ function setRunControls() {
 }
 
 function clearConversation() {
+  if (state.conversationScrollTimer !== null) {
+    window.clearTimeout(state.conversationScrollTimer);
+    state.conversationScrollTimer = null;
+  }
   state.blocks.clear();
   state.liveAssistantContent = null;
   state.liveAssistantMessage = null;
   state.conversationMessages = [];
+  state.conversationFollowLatest = true;
   elements.conversationMessages.replaceChildren();
   elements.conversationEmpty.hidden = false;
+  updateConversationLatestControl();
   state.subagents = [];
   elements.subagentList.replaceChildren();
   elements.subagentPanel.hidden = true;
@@ -448,6 +803,7 @@ function clearSelectedSession({ preserveTimeline = false } = {}) {
   elements.activeSessionTitle.textContent = "请选择一个会话";
   elements.sessionId.textContent = "未选择";
   clearConversation();
+  clearSessionContextUsage();
   if (!preserveTimeline) clearTimeline();
   setRunControls();
 }
@@ -468,6 +824,8 @@ function setAuthenticated(session) {
   elements.loginPanel.hidden = true;
   elements.workspace.hidden = false;
   elements.logoutButton.hidden = false;
+  setNavigation(!narrowWorkspace());
+  setRuntimeInspector(false);
 }
 
 function setUnauthenticated(message = "尚未认证") {
@@ -489,6 +847,8 @@ function setUnauthenticated(message = "尚未认证") {
   setStatus(message);
   elements.loginPanel.hidden = false;
   elements.workspace.hidden = true;
+  setRuntimeInspector(false);
+  elements.workspace.classList.remove("navigation-open");
   elements.logoutButton.hidden = true;
   elements.sessionList.replaceChildren();
   elements.agentList.replaceChildren();
@@ -538,7 +898,7 @@ function normalizeAgent(value) {
     typeof value.display_name !== "string" || !value.display_name.trim() ||
     new TextEncoder().encode(value.display_name).length > 128 ||
     !Number.isSafeInteger(value.generation) || value.generation < 1 ||
-    !["provisioning", "active", "upgrading", "deleting"].includes(value.state) ||
+    !["provisioning", "active", "renaming", "upgrading", "deleting"].includes(value.state) ||
     typeof value.created_at !== "string" || typeof value.updated_at !== "string"
   ) {
     return null;
@@ -584,7 +944,7 @@ function renderAgentList() {
     const identity = document.createElement("span");
     identity.textContent = agent.agent_id;
     const generation = document.createElement("span");
-    generation.textContent = `generation ${agent.generation}`;
+    generation.textContent = `运行环境 v${agent.generation}`;
     metadata.append(identity, generation);
 
     const actions = document.createElement("div");
@@ -599,21 +959,39 @@ function renderAgentList() {
       actions.append(select);
     }
     if (!system) {
-      const upgrade = document.createElement("button");
-      upgrade.type = "button";
-      upgrade.className = "quiet agent-upgrade";
-      upgrade.textContent = "重命名 / 升级";
-      upgrade.dataset.agentState = agent.state;
-      upgrade.addEventListener("click", () => void upgradeAgent(agent));
+      const rename = document.createElement("button");
+      rename.type = "button";
+      rename.className = "quiet agent-rename";
+      rename.textContent = "重命名";
+      rename.dataset.agentState = agent.state;
+      rename.addEventListener("click", () => void renameAgent(agent));
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "danger agent-delete";
       remove.textContent = "删除";
       remove.dataset.agentState = agent.state;
       remove.addEventListener("click", () => void deleteAgent(agent));
-      actions.append(upgrade, remove);
+      actions.append(rename, remove);
+
+      const advanced = document.createElement("details");
+      advanced.className = "agent-advanced";
+      const advancedSummary = document.createElement("summary");
+      advancedSummary.textContent = "高级操作";
+      const advancedCopy = document.createElement("p");
+      advancedCopy.textContent = (
+        "仅在 Agent 指令、基础运行环境或安全策略发生实质变化时重建运行代。"
+      );
+      const upgrade = document.createElement("button");
+      upgrade.type = "button";
+      upgrade.className = "quiet agent-upgrade";
+      upgrade.textContent = "重建运行环境";
+      upgrade.dataset.agentState = agent.state;
+      upgrade.addEventListener("click", () => void upgradeAgent(agent));
+      advanced.append(advancedSummary, advancedCopy, upgrade);
+      item.append(heading, metadata, actions, advanced);
+    } else {
+      item.append(heading, metadata, actions);
     }
-    item.append(heading, metadata, actions);
     elements.agentList.append(item);
   }
   setRunControls();
@@ -788,6 +1166,50 @@ async function createAgent(displayName) {
   }
 }
 
+async function renameAgent(agent) {
+  if (
+    agent.agent_id === SYSTEM_AGENT_ID || agent.state !== "active" ||
+    state.settling || state.mutationPending || state.activeRun !== null
+  ) {
+    return;
+  }
+  const displayName = window.prompt("输入新的 Agent 名称", agent.display_name);
+  if (displayName === null) return;
+  const normalizedName = displayName.trim();
+  if (!validAgentDisplayName(normalizedName)) {
+    setStatus("Agent 名称必须为 1–128 UTF-8 bytes");
+    return;
+  }
+  if (normalizedName === agent.display_name) {
+    setStatus("Agent 名称没有变化");
+    return;
+  }
+  state.mutationPending = true;
+  setRunControls();
+  try {
+    const response = await api(
+      `/api/agents/${encodeURIComponent(agent.agent_id)}`,
+      { method: "PATCH", body: JSON.stringify({ display_name: normalizedName }) },
+    );
+    const renamed = normalizeAgent(await response.json());
+    if (!renamed || renamed.state !== "active") throw new Error("Agent 重命名响应格式无效");
+    if (renamed.generation !== agent.generation) {
+      throw new Error("Agent 重命名意外改变了运行代");
+    }
+    state.agents = state.agents.map((item) => (
+      item.agent_id === renamed.agent_id ? renamed : item
+    ));
+    if (renamed.agent_id === state.agentId) setAgentIdentity(renamed);
+    renderAgentList();
+    setStatus(`Agent 已重命名为“${renamed.display_name}”；运行环境未重建`);
+  } catch (error) {
+    if (state.csrfToken !== null) setStatus(error.message);
+  } finally {
+    state.mutationPending = false;
+    setRunControls();
+  }
+}
+
 async function upgradeAgent(agent) {
   if (
     agent.agent_id === SYSTEM_AGENT_ID || agent.state !== "active" ||
@@ -795,30 +1217,29 @@ async function upgradeAgent(agent) {
   ) {
     return;
   }
-  const displayName = window.prompt("输入升级后的 Agent 名称", agent.display_name);
-  if (displayName === null) return;
-  if (!validAgentDisplayName(displayName)) {
-    setStatus("Agent 名称必须为 1–128 UTF-8 bytes");
-    return;
-  }
-  if (!window.confirm(`确定升级“${agent.display_name}”并切换到新的 generation 吗？`)) return;
+  const nextGeneration = agent.generation + 1;
+  if (!window.confirm(
+    `确定重建“${agent.display_name}”的运行环境吗？\n\n` +
+    `运行代将从 ${agent.generation} 升至 ${nextGeneration}。该操作会排空当前运行时并重建 ` +
+    "Worker 虚拟环境；会话、工作区、Skills 和持久依赖会保留。普通重命名不需要执行此操作。",
+  )) return;
   state.mutationPending = true;
   setRunControls();
   try {
     const response = await api(
       `/api/agents/${encodeURIComponent(agent.agent_id)}/upgrade`,
-      { method: "POST", body: JSON.stringify({ display_name: displayName.trim() }) },
+      { method: "POST", body: JSON.stringify({}) },
     );
     const upgraded = normalizeAgent(await response.json());
     if (!upgraded || upgraded.state !== "active") throw new Error("Agent 升级响应格式无效");
     if (agent.agent_id === state.agentId) {
       await loadAgentSurface(
         state.agentId,
-        `Agent 已升级到 generation ${upgraded.generation}`,
+        `Agent 运行环境已重建为 generation ${upgraded.generation}`,
       );
     } else {
       await refreshAgents(state.agentId);
-      setStatus(`Agent 已升级到 generation ${upgraded.generation}`);
+      setStatus(`Agent 运行环境已重建为 generation ${upgraded.generation}`);
     }
   } catch (error) {
     if (state.csrfToken !== null) setStatus(error.message);
@@ -988,6 +1409,7 @@ async function executeSlashCommand(sessionId, command) {
   }
   if (value.ui_effect.compact_next_turn === true) elements.compactInput.checked = true;
   elements.messageInput.value = "";
+  resizeComposer();
   if (value.ui_effect.conversation_deleted === true) {
     clearSelectedSession();
     await refreshSessions(null);
@@ -1036,6 +1458,7 @@ async function refreshModels() {
     elements.modelSelect.append(option);
   }
   elements.modelSelect.value = state.selectedModelId;
+  renderSessionContextUsage();
   setRunControls();
 }
 
@@ -1092,6 +1515,7 @@ function renderSessionList() {
     selectButton.append(title, meta, marker);
     selectButton.addEventListener("click", () => {
       void selectSession(session.session_id);
+      closeNavigationOnNarrowScreen();
     });
 
     const deleteButton = document.createElement("button");
@@ -1237,6 +1661,7 @@ function renderConversationTurns() {
     elements.conversationMessages.append(card);
   }
   syncSelectedTurn(false);
+  scheduleConversationLatest();
 }
 
 function appendMessage(role, content, metadata = {}) {
@@ -1251,6 +1676,7 @@ function appendMessage(role, content, metadata = {}) {
     live: metadata.live === true,
   });
   if (!record) return null;
+  if (record.role === "user") state.conversationFollowLatest = true;
   state.conversationMessages.push(record);
   if (metadata.live === true && record.role === "assistant") {
     state.liveAssistantMessage = record;
@@ -1271,6 +1697,7 @@ function renderMessages(messages) {
     .filter((message) => message !== null);
   renderConversationTurns();
   renderTimelineEntries();
+  scheduleConversationLatest();
 }
 
 function syncSelectedTurn(scrollTurn = false) {
@@ -1289,6 +1716,7 @@ function syncSelectedTurn(scrollTurn = false) {
 async function selectRunFromTurn(runId) {
   if (!RUN_ID_PATTERN.test(runId)) return;
   await selectTimelineRun(runId, { scrollTurn: false });
+  setRuntimeInspector(true, { focus: true });
 }
 
 function runningRunId(messages) {
@@ -1647,6 +2075,8 @@ async function selectSession(
   state.timelineRequest += 1;
   state.sessionId = sessionId;
   if (previousSessionId !== sessionId) {
+    state.conversationFollowLatest = true;
+    clearSessionContextUsage();
     state.timelineRuns = [];
     setSelectedTimelineRunId(null);
     state.timelineEntriesByRun.clear();
@@ -2222,6 +2652,77 @@ elements.logoutButton.addEventListener("click", async () => {
 
 elements.newSessionButton.addEventListener("click", () => {
   void createSession();
+  closeNavigationOnNarrowScreen();
+});
+
+elements.navigationToggle.addEventListener("click", () => {
+  const open = narrowWorkspace()
+    ? !elements.workspace.classList.contains("navigation-open")
+    : elements.workspace.classList.contains("sidebar-collapsed");
+  setNavigation(open);
+});
+
+elements.navigationClose.addEventListener("click", () => setNavigation(false));
+
+elements.runtimeInspectorButton.addEventListener("click", () => {
+  setRuntimeInspector(!elements.workspace.classList.contains("runtime-open"), { focus: true });
+});
+
+elements.runtimeInspectorClose.addEventListener("click", () => {
+  setRuntimeInspector(false, { focus: true });
+});
+
+elements.workspaceBackdrop.addEventListener("click", () => {
+  setRuntimeInspector(false);
+  setNavigation(false);
+  elements.navigationToggle.focus();
+});
+
+for (const suggestion of document.querySelectorAll("[data-prompt-suggestion]")) {
+  suggestion.addEventListener("click", () => {
+    if (elements.messageInput.disabled) return;
+    elements.messageInput.value = suggestion.dataset.promptSuggestion || "";
+    resizeComposer();
+    elements.messageInput.focus();
+  });
+}
+
+elements.messageInput.addEventListener("input", resizeComposer);
+elements.messageInput.addEventListener("keydown", (event) => {
+  if (
+    event.key !== "Enter" || event.shiftKey || event.isComposing ||
+    elements.runButton.disabled
+  ) {
+    return;
+  }
+  event.preventDefault();
+  elements.runForm.requestSubmit();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (elements.workspace.classList.contains("runtime-open")) {
+    setRuntimeInspector(false, { focus: true });
+  } else if (elements.workspace.classList.contains("navigation-open")) {
+    setNavigation(false);
+    elements.navigationToggle.focus();
+  }
+});
+
+window.addEventListener("resize", () => {
+  if (narrowWorkspace()) {
+    elements.workspace.classList.remove("sidebar-collapsed");
+    elements.navigationToggle.setAttribute(
+      "aria-expanded",
+      String(elements.workspace.classList.contains("navigation-open")),
+    );
+  } else {
+    elements.workspace.classList.remove("navigation-open");
+    elements.navigationToggle.setAttribute(
+      "aria-expanded",
+      String(!elements.workspace.classList.contains("sidebar-collapsed")),
+    );
+  }
 });
 
 elements.newAgentForm.addEventListener("submit", (event) => {
@@ -2605,7 +3106,9 @@ function eventBusinessBody(entry) {
   } else if (kind === "model.request.started") {
     eventBody = "模型原始请求正文按协议未持久化；这里只存在边界元数据和摘要。";
   } else if (kind === "model.response.finished") {
-    eventBody = "模型供应商原始响应正文按协议未持久化；智能体正文来自规范 assistant 事件。";
+    eventBody = payload?.error_code && MODEL_ERROR_LABELS[payload.error_code]
+      ? `模型失败阶段：${MODEL_ERROR_LABELS[payload.error_code]}`
+      : "模型供应商原始响应正文按协议未持久化；智能体正文来自规范 assistant 事件。";
   } else if (["stream.gap", "stream.snapshot"].includes(kind)) {
     eventBody = "这是 Replay control，不是 Run 业务消息，也不是模型报文。";
   }
@@ -2777,12 +3280,15 @@ function renderTimelineEntries() {
   });
   state.eventCount = state.timelineEntries.length;
   elements.eventCount.textContent = `${state.eventCount} events${selectedRunTurnFact() ? " · 1 Turn fact" : ""}`;
+  elements.runtimeEventBadge.textContent = String(state.eventCount);
   const selected = entries.find((entry) => entry.key === state.selectedTimelineEntryKey) || null;
   renderEventInspector(selected);
   setReplayControls();
 }
 
 function addTimelineEvent(envelope) {
+  captureSessionContextUsage(envelope);
+  captureSessionTurnUsage(envelope);
   const serial = state.timelineEntrySerial;
   state.timelineEntrySerial += 1;
   const eventIdentity = typeof envelope.event_id === "string" && envelope.event_id
@@ -2933,7 +3439,12 @@ function renderEnvelope(envelope, runContext) {
   runContext.lastSeq = envelope.seq;
   addTimelineEvent(envelope);
   const payload = envelope.payload || {};
-  if (envelope.kind === "assistant.block.started") {
+  if (envelope.kind === "model.request.started") {
+    setStatus("模型请求已提交，正在等待首个响应帧…");
+  } else if (envelope.kind === "model.response.finished" && payload.error_code) {
+    setStatus(MODEL_ERROR_LABELS[payload.error_code] || `模型调用失败：${payload.error_code}`);
+  } else if (envelope.kind === "assistant.block.started") {
+    setStatus("模型正在流式生成回答…");
     const block = document.createElement("div");
     block.className = "assistant-block";
     block.dataset.blockId = payload.block_id;
@@ -2961,6 +3472,7 @@ function renderEnvelope(envelope, runContext) {
     syncLiveAssistantMessage();
   }
   if (envelope.kind.startsWith("assistant.block.")) {
+    scheduleConversationLatest();
     const selected = timelineEntriesForCurrentRun()
       .find((entry) => entry.key === state.selectedTimelineEntryKey) || null;
     renderEventInspector(selected);
@@ -2969,6 +3481,7 @@ function renderEnvelope(envelope, runContext) {
   if (TERMINAL_EVENTS.has(envelope.kind)) {
     runContext.terminalSeen = true;
     runContext.terminalKind = envelope.kind;
+    runContext.terminalPayload = payload;
     updateTimelineRunTerminalStatus(runContext.runId, envelope.kind);
     setRunControls();
   }
@@ -3115,7 +3628,13 @@ function completeRunContext(runContext, refreshFailed, summariesRefreshed) {
     "run.cancelled": "Run 已取消",
   };
   const suffix = refreshFailed ? "；会话刷新失败，当前事件时间线已保留" : "";
-  setStatus(`${terminalStatus[runContext.terminalKind] || "Run 已结束"}${suffix}`);
+  const failureCode = runContext.terminalPayload?.code;
+  const failureDetail = runContext.terminalKind === "run.failed" && failureCode
+    ? `：${MODEL_ERROR_LABELS[failureCode] || failureCode}`
+    : "";
+  setStatus(
+    `${terminalStatus[runContext.terminalKind] || "Run 已结束"}${failureDetail}${suffix}`,
+  );
   if (
     summariesRefreshed && state.sessionId === runContext.sessionId &&
     sessionIsActive(selectedSession())
@@ -3211,9 +3730,20 @@ elements.modelSelect.addEventListener("change", () => {
   const candidate = elements.modelSelect.value;
   if (state.models.some((item) => item.model_id === candidate)) {
     state.selectedModelId = candidate;
+    renderSessionContextUsage();
   } else {
     elements.modelSelect.value = state.selectedModelId || "";
   }
+});
+
+elements.conversationMessages.addEventListener("scroll", () => {
+  state.conversationFollowLatest = conversationIsNearLatest();
+  updateConversationLatestControl();
+}, { passive: true });
+
+elements.conversationLatestButton.addEventListener("click", () => {
+  scheduleConversationLatest({ force: true });
+  elements.conversationMessages.focus({ preventScroll: true });
 });
 
 elements.runForm.addEventListener("submit", async (event) => {
@@ -3288,6 +3818,7 @@ elements.runForm.addEventListener("submit", async (event) => {
     elements.compactInput.checked = false;
     state.liveAssistantContent = null;
     elements.messageInput.value = "";
+    resizeComposer();
     appendMessage("user", message, { runId: run.run_id, turnStatus: "running" });
     registerTimelineRun(run.run_id, "running");
     clearTimeline(run.run_id);

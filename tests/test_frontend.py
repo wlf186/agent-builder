@@ -33,6 +33,95 @@ def test_session_ui_exposes_create_restore_delete_and_multiturn_surfaces() -> No
     assert "preserveTimeline: true" in SCRIPT
 
 
+def test_conversation_first_workspace_keeps_operations_available_on_demand() -> None:
+    required_ids = {
+        "navigation-rail",
+        "navigation-toggle",
+        "navigation-close",
+        "runtime-inspector-button",
+        "runtime-inspector-close",
+        "runtime-event-badge",
+        "workspace-backdrop",
+        "replay-workbench",
+        "composer-status",
+    }
+    html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
+
+    assert required_ids <= html_ids
+    assert 'class="primary-workspace"' in INDEX
+    assert 'data-prompt-suggestion=' in INDEX
+    assert 'aria-keyshortcuts="Enter"' in INDEX
+    assert "function setRuntimeInspector" in SCRIPT
+    assert 'elements.replayWorkbench.inert = !next' in SCRIPT
+    assert 'setRuntimeInspector(true, { focus: true })' in _function_body(
+        "selectRunFromTurn"
+    )
+    assert 'event.key !== "Enter" || event.shiftKey || event.isComposing' in SCRIPT
+    assert "elements.runForm.requestSubmit()" in SCRIPT
+    assert "elements.composerStatus.textContent = message" in SCRIPT
+    assert ".workspace.runtime-open .replay-workbench" in STYLES
+    assert "@media (max-width: 860px)" in STYLES
+
+
+def test_conversation_follows_latest_and_projects_trusted_context_usage() -> None:
+    required_ids = {
+        "conversation-latest-button",
+        "context-usage",
+        "context-usage-label",
+        "context-usage-value",
+        "context-usage-meter",
+        "context-usage-fill",
+        "context-usage-detail",
+        "turn-token-usage-label",
+        "turn-token-usage-value",
+    }
+    html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
+
+    assert required_ids <= html_ids
+    assert 'id="conversation-messages"' in INDEX
+    assert 'tabindex="0"' in INDEX
+    assert "function conversationIsNearLatest" in SCRIPT
+    assert "function scheduleConversationLatest" in SCRIPT
+    assert "elements.conversationMessages.scrollTop =" in SCRIPT
+    assert "elements.conversationMessages.scrollHeight" in SCRIPT
+    assert "scroll-behavior: auto" in STYLES
+    assert "function captureSessionContextUsage" in SCRIPT
+    assert "function captureSessionTurnUsage" in SCRIPT
+    assert 'envelope?.kind !== "run.started"' in SCRIPT
+    assert "plan.estimated_input_tokens" in SCRIPT
+    assert "plan.operational_context_tokens" in SCRIPT
+    assert "plan.compact_at_tokens" in SCRIPT
+    assert 'envelope.kind === "model.response.finished"' in SCRIPT
+    assert "payload.input_tokens" in SCRIPT
+    assert "payload.output_tokens" in SCRIPT
+    assert "aggregate.last_input_tokens" in SCRIPT
+    assert "usage.firstInputTokens + usage.finalOutputTokens" in SCRIPT
+    assert 'usage.terminalKind === "run.completed"' in SCRIPT
+    assert "首次完整请求" in SCRIPT
+    assert "最终回答" in SCRIPT
+    assert "usage.providerResponseCount === 0" in SCRIPT
+    assert "aggregate.input_tokens === aggregate.last_input_tokens" in SCRIPT
+    assert "lastInputTokens" not in SCRIPT
+    assert "lastOutputTokens" not in SCRIPT
+    assert "触发压缩前约可写" in SCRIPT
+    assert "Provider 实测推导占用约" in SCRIPT
+    assert "aggregate.complete" in SCRIPT
+    assert ".context-usage-meter" in STYLES
+    assert ".context-usage-detail" in STYLES
+    assert ".turn-token-usage" in STYLES
+
+
+def test_model_timeout_stages_have_operator_visible_status() -> None:
+    assert "const MODEL_ERROR_LABELS" in SCRIPT
+    assert "model_first_frame_timeout" in SCRIPT
+    assert "model_stream_idle_timeout" in SCRIPT
+    assert "model_turn_deadline" in SCRIPT
+    assert "model_transport_timeout" in SCRIPT
+    assert "正在等待首个响应帧" in SCRIPT
+    assert "模型正在流式生成回答" in SCRIPT
+    assert "runContext.terminalPayload = payload" in SCRIPT
+
+
 def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     required_ids = {
         "agent-drawer",
@@ -51,6 +140,7 @@ def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
     renderer = _function_body("renderAgentList")
     creator = _function_body("createAgent")
+    renamer = _function_body("renameAgent")
     upgrader = _function_body("upgradeAgent")
     deletion = _function_body("deleteAgent")
 
@@ -60,17 +150,28 @@ def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     assert 'api("/api/agents")' in SCRIPT
     assert "function agentApiPath" in SCRIPT
     assert "textContent = agent.display_name" in renderer
+    assert "运行环境 v${agent.generation}" in renderer
     assert "switchAgent(agent.agent_id)" in renderer
     assert "clearSelectedSession()" in _function_body("loadAgentSurface")
     assert "await refreshCommands()" in _function_body("loadAgentSurface")
     assert "await refreshSessions(null)" in _function_body("loadAgentSurface")
     assert 'method: "POST"' in creator
+    assert 'method: "PATCH"' in renamer
+    assert "renamed.generation !== agent.generation" in renamer
+    assert "运行环境未重建" in renamer
     assert 'method: "POST"' in upgrader
+    assert "重建运行环境" in renderer
+    assert "普通重命名不需要执行此操作" in upgrader
+    assert 'body: JSON.stringify({})' in upgrader
+    assert "重命名 / 升级" not in SCRIPT
     assert 'method: "DELETE"' in deletion
+    assert "agent.agent_id === SYSTEM_AGENT_ID" in renamer
     assert "agent.agent_id === SYSTEM_AGENT_ID" in upgrader
     assert "agent.agent_id === SYSTEM_AGENT_ID" in deletion
     assert "其会话、Skill、Task、环境和沙箱数据都会清除" in deletion
     assert "PDF / DOCX 依赖可跨会话复用" in INDEX
+    assert "重命名不会重建环境" in INDEX
+    assert ".agent-advanced" in STYLES
     assert 'agentApiPath("/research-environment")' in SCRIPT
     assert "await refreshResearchEnvironment()" in _function_body("loadAgentSurface")
     assert '.innerHTML' not in renderer

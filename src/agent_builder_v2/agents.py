@@ -21,7 +21,9 @@ from .capsule import (
 
 
 MAX_AGENTS = 100
-_STATES = frozenset({"provisioning", "active", "upgrading", "deleting"})
+_STATES = frozenset(
+    {"provisioning", "active", "renaming", "upgrading", "deleting"}
+)
 _LEGACY_SYSTEM_AGENT_DISPLAY_NAME = "Harness V2 Prototype Agent"
 
 
@@ -49,9 +51,10 @@ class AgentRecord:
             or not 1 <= self.generation <= 1_000_000_000
             or self.state not in _STATES
             or (
-                self.target_generation is not None
+                self.state == "upgrading"
                 and self.target_generation != self.generation + 1
             )
+            or (self.state != "upgrading" and self.target_generation is not None)
         ):
             raise ValueError("invalid Agent registry record")
 
@@ -237,6 +240,20 @@ class AgentRegistry:
                 target_generation=None,
                 display_name=record.display_name,
             )
+        if record.state == "renaming":
+            current = self.capsules.load_agent(record.agent_id)
+            if current.generation != record.generation:
+                raise RuntimeError("Agent rename recovery found generation drift")
+            current = self.capsules.rename_agent(
+                current, display_name=record.display_name
+            )
+            return self._set_state_locked(
+                record.agent_id,
+                state="active",
+                generation=current.generation,
+                target_generation=None,
+                display_name=current.display_name,
+            )
         if record.state == "upgrading":
             current = self.capsules.load_agent(record.agent_id)
             if current.generation == record.generation:
@@ -301,6 +318,30 @@ class AgentRegistry:
             raise KeyError("Agent not found")
         with self._lock:
             return self._get_locked(agent_id)
+
+    def rename(self, agent_id: str, *, display_name: str) -> AgentRecord:
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name.encode("utf-8")) > 128
+        ):
+            raise ValueError("invalid Agent display name")
+        with self._lock:
+            current = self._get_locked(agent_id)
+            if current.state != "active":
+                raise RuntimeError("Agent is not active")
+            if current.display_name == display_name:
+                return current
+            record = self._set_state_locked(
+                agent_id,
+                state="renaming",
+                generation=current.generation,
+                target_generation=None,
+                display_name=display_name,
+            )
+            result = self._recover_locked(record)
+            assert result is not None
+            return result
 
     def upgrade(self, agent_id: str, *, display_name: str | None = None) -> AgentRecord:
         with self._lock:

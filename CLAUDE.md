@@ -9,15 +9,29 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
 
 - Web Gateway 固定监听 `0.0.0.0:20815`，`GET /health` 是唯一无需登录的运行状态
   入口。监听器目前没有 TLS，只能部署在受信、防火墙保护的网络。
-- 持久 Agent registry 支持 create/list/get/upgrade/delete；Agent 管理抽屉支持创建、切换、
-  升级和删除普通 Agent。固定 ID `00000000-0000-4000-8000-000000000001` 是不可升级、
-  不可删除的正式系统 Agent。每个 active generation 惰性创建独立
+- 持久 Agent registry 支持 create/list/get/rename/upgrade/delete；左侧 Agent 管理区域支持
+  创建、切换、重命名和删除普通 Agent。rename 通过可恢复 `renaming` 状态原子更新 registry
+  与 manifest，不改变 generation、解释器或 runtime admission；generation upgrade 只位于
+  高级操作，用于重建基础运行环境。固定 ID `00000000-0000-4000-8000-000000000001` 是
+  不可重命名、不可升级、不可删除的正式系统 Agent。每个 active generation 惰性创建独立
   RunService/QueryEngineRegistry，所有 Agent 只共享同一个有界模型 Broker。
 - Web UI 和受认证 API 支持会话的新建、列表、读取恢复和删除；同一会话可连续创建
   多个 Turn。Web 使用 `/api/agents/<agent-id>/sessions/...` 和
   `/api/agents/<agent-id>/runs/...` 显式绑定当前 Agent；无 Agent ID 的旧路径只兼容系统
   Agent。一个会话同时最多有一个 active Run；有活跃 Run 时
   新一轮和删除都会被拒绝，必须先取消或等待终态。
+- Web UI 采用 conversation-first 壳层：Agent/会话位于左侧导航，中央是 durable Turn 对话
+  与固定输入区，四泳道 Run 回放、事件消息体和 ContextPlan 检查位于默认关闭的右侧检查器。
+  点击 Turn 才按需打开对应 Run；窄屏导航与检查器互斥，不得为了简化默认界面删除审计事实。
+  Conversation 消息只在用户跟随最新内容时自动吸底，用户向上回看后不得强制抢回滚动位置；
+  composer 的下一条消息预算用上一轮第一次完整请求的 Provider 实际 input 加最终回答调用
+  的实际 output 推导下轮基线，再结合该模型的压缩阈值和硬输入上限显示近似余量。中间
+  Tool 调用及其重复读取只进入本轮累计用量，不得叠加成持久上下文；由于
+  Provider 尚未收到下一条消息，这个基线必须明确标“约”，不得伪装成预先精确计数。
+  `run.started` 的 UTF-8 admission 上界只用于安全准入，不得作为用户可见的 tokenizer
+  实际占用。本轮总用量单独投影所有 Provider 调用的实际 input/output，并弱化为辅助信息。
+  若 snapshot-only 多调用 Run 缺少逐调用边界，必须显示不可可靠推导，不得回退到最后一次
+  无 Tool 调用或累计 output 伪造下轮基线。
 - Web 输入边界在 Turn admission 前解析版本化 Slash Command；`/status`、`/context`、
   `/model`、`/compact`、`/permissions`、`/cancel`、`/clear` 只调用已有受信服务，响应固定
   标记不调用模型、不创建 Turn。registry/help 位于认证 `/api/commands`；命令 POST 与所有
@@ -32,7 +46,9 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
 - 真实模型固定为 `iollama:11434` 上的 `qwen3.5:2b`；端点、模型和参数不能由
   浏览器或 Worker 覆盖。启动资格检查从 Ollama `/api/show` 读取原生上下文窗口；
   当前模型报告 `262144` tokens，受信运行策略将实际窗口封顶为 `32768`，预留
-  `2048` 输出 tokens，因此硬输入预算为 `30720`。
+  `4096` 输出 tokens，因此硬输入预算为 `28672`。每个 ModelCatalog entry 同时固定有界
+  queue/first-frame/stream-idle/turn timeout；只有首帧前零输出 timeout 可透明重试一次，
+  部分输出、idle timeout 和 turn deadline 不得重试。
 - Conversation、Turn 和 Run 是不同生命周期：Conversation 是持久容器，Turn 保存一次
   用户提交及其终态，Run 是该 Turn 的独立 Worker 执行。会话和 Turn 位于 Agent 专属
   `state.sqlite`；Gateway 重启会把遗留 `running` Turn 标为 `interrupted`，不会复活旧
@@ -55,11 +71,14 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
 - 每个 Run 启动一个独立 Worker 进程。Worker 使用 Agent 专属虚拟环境，并强制
   进入 Landlock、seccomp、rlimit、`no_new_privs` 和父进程死亡联动边界。
 - Worker 无网络、不能创建子进程、不能直接读写 workspace。当前 EffectiveToolSet 是
-  `builtin/echo`、`file/stat`、`file/read_text`、`file/glob`、`file/grep`、`file/edit`、
+  `file/stat`、`file/read_text`、`file/glob`、`file/grep`、`file/edit`、
   `file/write`、`exec/run`；文件和执行能力经有界 IPC 交给 Control Plane。mutation 始终要求 same-Run 完整
   read/absence receipt、精确 diff 审批和 descriptor-anchored atomic commit，不向 Worker
   授予文件描述符。TurnRuntimeSnapshot 固化最多 4 次模型调用、2 次顺序 Tool 调用及
-  usage/deadline；第二次结果回流后 ToolSet 收窄为空。`exec/run` 支持固定
+  usage/deadline；第二次结果回流后 ToolSet 收窄为空，Broker 在最后一个 Tool result 之后
+  追加固定、受信且不插值结果内容的 finalization system marker，要求模型只返回普通文本。
+  `builtin/echo` 只保留在密封 catalog 中用于原型测试和历史 journal 回放，不得进入新 Run
+  的 release policy。`exec/run` 支持固定
   `runtime-compile` 与 builtin-only `bounded-bash`，始终审批；后者的显式 parser 只接受
   `printf|pwd|true|false` 单命令，拒绝 expansion/pipe/redirection/env/subshell/glob/rc。
   两者在 PIDFD 监督的无 fork/network singleton Landlock+seccomp domain 内运行。认证管理面
@@ -68,6 +87,10 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
   只在 queued/running/terminal 边界写 SQLite，取消、Gateway 重启、Conversation/Agent 删除
   均不重放且先清根再发布终态。不得把受限命令、Skill 或 extension 描述为支持任意
   Shell、package 或 MCP。
+- 受信 Agent 指令要求默认直接回答；只有回答依赖外部/workspace 状态，或用户明确要求执行
+  操作时才调用 Tool。创作与上下文内自包含问题不得触发 Tool，以避免小模型生成无意义的
+  buffered Tool call；这只约束其余已授权能力的选择策略。无业务价值的 Echo 已在受信
+  release policy 层移除，不能仅依赖提示词约束小模型。
 - Model Broker 全局最多同时打开 2 路 provider stream；其它请求只能在最多 4 个 active
   Run 的边界内有界等待，30 秒仍未取得 slot 时以可重试 `model_busy` 失败。
 - `extension/call` 提供 MCP/LSP 共用的 permission/result adapter，但 release catalog 默认为空，

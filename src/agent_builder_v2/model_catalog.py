@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import re
@@ -17,6 +17,50 @@ MAX_CATALOG_MODELS = 16
 
 class ModelCatalogError(ValueError):
     """A trusted catalog or selection violated its closed schema."""
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTimeoutProfile:
+    """Bounded provider timing policy selected with the trusted model."""
+
+    queue_seconds: float = 30.0
+    first_frame_seconds: float = 60.0
+    stream_idle_seconds: float = 20.0
+    turn_seconds: float = 120.0
+    first_frame_attempts: int = 2
+
+    def __post_init__(self) -> None:
+        numeric = (
+            self.queue_seconds,
+            self.first_frame_seconds,
+            self.stream_idle_seconds,
+            self.turn_seconds,
+        )
+        if (
+            any(
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not 0.01 <= value <= 300.0
+                for value in numeric
+            )
+            or self.queue_seconds > 120.0
+            or self.first_frame_seconds > 120.0
+            or self.stream_idle_seconds > 120.0
+            or self.turn_seconds > 180.0
+            or self.first_frame_seconds >= self.turn_seconds
+            or self.stream_idle_seconds >= self.turn_seconds
+            or self.first_frame_attempts not in {1, 2}
+        ):
+            raise ModelCatalogError("invalid trusted model timeout profile")
+
+    def canonical_manifest(self) -> dict[str, object]:
+        return {
+            "first_frame_attempts": self.first_frame_attempts,
+            "first_frame_seconds": self.first_frame_seconds,
+            "queue_seconds": self.queue_seconds,
+            "stream_idle_seconds": self.stream_idle_seconds,
+            "turn_seconds": self.turn_seconds,
+        }
 
 
 def _digest(domain: bytes, value: object) -> str:
@@ -69,6 +113,7 @@ class ModelCatalogEntry:
     temperature: int = 0
     seed: int = 0
     keep_alive: str = "5m"
+    timeouts: ModelTimeoutProfile = field(default_factory=ModelTimeoutProfile)
 
     def __post_init__(self) -> None:
         capabilities = tuple(sorted(set(self.required_capabilities)))
@@ -91,6 +136,7 @@ class ModelCatalogEntry:
             or self.temperature != 0
             or self.seed != 0
             or self.keep_alive != "5m"
+            or not isinstance(self.timeouts, ModelTimeoutProfile)
         ):
             raise ModelCatalogError("invalid trusted model catalog entry")
 
@@ -119,6 +165,7 @@ class ModelCatalogEntry:
             "provider": self.provider,
             "provider_model": self.provider_model,
             "required_capabilities": list(self.required_capabilities),
+            "timeouts": self.timeouts.canonical_manifest(),
         }
 
 
@@ -225,7 +272,7 @@ def default_model_catalog() -> ModelCatalog:
                 provider_model="qwen3.5:2b",
                 endpoint_id="local-ollama",
                 operational_context_cap=32_768,
-                output_token_cap=2_048,
+                output_token_cap=4_096,
             ),
         ),
         default_model_id="qwen3.5:2b",
@@ -237,6 +284,7 @@ __all__ = [
     "ModelCatalog",
     "ModelCatalogEntry",
     "ModelCatalogError",
+    "ModelTimeoutProfile",
     "ProviderEndpoint",
     "default_model_catalog",
 ]

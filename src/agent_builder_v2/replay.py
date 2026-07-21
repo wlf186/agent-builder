@@ -80,11 +80,45 @@ _WORKER_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _PLAN_ID = re.compile(r"^context-[a-f0-9]{24}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
+_CURRENT_RUNTIME_SPECS = runtime_tool_specs()
+# Echo was exposed by earlier release policies.  Keep its immutable contract in
+# the replay registry and enumerate both policy generations so removing it from
+# new model requests never makes an existing journal undecodable.
+_LEGACY_RUNTIME_SPECS = tuple(
+    sorted(
+        (*_CURRENT_RUNTIME_SPECS, PROTOTYPE_ECHO_SPEC),
+        key=lambda spec: spec.tool_id,
+    )
+)
 _TOOL_SPECS: dict[str, ToolSpec] = {
-    spec.tool_id: spec for spec in runtime_tool_specs()
+    spec.tool_id: spec for spec in _LEGACY_RUNTIME_SPECS
 }
-_VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in runtime_tool_specs())
-_TOOLSET_DIGEST = toolset_digest(runtime_tool_specs())
+_VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in _CURRENT_RUNTIME_SPECS)
+_TOOLSET_DIGEST = toolset_digest(_CURRENT_RUNTIME_SPECS)
+_OPTIONAL_RUNTIME_TOOL_IDS = (
+    "document/extract_text",
+    "extension/call",
+    "skill/run",
+)
+_RUNTIME_TOOLSET_PROJECTIONS: dict[str, tuple[str, ...]] = {}
+for _policy_specs in (_CURRENT_RUNTIME_SPECS, _LEGACY_RUNTIME_SPECS):
+    for _optional_mask in range(1 << len(_OPTIONAL_RUNTIME_TOOL_IDS)):
+        _enabled_optional_tools = {
+            tool_id
+            for index, tool_id in enumerate(_OPTIONAL_RUNTIME_TOOL_IDS)
+            if _optional_mask & (1 << index)
+        }
+        _projected_specs = tuple(
+            spec
+            for spec in _policy_specs
+            if (
+                spec.tool_id not in _OPTIONAL_RUNTIME_TOOL_IDS
+                or spec.tool_id in _enabled_optional_tools
+            )
+        )
+        _RUNTIME_TOOLSET_PROJECTIONS[toolset_digest(_projected_specs)] = tuple(
+            spec.tool_id for spec in _projected_specs
+        )
 _LEGACY_TOOLSET_DIGEST = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
 _LEGACY_TOOLSET_DIGEST_V2 = toolset_digest((PROTOTYPE_ECHO_SPEC_V2,))
 _LEGACY_TOOLSET_DIGEST_V3 = toolset_digest((PROTOTYPE_ECHO_SPEC,))
@@ -628,6 +662,7 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         or plan_id != f"context-{digest[:24]}"
         or value.get("toolset_digest")
         not in {
+            *_RUNTIME_TOOLSET_PROJECTIONS,
             _TOOLSET_DIGEST,
             _LEGACY_TOOLSET_DIGEST,
             _LEGACY_TOOLSET_DIGEST_V2,
@@ -771,8 +806,10 @@ def _validate_started_payload(payload: object) -> dict[str, object]:
     model = payload.get("model")
     visible_tools = payload.get("visible_tools")
     context_metadata = _validate_context_plan_metadata(payload.get("context_plan"))
-    if context_metadata["toolset_digest"] == _TOOLSET_DIGEST:
-        expected_visible_tools = _VISIBLE_TOOL_IDS
+    if context_metadata["toolset_digest"] in _RUNTIME_TOOLSET_PROJECTIONS:
+        expected_visible_tools = _RUNTIME_TOOLSET_PROJECTIONS[
+            context_metadata["toolset_digest"]
+        ]
     elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_READ_TOOLSET_DIGEST:
         expected_visible_tools = ("builtin/echo", "file/read_text", "file/stat")
     elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_SEARCH_TOOLSET_DIGEST:

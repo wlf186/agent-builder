@@ -16,6 +16,7 @@ from agent_builder_v2.tools import (
     project_tool_result,
     prototype_effective_toolset,
     prototype_tools,
+    runtime_tool_catalog,
     runtime_tool_specs,
     runtime_tools,
     toolset_digest,
@@ -155,10 +156,21 @@ def test_runtime_catalog_brokers_capabilities_and_rejects_surrogates() -> None:
         return ToolResult("succeeded", "{}")
 
     specs = runtime_tool_specs()
+    assert runtime_tool_catalog().by_id()["builtin/echo"] == PROTOTYPE_ECHO_SPEC
     assert [item.tool_id for item in specs] == [
-        "agent/delegate", "builtin/echo", "document/extract_text", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
-        "file/read_text", "file/stat", "file/write", "skill/run",
+        "agent/delegate",
+        "document/extract_text",
+        "exec/run",
+        "extension/call",
+        "file/edit",
+        "file/glob",
+        "file/grep",
+        "file/read_text",
+        "file/stat",
+        "file/write",
+        "skill/run",
     ]
+    assert "builtin/echo" not in {item.tool_id for item in specs}
     registry = runtime_tools(specs, brokered)  # type: ignore[arg-type]
     result = registry.execute(
         "file/glob", {"pattern": "**/*.txt"}, call_id="glob-call"

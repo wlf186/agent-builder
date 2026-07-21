@@ -874,6 +874,31 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(404, "Agent not found") from exc
         return record.to_dict()
 
+    @app.patch("/api/agents/{agent_id}")
+    async def rename_agent(agent_id: str, request: Request) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) != {"display_name"} or not isinstance(
+            body.get("display_name"), str
+        ):
+            raise HTTPException(400, "display_name is required")
+        if agent_id == PROTOTYPE_AGENT_ID:
+            raise HTTPException(409, "the system Agent cannot be renamed")
+        registry: AgentRegistry = request.app.state.agent_registry
+        try:
+            record = await asyncio.to_thread(
+                registry.rename,
+                agent_id,
+                display_name=body["display_name"],
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "Agent not found") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return record.to_dict()
+
     @app.post("/api/agents/{agent_id}/upgrade")
     async def upgrade_agent(agent_id: str, request: Request) -> dict[str, object]:
         _require_csrf(request)
@@ -1279,17 +1304,22 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
         body = await _read_json_object(request)
-        if set(body) != {"message"} or not isinstance(body.get("message"), str):
+        if "message" not in body or set(body) - {"message", "model_id", "compact"}:
             raise HTTPException(400, "message is required")
+        message = body.get("message")
+        if not isinstance(message, str):
+            raise HTTPException(400, "message must be a string")
         runtime = await _runtime_for_agent(request, agent_id)
         try:
-            slash = runtime.commands.registry.parse(body["message"])
+            slash = runtime.commands.registry.parse(message)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         if slash is not None:
+            if set(body) != {"message"}:
+                raise HTTPException(400, "slash commands do not accept Run options")
             try:
                 command_result = await runtime.commands.execute_slash(
-                    conversation_id, body["message"]
+                    conversation_id, message
                 )
             except (ConversationNotFoundError, QueryEngineOwnershipError) as exc:
                 raise HTTPException(404, "conversation or Run not found") from exc
@@ -1300,12 +1330,24 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             except RuntimeError as exc:
                 raise HTTPException(503, "command service is unavailable") from exc
             return JSONResponse(command_result.to_dict(), status_code=200)
+        model_id = body.get("model_id")
+        if model_id is not None and not isinstance(model_id, str):
+            raise HTTPException(400, "model_id must be a string")
+        try:
+            request.app.state.runtime_manager.model_broker.catalog.select(model_id)
+        except ModelCatalogError as exc:
+            raise HTTPException(400, "model is not available") from exc
+        compact = body.get("compact", False)
+        if not isinstance(compact, bool):
+            raise HTTPException(400, "compact must be a boolean")
         try:
             record = await runtime.commands.start(
                 StartRunCommand(
                     agent_id=agent_id,
-                    message=body["message"],
+                    message=message,
                     conversation_id=conversation_id,
+                    model_id=model_id,
+                    compact=compact,
                 )
             )
         except ConversationNotFoundError as exc:

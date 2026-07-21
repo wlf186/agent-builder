@@ -1084,10 +1084,24 @@ def runtime_tool_catalog() -> ToolCatalog:
 
 def runtime_tool_policy() -> ToolPolicy:
     return ToolPolicy(
-        revision="runtime-execution-policy-v1",
+        # builtin/echo remains in the catalog only so prototype fixtures and
+        # historical Run journals can still be decoded.  It is deliberately
+        # absent from the release policy: it has no user-facing capability and
+        # small models can mistake it for a generic answer channel, creating a
+        # deterministic Tool loop on otherwise self-contained prompts.
+        revision="runtime-execution-policy-v2",
         allowed_tool_ids=(
-            "agent/delegate", "builtin/echo", "document/extract_text", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
-            "file/read_text", "file/stat", "file/write", "skill/run"
+            "agent/delegate",
+            "document/extract_text",
+            "exec/run",
+            "extension/call",
+            "file/edit",
+            "file/glob",
+            "file/grep",
+            "file/read_text",
+            "file/stat",
+            "file/write",
+            "skill/run",
         ),
         allowed_risks=("execution", "mutation", "read_only"),
     )

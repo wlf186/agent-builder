@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 import hashlib
 import json
 import socket
@@ -36,6 +37,7 @@ from agent_builder_v2.ollama import (
     OLLAMA_HOST,
     OLLAMA_MODEL,
     OLLAMA_PORT,
+    TOOL_FINALIZATION_INSTRUCTION,
     OllamaBroker,
     OllamaBrokerError,
     OllamaCancelledError,
@@ -876,6 +878,114 @@ async def test_frozen_tool_capability_supports_a_second_sequential_call() -> Non
 
 
 @pytest.mark.asyncio
+async def test_tool_budget_transition_forces_a_visible_final_answer() -> None:
+    first_call = {
+        "id": "call_first",
+        "function": {"name": "builtin_echo", "arguments": {"text": "first"}},
+    }
+    second_call = {
+        "id": "call_second",
+        "function": {"name": "builtin_echo", "arguments": {"text": "second"}},
+    }
+    broker, provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(
+                    _provider_frame(tool_calls=[first_call]),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+            _chat_response(
+                _ndjson(
+                    _provider_frame(tool_calls=[second_call]),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+            _chat_response(
+                _ndjson(
+                    _provider_frame(content="final visible answer"),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+        ]
+    )
+    try:
+        message = "finish after two tools"
+        session = broker.new_run(_plan(broker, message))
+        await _collect(session.stream_turn(message))
+        first_result = OllamaToolResult(
+            "call_first", HARNESS_TOOL_ID, "first"
+        )
+        await _collect(session.stream_turn(message, (first_result,)))
+        second_result = OllamaToolResult(
+            "call_second", HARNESS_TOOL_ID, "second"
+        )
+        frames = await _collect(
+            session.stream_turn(message, (first_result, second_result))
+        )
+
+        assert [frame.kind for frame in frames] == ["content", "stop"]
+        requests = [
+            json.loads(request.content)
+            for request in provider.requests
+            if request.url.path == "/api/chat"
+        ]
+        assert len(requests) == 3
+        assert requests[2]["tools"] == []
+        assert requests[2]["messages"][-2] == {
+            "role": "tool",
+            "tool_name": "builtin_echo",
+            "content": "second",
+        }
+        assert requests[2]["messages"][-1] == {
+            "role": "system",
+            "content": TOOL_FINALIZATION_INSTRUCTION,
+        }
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_call_after_finalization_has_a_specific_failure_code() -> None:
+    first_call = {
+        "id": "call_first",
+        "function": {"name": "builtin_echo", "arguments": {"text": "stale"}},
+    }
+    second_call = {
+        "id": "call_second",
+        "function": {"name": "builtin_echo", "arguments": {"text": "stale"}},
+    }
+    third_call = {
+        "id": "call_third",
+        "function": {"name": "builtin_echo", "arguments": {"text": "stale"}},
+    }
+    responses = [
+        _chat_response(
+            _ndjson(
+                _provider_frame(tool_calls=[call]),
+                _provider_frame(done=True, done_reason="stop"),
+            )
+        )
+        for call in (first_call, second_call, third_call)
+    ]
+    broker, _provider = await _started_broker(responses)
+    try:
+        message = "never execute a third tool"
+        session = broker.new_run(_plan(broker, message))
+        await _collect(session.stream_turn(message))
+        first_result = OllamaToolResult("call_first", HARNESS_TOOL_ID, "first")
+        await _collect(session.stream_turn(message, (first_result,)))
+        second_result = OllamaToolResult("call_second", HARNESS_TOOL_ID, "second")
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(
+                session.stream_turn(message, (first_result, second_result))
+            )
+        assert raised.value.code == "model_tool_loop"
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
 async def test_later_turn_fails_closed_when_full_transcript_exceeds_token_budget() -> None:
     tool_text = "t" * 8_192
     tool_call = {
@@ -1202,7 +1312,7 @@ async def test_smaller_model_window_drives_operational_budget() -> None:
     try:
         assert qualification.model_profile.native_context_tokens == 16_384
         assert qualification.model_profile.operational_context_tokens == 16_384
-        assert qualification.model_profile.max_output_tokens == 1_024
+        assert qualification.model_profile.max_output_tokens == 2_048
     finally:
         await broker.close()
 
@@ -1264,6 +1374,122 @@ class _HangingStream(httpx.AsyncByteStream):
         self.closed.set()
 
 
+class _FrameThenHangStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            yield _ndjson(_provider_frame(content="partial"))
+            await asyncio.Event().wait()
+        finally:
+            self.closed.set()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class _PulsingStream(httpx.AsyncByteStream):
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            yield _ndjson(_provider_frame(content="x"))
+            await asyncio.sleep(0.005)
+
+
+def _stream_factory(stream: httpx.AsyncByteStream) -> ChatFactory:
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/x-ndjson"},
+            stream=stream,
+        )
+
+    return response
+
+
+def _set_session_timeouts(session: object, **changes: object) -> None:
+    entry = session._catalog_entry  # type: ignore[attr-defined]
+    session._catalog_entry = replace(  # type: ignore[attr-defined]
+        entry,
+        timeouts=replace(entry.timeouts, **changes),
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_frame_timeout_retries_once_before_any_provider_output() -> None:
+    hanging = _HangingStream()
+    success = _chat_response(
+        _ndjson(
+            _provider_frame(content="recovered"),
+            _provider_frame(done=True, done_reason="stop"),
+        )
+    )
+    broker, provider = await _started_broker([_stream_factory(hanging), success])
+    try:
+        session = broker.new_run(_plan(broker, "retry first frame"))
+        _set_session_timeouts(
+            session,
+            first_frame_seconds=0.02,
+            stream_idle_seconds=0.02,
+            turn_seconds=0.2,
+        )
+        frames = await _collect(session.stream_turn("retry first frame"))
+        assert [frame.kind for frame in frames] == ["content", "stop"]
+        assert frames[0].payload == {"text": "recovered"}
+        assert len(
+            [request for request in provider.requests if request.url.path == "/api/chat"]
+        ) == 2
+        await asyncio.wait_for(hanging.closed.wait(), timeout=1.0)
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_stream_idle_timeout_never_retries_after_provider_output() -> None:
+    stalled = _FrameThenHangStream()
+    broker, provider = await _started_broker([_stream_factory(stalled)])
+    try:
+        session = broker.new_run(_plan(broker, "stall after output"))
+        _set_session_timeouts(
+            session,
+            first_frame_seconds=0.1,
+            stream_idle_seconds=0.02,
+            turn_seconds=0.2,
+        )
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("stall after output"))
+        assert raised.value.code == "model_stream_idle_timeout"
+        assert raised.value.retryable is False
+        assert len(
+            [request for request in provider.requests if request.url.path == "/api/chat"]
+        ) == 1
+        await asyncio.wait_for(stalled.closed.wait(), timeout=1.0)
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_total_turn_deadline_stops_an_active_nonidle_stream() -> None:
+    broker, provider = await _started_broker([_stream_factory(_PulsingStream())])
+    try:
+        session = broker.new_run(_plan(broker, "bounded active stream"))
+        _set_session_timeouts(
+            session,
+            first_frame_seconds=0.02,
+            stream_idle_seconds=0.02,
+            turn_seconds=0.04,
+        )
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("bounded active stream"))
+        assert raised.value.code == "model_turn_deadline"
+        assert raised.value.retryable is False
+        assert len(
+            [request for request in provider.requests if request.url.path == "/api/chat"]
+        ) == 1
+    finally:
+        await broker.close()
+
+
 @pytest.mark.asyncio
 async def test_cancel_callback_closes_blocked_provider_stream() -> None:
     hanging = _HangingStream()
@@ -1317,9 +1543,7 @@ async def test_cancel_callback_interrupts_the_bounded_model_queue() -> None:
 
 @pytest.mark.asyncio
 async def test_bounded_model_queue_times_out_with_retryable_busy(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(ollama_module, "MODEL_QUEUE_TIMEOUT_SECONDS", 0.02)
     broker, _provider = await _started_broker([])
     acquired = 0
     try:
@@ -1327,6 +1551,10 @@ async def test_bounded_model_queue_times_out_with_retryable_busy(
             await broker._model_slots.acquire()
             acquired += 1
         session = broker.new_run(_plan(broker, "queued"))
+        session._catalog_entry = replace(
+            session._catalog_entry,
+            timeouts=replace(session._catalog_entry.timeouts, queue_seconds=0.02),
+        )
         with pytest.raises(OllamaBrokerError) as raised:
             await _collect(session.stream_turn("queued"))
         assert raised.value.code == "model_busy"

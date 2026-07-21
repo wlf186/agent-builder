@@ -605,6 +605,40 @@ class CapsuleManager:
             display_name,
         )
 
+    def rename_agent(
+        self,
+        capsule: AgentCapsule,
+        *,
+        display_name: str,
+    ) -> AgentCapsule:
+        """Atomically change display metadata without rotating the generation."""
+
+        self._validate_capsule(capsule)
+        if (
+            not isinstance(display_name, str)
+            or not display_name.strip()
+            or len(display_name.encode("utf-8")) > 128
+        ):
+            raise ValueError("invalid Agent display name")
+        if capsule.display_name == display_name:
+            return capsule
+        self._replace_manifest(
+            capsule.data_root / "manifest.json",
+            capsule.agent_id,
+            display_name=display_name,
+            generation=capsule.generation,
+        )
+        renamed = AgentCapsule(
+            capsule.agent_id,
+            capsule.data_root,
+            capsule.runtime_root,
+            capsule.interpreter,
+            capsule.generation,
+            display_name,
+        )
+        self._validate_capsule(renamed)
+        return renamed
+
     def promote_generation(
         self,
         current: AgentCapsule,

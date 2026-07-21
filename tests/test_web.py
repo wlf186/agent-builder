@@ -1077,13 +1077,36 @@ def test_authenticated_agent_lifecycle_api_is_csrf_protected_and_isolated(
         agent_id = created.json()["agent_id"]
         assert created.json()["generation"] == 1
         assert client.get(f"/api/agents/{agent_id}").status_code == 200
+        assert client.patch(
+            f"/api/agents/{agent_id}",
+            json={"display_name": "Renamed API Agent"},
+            headers=SAME_ORIGIN,
+        ).status_code == 403
+        renamed = client.patch(
+            f"/api/agents/{agent_id}",
+            json={"display_name": "Renamed API Agent"},
+            headers=mutation,
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["display_name"] == "Renamed API Agent"
+        assert renamed.json()["generation"] == 1
+        protected_rename = client.patch(
+            f"/api/agents/{PROTOTYPE_AGENT_ID}",
+            json={"display_name": "Renamed system"},
+            headers=mutation,
+        )
+        assert protected_rename.status_code == 409
+        assert protected_rename.json()["detail"] == (
+            "the system Agent cannot be renamed"
+        )
         upgraded = client.post(
             f"/api/agents/{agent_id}/upgrade",
-            json={"display_name": "API Agent v2"},
+            json={},
             headers=mutation,
         )
         assert upgraded.status_code == 200
         assert upgraded.json()["generation"] == 2
+        assert upgraded.json()["display_name"] == "Renamed API Agent"
         protected = client.delete(
             f"/api/agents/{PROTOTYPE_AGENT_ID}", headers=mutation
         )
@@ -1120,11 +1143,13 @@ def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
     session_id = created.json()["session_id"]
     started = client.post(
         f"/api/agents/{agent_id}/sessions/{session_id}/runs",
-        json={"message": "isolated"},
+        json={"message": "isolated", "model_id": "qwen3.5:2b", "compact": True},
         headers=mutation,
     )
     assert started.status_code == 202
     assert started.json()["agent_id"] == agent_id
+    assert commands.started[-1].model_id == "qwen3.5:2b"
+    assert commands.started[-1].compact is True
     assert started.json()["events_url"].startswith(
         f"/api/agents/{agent_id}/runs/"
     )
@@ -1139,6 +1164,11 @@ def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
     assert client.get(
         f"/api/agents/{PROTOTYPE_AGENT_ID}/sessions/{session_id}"
     ).status_code == 404
+    assert client.post(
+        f"/api/agents/{agent_id}/sessions/{session_id}/runs",
+        json={"message": "invalid", "compact": "yes"},
+        headers=mutation,
+    ).status_code == 400
 
 
 def test_permission_approval_is_authenticated_csrf_bound_and_operator_safe(

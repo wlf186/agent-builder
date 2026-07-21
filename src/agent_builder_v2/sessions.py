@@ -47,7 +47,7 @@ from .replay import (
     encode_projection_snapshot,
     project_durable_run,
 )
-from .tools import ToolSpec, runtime_tool_specs
+from .tools import ToolSpec, runtime_tool_catalog
 
 
 DATABASE_NAME = "state.sqlite"
@@ -115,7 +115,7 @@ _RECOVERY_BLOCK_REASONS = frozenset(
     {"cancelled", "runtime_failure", "worker_failure"}
 )
 _RECOVERY_TOOL_SPECS: dict[str, ToolSpec] = {
-    spec.tool_id: spec for spec in runtime_tool_specs()
+    spec.tool_id: spec for spec in runtime_tool_catalog().specs
 }
 TurnStatus = Literal["running", "completed", "failed", "cancelled", "interrupted"]
 TerminalTurnStatus = Literal["failed", "cancelled", "interrupted"]

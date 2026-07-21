@@ -20,6 +20,7 @@ from agent_builder_v2.tools import (
     PROTOTYPE_ECHO_SPEC_V1,
     PROTOTYPE_ECHO_SPEC_V2,
     prototype_tool_specs,
+    runtime_tool_specs,
     toolset_digest,
 )
 
@@ -224,6 +225,27 @@ def test_retained_tool_manifest_digest_remains_replayable(legacy_spec: object) -
     snapshot, gaps = project_durable_run(
         (_event(1, "run.started", payload), _event(2, "run.failed", _failed()))
     )
+    assert snapshot.complete is True
+    assert gaps == ()
+
+
+def test_runtime_replay_accepts_independently_enabled_research_tool() -> None:
+    specs = tuple(
+        spec
+        for spec in runtime_tool_specs()
+        if spec.tool_id not in {"extension/call", "skill/run"}
+    )
+    assert "document/extract_text" in {spec.tool_id for spec in specs}
+    payload = _started_payload()
+    payload["visible_tools"] = [spec.tool_id for spec in specs]
+    context = payload["context_plan"]
+    assert isinstance(context, dict)
+    context["toolset_digest"] = toolset_digest(specs)
+
+    snapshot, gaps = project_durable_run(
+        (_event(1, "run.started", payload), _event(2, "run.failed", _failed()))
+    )
+
     assert snapshot.complete is True
     assert gaps == ()
 

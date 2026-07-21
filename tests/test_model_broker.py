@@ -9,8 +9,12 @@ import pytest
 
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
 from agent_builder_v2.context import ContextCompiler, ModelContext, ModelProfile
-from agent_builder_v2.model import BrokeredStreamingModel, ModelToolResult
-from agent_builder_v2.tools import prototype_tool_specs
+from agent_builder_v2.model import (
+    BrokeredCapabilityClient,
+    BrokeredStreamingModel,
+    ModelToolResult,
+)
+from agent_builder_v2.tools import prototype_tool_specs, runtime_tool_specs
 
 
 def _context(
@@ -163,3 +167,60 @@ def test_explicit_empty_tool_set_never_restores_prototype_capabilities() -> None
 
     with pytest.raises(RuntimeError, match="tool call is invalid"):
         list(model.stream(_context("hello", tools=()), (), lambda: False))
+
+
+def _capability_response(**changes: object) -> bytes:
+    value = {
+        "internal": "capability.response",
+        "version": 2,
+        "request_id": "capability-1",
+        "type": "result",
+        "call_id": "read-call",
+        "tool_id": "file/read_text",
+        "outcome": "succeeded",
+        "content": '{"content":"bounded"}',
+    }
+    value.update(changes)
+    return json.dumps(value, separators=(",", ":")).encode() + b"\n"
+
+
+def test_brokered_capability_client_binds_call_and_arguments() -> None:
+    requests = BytesIO()
+    client = BrokeredCapabilityClient(
+        BytesIO(_capability_response()), requests, runtime_tool_specs()
+    )
+    result = client.execute(
+        "file/read_text", {"path": "facts.txt", "max_bytes": 128}, "read-call"
+    )
+
+    assert result.outcome == "succeeded"
+    assert result.content == '{"content":"bounded"}'
+    assert json.loads(requests.getvalue()) == {
+        "internal": "capability.request",
+        "version": 2,
+        "request_id": "capability-1",
+        "call_id": "read-call",
+        "tool_id": "file/read_text",
+        "arguments": {"path": "facts.txt", "max_bytes": 128},
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"request_id": "different"},
+        {"call_id": "different"},
+        {"tool_id": "file/stat"},
+        {"outcome": "approved"},
+        {"extra": "field"},
+    ),
+)
+def test_brokered_capability_client_rejects_response_confusion(
+    changes: dict[str, object],
+) -> None:
+    client = BrokeredCapabilityClient(
+        BytesIO(_capability_response(**changes)), BytesIO(), runtime_tool_specs()
+    )
+    result = client.execute("file/read_text", {"path": "facts.txt"}, "read-call")
+    assert result.outcome == "failed"
+    assert result.content == "Brokered capability response is invalid"

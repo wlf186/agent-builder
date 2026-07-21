@@ -419,7 +419,9 @@ class QueryEngine:
                 raise ConversationNotFoundError("conversation not found")
             return conversation
 
-    async def submit_message(self, message: str) -> QueryRunHandle:
+    async def submit_message(
+        self, message: str, *, model_id: str | None = None, compact: bool = False
+    ) -> QueryRunHandle:
         """Admit one new Turn while keeping the Run itself independently live."""
 
         async with self._operation_lock:
@@ -429,6 +431,8 @@ class QueryEngine:
                     agent_id=self._agent_id,
                     message=message,
                     conversation_id=self._conversation_id,
+                    model_id=model_id,
+                    compact=compact,
                 )
             )
             try:
@@ -824,7 +828,9 @@ class QueryEngineRegistry:
             raise ValueError("unknown agent")
         if command.conversation_id is not None:
             engine = await self.for_conversation(command.conversation_id)
-            return await engine.submit_message(command.message)
+            return await engine.submit_message(
+                command.message, model_id=command.model_id, compact=command.compact
+            )
 
         # Compatibility endpoint: RunService retains its cancellation-safe
         # auto-create transaction; the resulting conversation is immediately

@@ -40,12 +40,14 @@ class _Service:
         agent_id: str,
         model_broker: object,
         manage_model_broker: bool,
+        extension_catalog: object,
     ) -> None:
         del source_root
         self.repository_root = repository_root
         self.agent_id = agent_id
         self.model_broker = model_broker
         self.manage_model_broker = manage_model_broker
+        self.extension_catalog = extension_catalog
         self.capsule = None
         self.closed = False
         self.runs: dict[str, object] = {}

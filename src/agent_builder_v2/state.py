@@ -1,4 +1,4 @@
-"""Agent-scoped semantic event journal for the walking skeleton."""
+"""Agent-scoped semantic event journal for the runtime."""
 
 from __future__ import annotations
 

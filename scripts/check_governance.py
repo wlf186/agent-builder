@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tomllib
 from datetime import date
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -24,6 +25,8 @@ EXCLUDED_ROOTS = (
     Path(".runtime"),
     Path(".tools"),
     Path(".venv"),
+    Path("backups"),
+    Path("data"),
     Path("_legacy-reference"),
     Path("references/claude-code/materials"),
 )
@@ -38,6 +41,7 @@ REQUIRED_DOCUMENTS = (
     Path("docs/design/event-protocol.md"),
     Path("docs/design/agent-capsule.md"),
     Path("docs/plans/runtime-rebuild.md"),
+    Path("docs/design/release.md"),
     Path("references/claude-code/README.md"),
     Path("references/claude-code/PROVENANCE.md"),
 )
@@ -48,6 +52,9 @@ ROOT_COMMANDS = (
     "stop.sh",
     "set-access-token.sh",
     "purge.sh",
+    "backup.sh",
+    "restore.sh",
+    "release.sh",
     "governance.sh",
 )
 
@@ -221,6 +228,29 @@ def validate_required_paths(failures: list[str]) -> None:
                         f"{relative(child)}: current runtime/config directory "
                         "must not be a symbolic link"
                     )
+
+
+def validate_release_version(failures: list[str]) -> None:
+    version_path = ROOT / "VERSION"
+    project_path = ROOT / "pyproject.toml"
+    try:
+        version = version_path.read_text(encoding="ascii").strip()
+        project = tomllib.loads(project_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        failures.append(f"release version metadata cannot be read: {type(error).__name__}")
+        return
+    project_version = project.get("project", {}).get("version")
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+        failures.append("VERSION must contain one semantic release version")
+    if project_version != version:
+        failures.append("VERSION and pyproject.toml project.version must match")
+    try:
+        web_source = (ROOT / "src/agent_builder_v2/web.py").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        failures.append("web release metadata cannot be read")
+    else:
+        if f'"release": "{version}"' not in web_source:
+            failures.append("health release and VERSION must match")
 
 
 def validate_agent_guide_symlink(failures: list[str]) -> None:
@@ -567,6 +597,7 @@ def main() -> int:
     ]
 
     validate_required_paths(failures)
+    validate_release_version(failures)
     validate_agent_guide_symlink(failures)
     validate_document_metadata(markdown_files, failures)
     validate_principles_and_operator_contract(failures)

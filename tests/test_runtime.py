@@ -47,7 +47,8 @@ def test_runtime_snapshot_freezes_every_execution_affecting_boundary() -> None:
     assert snapshot.max_total_output_tokens == 2_048 * 4
     assert snapshot.public_metadata() == {
         "capsule_generation": 7,
-        "model_profile_digest": "a" * 64,
+        "model_id": "qwen3.5:2b",
+        "model_profile_digest": snapshot.model_profile.profile_digest,
         "context_plan_id": snapshot.context_plan.reference.plan_id,
         "context_plan_digest": snapshot.context_plan.reference.digest,
         "toolset_digest": snapshot.context_plan.reference.toolset_digest,
@@ -57,6 +58,7 @@ def test_runtime_snapshot_freezes_every_execution_affecting_boundary() -> None:
         "max_total_input_tokens": 122_880,
         "max_total_output_tokens": 8_192,
         "wall_timeout_seconds": 60,
+        "projection_reason": "admission",
     }
     with pytest.raises(FrozenInstanceError):
         snapshot.wall_timeout_seconds = 61  # type: ignore[misc]

@@ -1,4 +1,4 @@
-"""Greenfield Agent Builder Harness V2 walking skeleton."""
+"""Checkout-contained Agent Builder runtime."""
 
 __all__ = ["__version__"]
 

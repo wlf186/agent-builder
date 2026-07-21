@@ -363,6 +363,74 @@ def _publish_gateway_child_identity(
         os.close(directory)
 
 
+def _remove_initial_pid_record_if_owned(
+    path: Path,
+    checkout: Path,
+    *,
+    qualification_sync_counter: bool = False,
+) -> bool:
+    """Remove only this live supervisor's exact pre-child record.
+
+    Child identity publication can fail before a complete managed record exists.
+    Leaving that exact initial record makes the next lifecycle correctly refuse
+    it, but also requires manual recovery.  This narrow cleanup compares bytes
+    and inode twice through an anchored directory before unlinking; any drift is
+    left untouched and fail-closed.
+    """
+
+    expected = (
+        "schema=1\n"
+        "role=gateway\n"
+        f"pid={os.getpid()}\n"
+        f"pgid={os.getpgrp()}\n"
+        f"marker={_process_marker(os.getpid())}\n"
+        f"root={checkout}\n"
+        + (f"sync_counter={COUNTER_ABI}\n" if qualification_sync_counter else "")
+    ).encode("utf-8")
+    directory = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECTORY", 0),
+    )
+    descriptor: int | None = None
+    try:
+        metadata = os.stat(
+            path.name, dir_fd=directory, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size != len(expected)
+        ):
+            return False
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        current = os.read(descriptor, len(expected) + 1)
+        opened = os.fstat(descriptor)
+        latest = os.stat(
+            path.name, dir_fd=directory, follow_symlinks=False
+        )
+        if (
+            current != expected
+            or (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+            or (latest.st_dev, latest.st_ino) != (metadata.st_dev, metadata.st_ino)
+        ):
+            return False
+        os.unlink(path.name, dir_fd=directory)
+        os.fsync(directory)
+        return True
+    except FileNotFoundError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory)
+
+
 class SecureRotatingFileHandler(RotatingFileHandler):
     """Rotate a fixed log name through an anchored directory descriptor."""
 
@@ -709,16 +777,39 @@ def main() -> int:
             env=gateway_environment,
             bufsize=0,
         )
-        try:
-            _publish_gateway_child_identity(
+        child_identity_published = False
+        for _attempt in range(50):
+            if child.poll() is not None:
+                break
+            try:
+                _publish_gateway_child_identity(
+                    pid_path,
+                    checkout,
+                    child.pid,
+                    args.command,
+                    qualification_sync_counter=args.qualification_sync_counter,
+                )
+            except (OSError, RuntimeError, ValueError):
+                time.sleep(0.02)
+                continue
+            child_identity_published = True
+            break
+        if not child_identity_published:
+            _write(handler, "gateway child identity publication failed\n")
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait(timeout=2.0)
+            if child.stdout is not None:
+                _capture(child.stdout, handler, args.max_bytes)
+            _remove_initial_pid_record_if_owned(
                 pid_path,
                 checkout,
-                child.pid,
-                args.command,
                 qualification_sync_counter=args.qualification_sync_counter,
             )
-        except (OSError, RuntimeError, ValueError):
-            _write(handler, "gateway child identity publication failed\n")
             return 127
         if stop_requested is not None and child.poll() is None:
             child.send_signal(stop_requested)

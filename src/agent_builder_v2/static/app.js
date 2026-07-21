@@ -2,6 +2,7 @@
 
 const TERMINAL_EVENTS = new Set(["run.completed", "run.failed", "run.cancelled"]);
 const RUN_ID_PATTERN = /^[a-f0-9]{32}$/;
+const MODEL_ID_PATTERN = /^[A-Za-z0-9._:/+-]{1,128}$/;
 const MAX_SSE_RECONNECTS = 3;
 const SSE_RECONNECT_DELAY_MS = 250;
 const STREAM_CONTROL_VERSION = "stream-control-v1";
@@ -54,6 +55,13 @@ const EVENT_PRESENTATIONS = Object.freeze({
     action: "收敛模型响应",
     explanation: "正常时对应 provider 终帧；错误或取消时也可能由 Broker 收敛，并不代表模型正文。",
     tone: "model",
+  },
+  "model.recovery.started": {
+    subject: "Harness",
+    direction: "Harness 内部",
+    action: "切换溢出恢复投影",
+    explanation: "Provider 明确拒绝上下文后，Harness 切换到一次性、更小的受信上下文投影；不会重放工具副作用。",
+    tone: "recovery",
   },
   "assistant.block.started": {
     subject: "LLM",
@@ -174,11 +182,15 @@ const CONTEXT_SECTION_FIELDS = Object.freeze([
 const state = {
   csrfToken: null,
   agentId: null,
+  models: [],
+  commands: [],
+  selectedModelId: null,
   sessions: [],
   sessionId: null,
   sessionRequest: 0,
   timelineRequest: 0,
   timelineRuns: [],
+  subagents: [],
   selectedTimelineRunId: null,
   contextRequest: 0,
   contextLoading: false,
@@ -220,12 +232,23 @@ const elements = {
   activeSessionTitle: document.querySelector("#active-session-title"),
   sessionId: document.querySelector("#session-id"),
   runForm: document.querySelector("#run-form"),
+  modelSelect: document.querySelector("#model-select"),
+  compactInput: document.querySelector("#compact-input"),
   messageInput: document.querySelector("#message-input"),
+  commandHelpList: document.querySelector("#command-help-list"),
+  commandResult: document.querySelector("#command-result"),
+  commandResultTitle: document.querySelector("#command-result-title"),
+  commandResultJson: document.querySelector("#command-result-json"),
+  commandResultClose: document.querySelector("#command-result-close"),
+  permissionPanel: document.querySelector("#permission-panel"),
+  permissionList: document.querySelector("#permission-list"),
   runButton: document.querySelector("#run-button"),
   cancelButton: document.querySelector("#cancel-button"),
   runId: document.querySelector("#run-id"),
   conversationMessages: document.querySelector("#conversation-messages"),
   conversationEmpty: document.querySelector("#conversation-empty"),
+  subagentPanel: document.querySelector("#subagent-panel"),
+  subagentList: document.querySelector("#subagent-list"),
   eventList: document.querySelector("#event-list"),
   eventCount: document.querySelector("#event-count"),
   timelineRunSelect: document.querySelector("#timeline-run-select"),
@@ -324,8 +347,12 @@ function setRunControls() {
   const hasSession = state.sessionId !== null;
   const selectedIsActive = sessionIsActive(selectedSession());
   elements.newSessionButton.disabled = locked;
-  elements.messageInput.disabled = locked || !hasSession || selectedIsActive;
-  elements.runButton.disabled = locked || !hasSession || selectedIsActive;
+  // Keep the command line available during an active Run so /status,
+  // /permissions and /cancel remain explicit control-plane actions.
+  elements.messageInput.disabled = state.mutationPending || !hasSession;
+  elements.modelSelect.disabled = locked || state.models.length === 0;
+  elements.compactInput.disabled = locked || !hasSession || selectedIsActive;
+  elements.runButton.disabled = state.mutationPending || !hasSession;
   elements.cancelButton.disabled = (
     runContext === null || runContext.terminalSeen || runContext.cancelPending
   );
@@ -348,6 +375,9 @@ function clearConversation() {
   state.conversationMessages = [];
   elements.conversationMessages.replaceChildren();
   elements.conversationEmpty.hidden = false;
+  state.subagents = [];
+  elements.subagentList.replaceChildren();
+  elements.subagentPanel.hidden = true;
 }
 
 function clearTimeline(label = "等待运行") {
@@ -409,6 +439,9 @@ function setUnauthenticated(message = "尚未认证") {
   state.activeRun?.controller?.abort();
   state.csrfToken = null;
   state.agentId = null;
+  state.models = [];
+  state.commands = [];
+  state.selectedModelId = null;
   state.sessions = [];
   state.activeRun = null;
   state.settling = false;
@@ -421,6 +454,11 @@ function setUnauthenticated(message = "尚未认证") {
   elements.workspace.hidden = true;
   elements.logoutButton.hidden = true;
   elements.sessionList.replaceChildren();
+  elements.modelSelect.replaceChildren(new Option("需要先登录", ""));
+  elements.commandHelpList.replaceChildren();
+  elements.commandResult.hidden = true;
+  elements.permissionPanel.hidden = true;
+  elements.permissionList.replaceChildren();
   elements.sessionListStatus.textContent = "";
   clearSelectedSession();
 }
@@ -447,6 +485,180 @@ async function api(path, options = {}) {
     throw error;
   }
   return response;
+}
+
+async function refreshCommands() {
+  const response = await api("/api/commands");
+  const body = await response.json();
+  if (
+    !body || body.schema_version !== 1 || !Array.isArray(body.commands) ||
+    body.commands.length < 1 || body.commands.length > 32
+  ) {
+    throw new Error("Slash Command 目录格式无效");
+  }
+  state.commands = body.commands;
+  elements.commandHelpList.replaceChildren();
+  for (const command of body.commands) {
+    if (
+      !command || typeof command.command_id !== "string" ||
+      typeof command.name !== "string" || !command.name.startsWith("/") ||
+      typeof command.description !== "string" ||
+      typeof command.argument_schema !== "string"
+    ) {
+      throw new Error("Slash Command 条目格式无效");
+    }
+    const item = document.createElement("li");
+    const name = document.createElement("code");
+    name.textContent = `${command.name}${command.argument_schema ? ` ${command.argument_schema}` : ""}`;
+    item.append(name, document.createTextNode(` — ${command.description}`));
+    elements.commandHelpList.append(item);
+  }
+}
+
+function showCommandResult(value) {
+  elements.commandResultTitle.textContent = `/${value.command_id || "command"} 结果`;
+  elements.commandResultJson.textContent = JSON.stringify(value, null, 2);
+  elements.commandResult.hidden = false;
+}
+
+function renderPermissions(permissions) {
+  elements.permissionList.replaceChildren();
+  const safe = Array.isArray(permissions) ? permissions.filter((item) => (
+    item && typeof item === "object" && RUN_ID_PATTERN.test(item.permission_id) &&
+    RUN_ID_PATTERN.test(item.run_id) && typeof item.capability_id === "string" &&
+    typeof item.preview === "string" && item.status === "pending"
+  )).slice(0, 6) : [];
+  elements.permissionPanel.hidden = safe.length === 0;
+  for (const permission of safe) {
+    const card = document.createElement("article");
+    card.className = "permission-card";
+    const heading = document.createElement("div");
+    heading.className = "permission-heading";
+    const capability = document.createElement("strong");
+    capability.textContent = permission.capability_id;
+    const run = document.createElement("code");
+    run.textContent = permission.run_id.slice(0, 8);
+    heading.append(capability, run);
+    const preview = document.createElement("pre");
+    preview.className = "permission-preview";
+    preview.textContent = permission.preview;
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    for (const decision of ["deny", "approve"]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = decision === "deny" ? "danger" : "quiet";
+      button.textContent = decision === "deny" ? "拒绝" : "批准";
+      button.addEventListener("click", async () => {
+        for (const control of actions.querySelectorAll("button")) control.disabled = true;
+        try {
+          await api(
+            `/api/agents/${encodeURIComponent(state.agentId)}/permissions/${encodeURIComponent(permission.permission_id)}`,
+            { method: "POST", body: JSON.stringify({ decision }) },
+          );
+          setStatus(decision === "approve" ? "能力已批准一次" : "能力已拒绝");
+          await refreshPendingPermissions(state.activeRun?.runId || null);
+        } catch (error) {
+          setStatus(error.message);
+          for (const control of actions.querySelectorAll("button")) control.disabled = false;
+        }
+      });
+      actions.append(button);
+    }
+    card.append(heading, preview, actions);
+    elements.permissionList.append(card);
+  }
+}
+
+async function refreshPendingPermissions(runId = null) {
+  if (!state.agentId) return;
+  const response = await api(`/api/agents/${encodeURIComponent(state.agentId)}/permissions`);
+  const body = await response.json();
+  const permissions = Array.isArray(body.permissions)
+    ? body.permissions.filter((item) => runId === null || item.run_id === runId)
+    : [];
+  renderPermissions(permissions);
+}
+
+async function pollPendingPermissions(runContext) {
+  while (state.activeRun === runContext && !runContext.terminalSeen && state.csrfToken !== null) {
+    await refreshPendingPermissions(runContext.runId).catch(() => null);
+    await new Promise((resolve) => window.setTimeout(resolve, 750));
+  }
+  if (state.activeRun === runContext || state.activeRun === null) renderPermissions([]);
+}
+
+async function executeSlashCommand(sessionId, command) {
+  const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/commands`, {
+    method: "POST",
+    body: JSON.stringify({ command }),
+  });
+  const value = await response.json();
+  if (
+    !value || value.schema_version !== 1 || value.kind !== "slash_command_result" ||
+    value.model_invoked !== false || value.turn_created !== false ||
+    typeof value.command_id !== "string" || typeof value.result !== "object" ||
+    typeof value.ui_effect !== "object"
+  ) {
+    throw new Error("Slash Command 响应格式无效");
+  }
+  showCommandResult(value);
+  if (value.command_id === "permissions") renderPermissions(value.result.permissions);
+  if (value.ui_effect.next_turn_model_id) {
+    state.selectedModelId = value.ui_effect.next_turn_model_id;
+    elements.modelSelect.value = state.selectedModelId;
+  }
+  if (value.ui_effect.compact_next_turn === true) elements.compactInput.checked = true;
+  elements.messageInput.value = "";
+  if (value.ui_effect.conversation_deleted === true) {
+    clearSelectedSession();
+    await refreshSessions(null);
+  } else {
+    await refreshSessions(sessionId);
+  }
+  setStatus(`/${value.command_id} 已完成；未调用模型、未创建 Turn`);
+}
+
+async function refreshModels() {
+  const response = await api("/api/models");
+  const body = await response.json();
+  if (
+    !body || typeof body.default_model_id !== "string" ||
+    !MODEL_ID_PATTERN.test(body.default_model_id) || !Array.isArray(body.models) ||
+    body.models.length < 1 || body.models.length > 16
+  ) {
+    throw new Error("受信模型目录格式无效");
+  }
+  const models = body.models.map((item) => {
+    if (
+      !item || typeof item !== "object" || typeof item.model_id !== "string" ||
+      !MODEL_ID_PATTERN.test(item.model_id) || typeof item.provider_model !== "string" ||
+      !Number.isSafeInteger(item.operational_context_tokens) ||
+      item.operational_context_tokens < 2048 ||
+      typeof item.profile_digest !== "string" || !/^[a-f0-9]{64}$/.test(item.profile_digest)
+    ) {
+      throw new Error("受信模型目录条目无效");
+    }
+    return item;
+  });
+  if (!models.some((item) => item.model_id === body.default_model_id)) {
+    throw new Error("受信默认模型不存在");
+  }
+  state.models = models;
+  if (!models.some((item) => item.model_id === state.selectedModelId)) {
+    state.selectedModelId = body.default_model_id;
+  }
+  elements.modelSelect.replaceChildren();
+  for (const model of models) {
+    const option = document.createElement("option");
+    option.value = model.model_id;
+    option.textContent = `${model.model_id} · ${model.operational_context_tokens} ctx${
+      model.supports_tools ? " · tools" : " · text"
+    }`;
+    elements.modelSelect.append(option);
+  }
+  elements.modelSelect.value = state.selectedModelId;
+  setRunControls();
 }
 
 function normalizeSession(value) {
@@ -758,7 +970,9 @@ function renderTimelineRunSelect() {
       const option = document.createElement("option");
       option.value = run.runId;
       const status = TURN_STATUS_LABELS[run.status] || run.status || "状态未知";
-      option.textContent = `Turn ${run.turnNumber} · ${status} · Run ${run.runId.slice(0, 8)}`;
+      option.textContent = run.kind === "subagent"
+        ? `子 Agent ${run.childAgentId.slice(0, 8)} · ${status} · Run ${run.runId.slice(0, 8)}`
+        : `Turn ${run.turnNumber} · ${status} · Run ${run.runId.slice(0, 8)}`;
       elements.timelineRunSelect.append(option);
     }
     if (state.timelineRuns.some((run) => run.runId === state.selectedTimelineRunId)) {
@@ -793,6 +1007,77 @@ function registerTimelineRun(runId, status = "running") {
   }
   state.followLatest = true;
   setSelectedTimelineRunId(runId);
+  renderTimelineRunSelect();
+}
+
+function renderSubagents() {
+  elements.subagentList.replaceChildren();
+  elements.subagentPanel.hidden = state.subagents.length === 0;
+  for (const delegation of state.subagents) {
+    const card = document.createElement("article");
+    card.className = "subagent-card";
+    const heading = document.createElement("div");
+    heading.className = "subagent-card-heading";
+    const identity = document.createElement("strong");
+    identity.textContent = `Agent ${delegation.child_agent_id.slice(0, 8)}`;
+    const status = document.createElement("span");
+    status.className = `subagent-state state-${delegation.state}`;
+    status.textContent = delegation.state;
+    heading.append(identity, status);
+    card.append(heading);
+    for (const message of delegation.mailbox) {
+      const row = document.createElement("div");
+      row.className = `subagent-message ${message.direction}`;
+      const label = document.createElement("span");
+      label.textContent = message.direction === "parent_to_child" ? "父 → 子" : "子 → 父";
+      const content = document.createElement("pre");
+      content.textContent = message.content;
+      row.append(label, content);
+      card.append(row);
+    }
+    if (typeof delegation.child_run_id === "string") {
+      const replay = document.createElement("button");
+      replay.type = "button";
+      replay.className = "quiet subagent-replay";
+      replay.textContent = `查看子 Run ${delegation.child_run_id.slice(0, 8)}`;
+      replay.addEventListener("click", () => {
+        void selectTimelineRun(delegation.child_run_id, { scrollTurn: false });
+      });
+      card.append(replay);
+    }
+    elements.subagentList.append(card);
+  }
+}
+
+async function refreshSubagents(sessionId, requestNumber) {
+  const response = await api(
+    `/api/agents/${encodeURIComponent(state.agentId)}/sessions/` +
+    `${encodeURIComponent(sessionId)}/subagents`,
+  );
+  const payload = await response.json();
+  if (requestNumber !== state.sessionRequest || state.sessionId !== sessionId) return;
+  if (!Array.isArray(payload.delegations)) throw new Error("子智能体状态格式无效");
+  state.subagents = payload.delegations.filter((item) => (
+    item && typeof item.child_agent_id === "string" &&
+    Array.isArray(item.mailbox)
+  ));
+  for (const item of state.subagents) {
+    if (
+      typeof item.child_run_id === "string" && RUN_ID_PATTERN.test(item.child_run_id) &&
+      !state.timelineRuns.some((run) => run.runId === item.child_run_id)
+    ) {
+      state.timelineRuns.push({
+        runId: item.child_run_id,
+        turnId: item.child_turn_id || null,
+        turnNumber: null,
+        status: item.state,
+        kind: "subagent",
+        childAgentId: item.child_agent_id,
+        childConversationId: item.child_conversation_id,
+      });
+    }
+  }
+  renderSubagents();
   renderTimelineRunSelect();
 }
 
@@ -836,6 +1121,10 @@ function addTimelineControl(kind, payload, cursor) {
 }
 
 async function loadDurableTimeline(runId, sessionRequest, timelineRequest, sessionId) {
+  const runMetadata = state.timelineRuns.find((item) => item.runId === runId);
+  const expectedConversationId = runMetadata?.kind === "subagent"
+    ? runMetadata.childConversationId
+    : sessionId;
   let cursor = 0;
   let pages = 0;
   let replayComplete = false;
@@ -843,8 +1132,12 @@ async function loadDurableTimeline(runId, sessionRequest, timelineRequest, sessi
   const ordered = [];
   let insertionOrder = 0;
   while (pages < 5) {
+    const replayPath = runMetadata?.kind === "subagent"
+      ? `/api/agents/${encodeURIComponent(runMetadata.childAgentId)}/runs/` +
+        `${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`
+      : `/api/runs/${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`;
     const response = await api(
-      `/api/runs/${encodeURIComponent(runId)}/replay?after=${cursor}&limit=128`,
+      replayPath,
     );
     const page = await response.json();
     if (!timelineLoadIsCurrent(runId, sessionRequest, timelineRequest, sessionId)) {
@@ -852,7 +1145,7 @@ async function loadDurableTimeline(runId, sessionRequest, timelineRequest, sessi
     }
     const identity = page?.identity;
     if (
-      !identity || identity.run_id !== runId || identity.conversation_id !== sessionId ||
+      !identity || identity.run_id !== runId || identity.conversation_id !== expectedConversationId ||
       !Array.isArray(page.events) || !Array.isArray(page.gaps) ||
       !Number.isSafeInteger(page.next_cursor) || page.next_cursor < cursor ||
       typeof page.has_more !== "boolean"
@@ -1004,6 +1297,7 @@ async function selectSession(
       detail.messages,
       preserveTimeline && previousSessionId === sessionId ? previousTimelineRunId : null,
     );
+    await refreshSubagents(sessionId, requestNumber);
     if (ownerRun && !state.timelineRuns.some((run) => run.runId === ownerRun.runId)) {
       registerTimelineRun(ownerRun.runId, "running");
     }
@@ -1326,7 +1620,15 @@ async function inspectSelectedRunContext(trigger) {
   setContextInspectControl();
   if (!elements.contextInspectDialog.open) elements.contextInspectDialog.showModal();
   try {
-    const response = await api(`/api/runs/${encodeURIComponent(runId)}/context`);
+    const runMetadata = state.timelineRuns.find((item) => item.runId === runId);
+    const expectedConversationId = runMetadata?.kind === "subagent"
+      ? runMetadata.childConversationId
+      : sessionId;
+    const contextPath = runMetadata?.kind === "subagent"
+      ? `/api/agents/${encodeURIComponent(runMetadata.childAgentId)}/runs/` +
+        `${encodeURIComponent(runId)}/context`
+      : `/api/runs/${encodeURIComponent(runId)}/context`;
+    const response = await api(contextPath);
     const body = await response.json();
     if (
       !contextLoadIsCurrent(
@@ -1339,7 +1641,7 @@ async function inspectSelectedRunContext(trigger) {
     ) {
       return;
     }
-    renderContextInspection(validateContextInspection(body, runId, sessionId));
+    renderContextInspection(validateContextInspection(body, runId, expectedConversationId));
   } catch (_error) {
     if (
       contextLoadIsCurrent(
@@ -1483,6 +1785,8 @@ async function restoreLoginSession() {
     return;
   }
   try {
+    await refreshCommands();
+    await refreshModels();
     await refreshSessions(null);
   } catch (error) {
     if (state.csrfToken !== null) setStatus(error.message);
@@ -1501,6 +1805,8 @@ elements.loginForm.addEventListener("submit", async (event) => {
     });
     setAuthenticated(await response.json());
     try {
+      await refreshCommands();
+      await refreshModels();
       await refreshSessions(null);
     } catch (error) {
       if (state.csrfToken !== null) setStatus(error.message);
@@ -1520,6 +1826,11 @@ elements.logoutButton.addEventListener("click", async () => {
 
 elements.newSessionButton.addEventListener("click", () => {
   void createSession();
+});
+
+elements.commandResultClose.addEventListener("click", () => {
+  elements.commandResult.hidden = true;
+  elements.commandResultJson.textContent = "";
 });
 
 elements.timelineRunSelect.addEventListener("change", () => {
@@ -1637,8 +1948,12 @@ function eventSummary(envelope) {
     ) {
       return "模型请求元数据不可用";
     }
+    const attempt = Number.isSafeInteger(payload.attempt) ? payload.attempt : 0;
+    const providerCall = Number.isSafeInteger(payload.provider_call_index)
+      ? ` · provider #${payload.provider_call_index}` : "";
     return (
-      `模型调用 #${iteration} · ${messageCount} 条消息 · ${toolCount} tools · ` +
+      `模型调用 #${iteration} / attempt ${attempt}${providerCall} · ` +
+      `${messageCount} 条消息 · ${toolCount} tools · ` +
       `${toolResults.length} 个 tool result`
     );
   }
@@ -1654,10 +1969,23 @@ function eventSummary(envelope) {
     ) {
       return "模型响应元数据不可用";
     }
+    const attempt = Number.isSafeInteger(payload.attempt) ? payload.attempt : 0;
+    const providerCall = Number.isSafeInteger(payload.provider_call_index)
+      ? ` · provider #${payload.provider_call_index}` : "";
     return (
-      `模型调用 #${iteration} · ${outcome} · ` +
+      `模型调用 #${iteration} / attempt ${attempt}${providerCall} · ${outcome} · ` +
       `${inputTokens} input / ${outputTokens} output tokens`
     );
+  }
+  if (envelope.kind === "model.recovery.started") {
+    if (
+      !Number.isSafeInteger(payload.iteration) || payload.iteration < 1 ||
+      payload.attempt !== 1 ||
+      !["model_context_overflow", "model_media_overflow"].includes(payload.overflow_code)
+    ) {
+      return "模型恢复元数据不可用";
+    }
+    return `模型调用 #${payload.iteration} · ${payload.overflow_code} · 单次恢复`;
   }
   if (envelope.kind === "run.started") {
     const context = payload.context_plan;
@@ -1665,7 +1993,10 @@ function eventSummary(envelope) {
       !context || typeof context !== "object" || Array.isArray(context) ||
       !isNonNegativeInteger(context.included_history_message_count) ||
       !isNonNegativeInteger(context.history_message_count) ||
-      !["full", "completed-turn-tail-v1"].includes(context.windowing_strategy)
+      ![
+        "full", "completed-turn-tail-v1", "completed-turn-collapse-v2",
+        "semantic-summary-v1",
+      ].includes(context.windowing_strategy)
     ) {
       return "上下文窗口元数据不可用";
     }
@@ -2394,6 +2725,7 @@ function completeRunContext(runContext, refreshFailed, summariesRefreshed) {
 async function driveRun(runContext) {
   if (runContext.driverPromise) return runContext.driverPromise;
   const driver = (async () => {
+    void pollPendingPermissions(runContext);
     let streamError = null;
     try {
       await streamWithReconnect(runContext);
@@ -2466,27 +2798,59 @@ function attachRecoveredRun(sessionId, runId) {
   void driveRun(runContext);
 }
 
+elements.modelSelect.addEventListener("change", () => {
+  const candidate = elements.modelSelect.value;
+  if (state.models.some((item) => item.model_id === candidate)) {
+    state.selectedModelId = candidate;
+  } else {
+    elements.modelSelect.value = state.selectedModelId || "";
+  }
+});
+
 elements.runForm.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (
-    state.activeRun !== null || state.settling || state.mutationPending ||
-    state.sessionId === null
-  ) {
-    return;
-  }
   const message = elements.messageInput.value;
   if (!message.trim()) {
     setStatus("消息不能为空");
     return;
   }
+  const slashCommand = message.trimStart().startsWith("/");
+  if (
+    state.mutationPending || state.sessionId === null ||
+    (!slashCommand && (state.activeRun !== null || state.settling))
+  ) return;
   const sessionId = state.sessionId;
+  if (slashCommand) {
+    state.mutationPending = true;
+    setRunControls();
+    try {
+      await executeSlashCommand(sessionId, message);
+    } catch (error) {
+      if (state.csrfToken !== null) setStatus(error.message);
+    } finally {
+      state.mutationPending = false;
+      setRunControls();
+    }
+    return;
+  }
+  const modelId = elements.modelSelect.value;
+  if (!MODEL_ID_PATTERN.test(modelId) || !state.models.some(
+    (item) => item.model_id === modelId
+  )) {
+    setStatus("请选择受信模型");
+    return;
+  }
   state.settling = true;
   setRunControls();
   let runContext = null;
   try {
     const response = await api(`/api/sessions/${encodeURIComponent(sessionId)}/runs`, {
       method: "POST",
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({
+        message,
+        model_id: modelId,
+        compact: elements.compactInput.checked,
+      }),
     });
     const run = await response.json();
     if (
@@ -2508,6 +2872,7 @@ elements.runForm.addEventListener("submit", async (event) => {
       driverPromise: null,
     };
     state.activeRun = runContext;
+    elements.compactInput.checked = false;
     state.liveAssistantContent = null;
     elements.messageInput.value = "";
     appendMessage("user", message, { runId: run.run_id, turnStatus: "running" });

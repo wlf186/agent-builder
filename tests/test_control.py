@@ -1511,3 +1511,32 @@ printf '%s\n' '{"kind":"tool.call.requested","durability":"durable","payload":{"
     finally:
         reopened_journal.close()
         reopened_store.close()
+
+
+def test_control_keeps_canonical_tool_result_but_projects_model_view() -> None:
+    record = _record()
+    record.pending_tools["call-large"] = "builtin/echo"
+    record.pending_tool_arguments["call-large"] = {"text": "x" * 8_192}
+    record.started_tools.add("call-large")
+    record.broker_pending_tool_calls["call-large"] = (
+        "builtin/echo",
+        {"text": "x" * 8_192},
+    )
+    payload: dict[str, Any] = {
+        "call_id": "call-large",
+        "outcome": "succeeded",
+        "result": "x" * 8_192,
+    }
+
+    RunService._apply_worker_event(record, "tool.call.finished", payload)
+
+    assert payload["result"] == "x" * 8_192
+    assert len(record.broker_tool_results) == 1
+    projected = record.broker_tool_results[0]
+    assert projected.truncated is True
+    assert projected.original_bytes == 8_192
+    assert projected.content_digest in projected.content
+    assert "call_id=call-large" in projected.content
+    assert len(projected.content.encode("utf-8")) <= 4_096
+    assert record.pending_tools == {}
+    assert record.broker_pending_tool_calls == {}

@@ -9,7 +9,7 @@ from time import sleep
 from typing import Any, BinaryIO, Callable, Iterator, Protocol
 
 from .context import ModelContext
-from .tools import ToolSpec, prototype_tool_specs, toolset_digest
+from .tools import ToolResult, ToolSpec, prototype_tool_specs, toolset_digest
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,91 @@ class ModelToolResult:
     tool_id: str
     outcome: str
     content: str = field(repr=False)
+
+
+class BrokeredCapabilityClient:
+    """A reference-only Tool client over the already inherited Worker pipes."""
+
+    def __init__(
+        self,
+        reader: BinaryIO,
+        writer: BinaryIO,
+        effective_tools: tuple[ToolSpec, ...],
+    ) -> None:
+        self._reader = reader
+        self._writer = writer
+        self._tools = {spec.tool_id: spec for spec in effective_tools}
+        self._sequence = 0
+
+    def execute(
+        self,
+        tool_id: str,
+        arguments: dict[str, str | int | bool],
+        call_id: str,
+    ) -> ToolResult:
+        spec = self._tools.get(tool_id)
+        if spec is None or tool_id not in {
+            "file/stat", "file/read_text", "file/glob", "file/grep",
+            "file/edit", "file/write", "exec/run", "extension/call", "skill/run",
+            "agent/delegate",
+        }:
+            return ToolResult("failed", "Unsupported brokered capability")
+        try:
+            validated = spec.validate_arguments(arguments)
+        except ValueError:
+            return ToolResult("failed", "Invalid brokered capability arguments")
+        if _BROKER_ID.fullmatch(call_id) is None:
+            return ToolResult("failed", "Invalid brokered capability identity")
+        self._sequence += 1
+        request_id = f"capability-{self._sequence}"
+        payload = json.dumps(
+            {
+                "internal": "capability.request",
+                "version": BROKER_PROTOCOL_VERSION,
+                "request_id": request_id,
+                "call_id": call_id,
+                "tool_id": tool_id,
+                "arguments": validated,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        if len(payload) > MAX_BROKER_FRAME_BYTES:
+            return ToolResult("failed", "Brokered capability request is too large")
+        self._writer.write(payload)
+        self._writer.flush()
+        raw = self._reader.readline(MAX_BROKER_FRAME_BYTES + 1)
+        if (
+            not raw
+            or len(raw) > MAX_BROKER_FRAME_BYTES
+            or not raw.endswith(b"\n")
+        ):
+            return ToolResult("failed", "Brokered capability response is invalid")
+        try:
+            response = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ToolResult("failed", "Brokered capability response is invalid")
+        if (
+            not isinstance(response, dict)
+            or set(response)
+            != {
+                "internal", "version", "request_id", "type", "call_id",
+                "tool_id", "outcome", "content",
+            }
+            or response.get("internal") != "capability.response"
+            or response.get("version") != BROKER_PROTOCOL_VERSION
+            or response.get("request_id") != request_id
+            or response.get("type") != "result"
+            or response.get("call_id") != call_id
+            or response.get("tool_id") != tool_id
+            or response.get("outcome") not in {"succeeded", "failed", "cancelled"}
+        ):
+            return ToolResult("failed", "Brokered capability response is invalid")
+        try:
+            content = spec.validate_result(response.get("content"))
+        except ValueError:
+            return ToolResult("failed", "Brokered capability response is invalid")
+        return ToolResult(str(response["outcome"]), content)
 
 
 class StreamingModel(Protocol):
@@ -292,6 +377,7 @@ class BrokeredStreamingModel:
 
 __all__ = [
     "BROKER_PROTOCOL_VERSION",
+    "BrokeredCapabilityClient",
     "BrokeredStreamingModel",
     "FakeStreamingModel",
     "MAX_BROKER_FRAME_BYTES",

@@ -1,7 +1,7 @@
 [project]
 name = "agent-builder-harness"
 version = "0.2.0"
-description = "Checkout-contained, event-driven AI agent runtime prototype"
+description = "Checkout-contained, event-driven single-operator AI agent runtime"
 requires-python = ">=3.11,<3.12"
 dependencies = [
   "fastapi==0.139.2",

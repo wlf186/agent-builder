@@ -17,6 +17,7 @@ import re
 import sqlite3
 import stat
 from threading import Lock
+import time
 from typing import Literal
 from uuid import uuid4
 
@@ -26,9 +27,17 @@ from .contracts import (
     EventEnvelope,
     utc_now,
 )
+from .context_projection import (
+    CONTEXT_PROJECTION_VERSION,
+    LEGACY_CONTEXT_PROJECTION_VERSION,
+    MAX_CONTEXT_PROJECTION_BYTES,
+    ContextProjectionBoundary,
+    ContextProjectionError,
+)
 from .replay import (
     LEGACY_PROJECTION_VERSION,
     MULTI_TOOL_LOOP_FEATURE,
+    OVERFLOW_RECOVERY_FEATURE,
     PROJECTION_VERSION,
     ProjectionSnapshot,
     ReplayCorruptionError,
@@ -38,7 +47,7 @@ from .replay import (
     encode_projection_snapshot,
     project_durable_run,
 )
-from .tools import ToolSpec, prototype_tool_specs
+from .tools import ToolSpec, runtime_tool_specs
 
 
 DATABASE_NAME = "state.sqlite"
@@ -68,6 +77,9 @@ MAX_RECOVERY_WORKER_TEXT_BYTES = 12_288
 MAX_LIST_LIMIT = 100
 MAX_LIST_OFFSET = 100_000
 MAX_OPERATION_RECORDS_PER_AGENT = 4_096
+MAX_PERMISSION_RECORDS_PER_AGENT = 4_096
+MAX_PENDING_PERMISSIONS_PER_AGENT = 64
+MAX_CAPABILITY_AUDIT_RECORDS_PER_AGENT = 16_384
 MAX_PROVIDER_CALLS_PER_RUN = 64
 MAX_SNAPSHOT_BYTES = 65_536
 MAX_LEDGER_TEXT_BYTES = 128
@@ -87,6 +99,7 @@ _RECOVERY_DURABLE_KINDS = frozenset(
         "run.started",
         "model.request.started",
         "model.response.finished",
+        "model.recovery.started",
         "assistant.block.started",
         "assistant.block.finished",
         "assistant.block.discarded",
@@ -102,13 +115,24 @@ _RECOVERY_BLOCK_REASONS = frozenset(
     {"cancelled", "runtime_failure", "worker_failure"}
 )
 _RECOVERY_TOOL_SPECS: dict[str, ToolSpec] = {
-    spec.tool_id: spec for spec in prototype_tool_specs()
+    spec.tool_id: spec for spec in runtime_tool_specs()
 }
 TurnStatus = Literal["running", "completed", "failed", "cancelled", "interrupted"]
 TerminalTurnStatus = Literal["failed", "cancelled", "interrupted"]
 MessageRole = Literal["user", "assistant"]
 OperationStatus = Literal[
     "intent", "dispatched", "succeeded", "failed", "cancelled", "outcome_unknown"
+]
+PermissionStatus = Literal[
+    "pending", "approved", "denied", "expired", "cancelled"
+]
+PermissionDecision = Literal["allow", "ask", "deny"]
+CapabilityAuditKind = Literal[
+    "permission.requested",
+    "permission.resolved",
+    "operation.intent",
+    "operation.dispatched",
+    "operation.outcome",
 ]
 ProviderUsageStatus = Literal["started", "complete", "incomplete"]
 
@@ -367,6 +391,63 @@ class OperationMutation:
 
 
 @dataclass(frozen=True, slots=True)
+class PermissionRecord:
+    permission_id: str
+    agent_id: str
+    capsule_generation: int
+    conversation_id: str
+    turn_id: str
+    run_id: str
+    call_id: str
+    capability_id: str
+    toolset_digest: str
+    policy_digest: str
+    arguments_digest: str
+    preview: str
+    preview_digest: str
+    policy_decision: PermissionDecision
+    status: PermissionStatus
+    expires_at_milliseconds: int
+    created_at: str
+    resolved_at: str | None
+    resolution_source: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PermissionMutation:
+    record: PermissionRecord
+    changed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityAuditEvent:
+    audit_seq: int
+    audit_id: str
+    agent_id: str
+    run_id: str
+    permission_id: str | None
+    operation_id: str | None
+    kind: CapabilityAuditKind
+    status: str
+    detail_digest: str | None
+    occurred_at: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "audit_seq": self.audit_seq,
+            "audit_id": self.audit_id,
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "permission_id": self.permission_id,
+            "operation_id": self.operation_id,
+            "kind": self.kind,
+            "status": self.status,
+            "detail_digest": self.detail_digest,
+            "occurred_at": self.occurred_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ProviderUsage:
     run_id: str
     call_index: int
@@ -441,6 +522,14 @@ def _run_journal_state_from_row(row: tuple[object, ...]) -> RunJournalState:
 
 def _operation_from_row(row: tuple[object, ...]) -> OperationRecord:
     return OperationRecord(*row)  # type: ignore[arg-type]
+
+
+def _permission_from_row(row: tuple[object, ...]) -> PermissionRecord:
+    return PermissionRecord(*row)  # type: ignore[arg-type]
+
+
+def _capability_audit_from_row(row: tuple[object, ...]) -> CapabilityAuditEvent:
+    return CapabilityAuditEvent(*row)  # type: ignore[arg-type]
 
 
 def _provider_usage_from_row(row: tuple[object, ...]) -> ProviderUsage:
@@ -821,6 +910,68 @@ class ConversationStore:
                     created_at TEXT NOT NULL,
                     CHECK (length(CAST(snapshot_json AS BLOB)) <= 65536)
                 );
+                CREATE TABLE IF NOT EXISTS context_projection_boundaries (
+                    run_id TEXT PRIMARY KEY
+                        REFERENCES run_journal_state(run_id) ON DELETE CASCADE,
+                    projection_version TEXT NOT NULL,
+                    conversation_revision INTEGER NOT NULL CHECK (
+                        conversation_revision BETWEEN 0 AND 1000000000
+                    ),
+                    boundary_digest TEXT NOT NULL CHECK (
+                        length(boundary_digest) = 64
+                    ),
+                    snapshot_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    CHECK (length(CAST(snapshot_json AS BLOB)) <= 16384)
+                );
+                CREATE TABLE IF NOT EXISTS permission_requests (
+                    permission_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    capsule_generation INTEGER NOT NULL CHECK (
+                        capsule_generation BETWEEN 1 AND 1000000000
+                    ),
+                    conversation_id TEXT NOT NULL
+                        REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+                    turn_id TEXT NOT NULL
+                        REFERENCES conversation_turns(turn_id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL
+                        REFERENCES conversation_turns(run_id) ON DELETE CASCADE,
+                    call_id TEXT NOT NULL,
+                    capability_id TEXT NOT NULL,
+                    toolset_digest TEXT NOT NULL CHECK (length(toolset_digest) = 64),
+                    policy_digest TEXT NOT NULL CHECK (length(policy_digest) = 64),
+                    arguments_digest TEXT NOT NULL CHECK (length(arguments_digest) = 64),
+                    preview TEXT NOT NULL CHECK (length(CAST(preview AS BLOB)) <= 4096),
+                    preview_digest TEXT NOT NULL CHECK (length(preview_digest) = 64),
+                    policy_decision TEXT NOT NULL CHECK (
+                        policy_decision IN ('allow', 'ask', 'deny')
+                    ),
+                    status TEXT NOT NULL CHECK (
+                        status IN (
+                            'pending', 'approved', 'denied', 'expired', 'cancelled'
+                        )
+                    ),
+                    expires_at_milliseconds INTEGER NOT NULL CHECK (
+                        expires_at_milliseconds > 0
+                    ),
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution_source TEXT,
+                    UNIQUE (agent_id, run_id, call_id),
+                    CHECK (
+                        (status = 'pending' AND policy_decision = 'ask'
+                            AND resolved_at IS NULL AND resolution_source IS NULL)
+                        OR (status != 'pending' AND resolved_at IS NOT NULL
+                            AND resolution_source IS NOT NULL)
+                    ),
+                    CHECK (
+                        (policy_decision = 'allow' AND status = 'approved')
+                        OR (policy_decision = 'deny' AND status = 'denied')
+                        OR policy_decision = 'ask'
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS permission_requests_pending
+                    ON permission_requests(agent_id, status, expires_at_milliseconds);
                 CREATE TABLE IF NOT EXISTS operation_ledger (
                     operation_id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
@@ -869,6 +1020,34 @@ class ConversationStore:
                 );
                 CREATE INDEX IF NOT EXISTS operation_ledger_run
                     ON operation_ledger(run_id, call_id);
+                CREATE TABLE IF NOT EXISTS capability_audit_events (
+                    audit_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    audit_id TEXT NOT NULL UNIQUE,
+                    agent_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL
+                        REFERENCES conversation_turns(run_id) ON DELETE CASCADE,
+                    permission_id TEXT,
+                    operation_id TEXT,
+                    kind TEXT NOT NULL CHECK (
+                        kind IN (
+                            'permission.requested', 'permission.resolved',
+                            'operation.intent', 'operation.dispatched',
+                            'operation.outcome'
+                        )
+                    ),
+                    status TEXT NOT NULL,
+                    detail_digest TEXT CHECK (
+                        detail_digest IS NULL OR length(detail_digest) = 64
+                    ),
+                    occurred_at TEXT NOT NULL,
+                    CHECK (length(status) BETWEEN 1 AND 64),
+                    CHECK (
+                        (kind LIKE 'permission.%' AND permission_id IS NOT NULL)
+                        OR (kind LIKE 'operation.%' AND operation_id IS NOT NULL)
+                    )
+                );
+                CREATE INDEX IF NOT EXISTS capability_audit_run
+                    ON capability_audit_events(agent_id, run_id, audit_seq);
                 CREATE TABLE IF NOT EXISTS provider_usage (
                     run_id TEXT NOT NULL
                         REFERENCES run_journal_state(run_id) ON DELETE CASCADE,
@@ -1184,6 +1363,554 @@ class ConversationStore:
         snapshot = self.read_run_snapshot(run_id)
         return None if snapshot is None else snapshot.to_dict()
 
+    def read_context_projection_boundary(
+        self, run_id: str
+    ) -> ContextProjectionBoundary | None:
+        run_id = _validate_id(run_id, "run_id")
+        with self._lock:
+            self._ensure_open()
+            try:
+                row = self._connection.execute(
+                    """
+                    SELECT b.projection_version, b.conversation_revision,
+                           b.boundary_digest, b.snapshot_json
+                    FROM context_projection_boundaries AS b
+                    JOIN conversation_turns AS t ON t.run_id = b.run_id
+                    JOIN conversations AS c
+                      ON c.conversation_id = t.conversation_id
+                    WHERE b.run_id = ? AND c.agent_id = ?
+                    """,
+                    (run_id, self.agent_id),
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise ConversationStoreUnavailableError(
+                    "could not read context projection boundary"
+                ) from exc
+        if row is None:
+            return None
+        version, conversation_revision, boundary_digest, raw = row
+        try:
+            raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else b""
+        except UnicodeEncodeError:
+            raw_bytes = b""
+        if (
+            version not in {
+                CONTEXT_PROJECTION_VERSION,
+                LEGACY_CONTEXT_PROJECTION_VERSION,
+            }
+            or not isinstance(conversation_revision, int)
+            or isinstance(conversation_revision, bool)
+            or not isinstance(boundary_digest, str)
+            or not isinstance(raw, str)
+            or not 2 <= len(raw_bytes) <= MAX_CONTEXT_PROJECTION_BYTES
+        ):
+            raise ConversationConflictError(
+                "context projection boundary is invalid"
+            )
+        try:
+            boundary = ContextProjectionBoundary.from_json(raw)
+        except ContextProjectionError as exc:
+            raise ConversationConflictError(
+                "context projection boundary is invalid"
+            ) from exc
+        if (
+            boundary.run_id != run_id
+            or boundary.version != version
+            or boundary.conversation_revision != conversation_revision
+            or boundary.boundary_digest != boundary_digest
+        ):
+            raise ConversationConflictError(
+                "context projection boundary is invalid"
+            )
+        return boundary
+
+    def replace_context_projection_boundary(
+        self,
+        boundary: ContextProjectionBoundary,
+        *,
+        expected_boundary_digest: str,
+    ) -> ContextProjectionBoundary:
+        if (
+            not isinstance(boundary, ContextProjectionBoundary)
+            or boundary.agent_id != self.agent_id
+        ):
+            raise ValueError("invalid context projection replacement")
+        expected_boundary_digest = _ledger_digest(
+            expected_boundary_digest, "expected_boundary_digest"
+        )
+        encoded = boundary.to_json()
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                identity = self._resolve_run_identity_locked(boundary.run_id)
+                if identity is None:
+                    raise TurnNotFoundError("projection boundary Run was not found")
+                if (
+                    identity.agent_id != boundary.agent_id
+                    or identity.conversation_id != boundary.conversation_id
+                    or identity.turn_id != boundary.turn_id
+                ):
+                    raise ConversationConflictError(
+                        "projection boundary identity changed"
+                    )
+                cursor = self._connection.execute(
+                    """
+                    UPDATE context_projection_boundaries
+                    SET projection_version = ?, conversation_revision = ?,
+                        boundary_digest = ?, snapshot_json = ?, created_at = ?
+                    WHERE run_id = ? AND boundary_digest = ?
+                    """,
+                    (
+                        boundary.version,
+                        boundary.conversation_revision,
+                        boundary.boundary_digest,
+                        encoded,
+                        timestamp,
+                        boundary.run_id,
+                        expected_boundary_digest,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ConversationConflictError(
+                        "context projection boundary CAS failed"
+                    )
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not replace context projection boundary"
+                ) from exc
+        return boundary
+
+    def _permission_row(self, permission_id: str) -> tuple[object, ...] | None:
+        return self._connection.execute(
+            """
+            SELECT permission_id, agent_id, capsule_generation,
+                   conversation_id, turn_id, run_id, call_id, capability_id,
+                   toolset_digest, policy_digest, arguments_digest, preview,
+                   preview_digest, policy_decision, status,
+                   expires_at_milliseconds, created_at, resolved_at,
+                   resolution_source
+            FROM permission_requests
+            WHERE permission_id = ? AND agent_id = ?
+            """,
+            (permission_id, self.agent_id),
+        ).fetchone()
+
+    def _insert_capability_audit_locked(
+        self,
+        *,
+        run_id: str,
+        kind: CapabilityAuditKind,
+        status: str,
+        timestamp: str,
+        permission_id: str | None = None,
+        operation_id: str | None = None,
+        detail_digest: str | None = None,
+    ) -> None:
+        if (
+            kind not in {
+                "permission.requested",
+                "permission.resolved",
+                "operation.intent",
+                "operation.dispatched",
+                "operation.outcome",
+            }
+            or _LEDGER_NAME.fullmatch(status) is None
+            or (detail_digest is not None and _LEDGER_DIGEST.fullmatch(detail_digest) is None)
+        ):
+            raise ValueError("invalid capability audit event")
+        count = self._connection.execute(
+            "SELECT COUNT(*) FROM capability_audit_events WHERE agent_id = ?",
+            (self.agent_id,),
+        ).fetchone()[0]
+        if count >= MAX_CAPABILITY_AUDIT_RECORDS_PER_AGENT:
+            raise ConversationConflictError("capability audit capacity is exhausted")
+        self._connection.execute(
+            """
+            INSERT INTO capability_audit_events(
+                audit_id, agent_id, run_id, permission_id, operation_id,
+                kind, status, detail_digest, occurred_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid4().hex,
+                self.agent_id,
+                run_id,
+                permission_id,
+                operation_id,
+                kind,
+                status,
+                detail_digest,
+                timestamp,
+            ),
+        )
+
+    def capability_audit_events(
+        self, run_id: str, *, after_seq: int = 0, limit: int = 128
+    ) -> tuple[CapabilityAuditEvent, ...]:
+        run_id = _validate_id(run_id, "run_id")
+        if (
+            not isinstance(after_seq, int)
+            or isinstance(after_seq, bool)
+            or not 0 <= after_seq <= 1_000_000_000
+            or not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 128
+        ):
+            raise ValueError("invalid capability audit cursor")
+        with self._lock:
+            self._ensure_open()
+            if not self._owned_run_exists(run_id):
+                raise TurnNotFoundError("capability audit Run was not found")
+            rows = self._connection.execute(
+                """
+                SELECT audit_seq, audit_id, agent_id, run_id, permission_id,
+                       operation_id, kind, status, detail_digest, occurred_at
+                FROM capability_audit_events
+                WHERE agent_id = ? AND run_id = ? AND audit_seq > ?
+                ORDER BY audit_seq LIMIT ?
+                """,
+                (self.agent_id, run_id, after_seq, limit),
+            ).fetchall()
+        return tuple(_capability_audit_from_row(row) for row in rows)
+
+    def create_permission_request(
+        self,
+        *,
+        permission_id: str,
+        capsule_generation: int,
+        conversation_id: str,
+        turn_id: str,
+        run_id: str,
+        call_id: str,
+        capability_id: str,
+        toolset_digest: str,
+        policy_digest: str,
+        arguments_digest: str,
+        preview: str,
+        preview_digest: str,
+        policy_decision: PermissionDecision,
+        expires_at_milliseconds: int,
+    ) -> PermissionMutation:
+        permission_id = _validate_id(permission_id, "permission_id")
+        conversation_id = _validate_id(conversation_id, "conversation_id")
+        turn_id = _validate_id(turn_id, "turn_id")
+        run_id = _validate_id(run_id, "run_id")
+        call_id = _ledger_name(call_id, "call_id")
+        capability_id = _ledger_name(capability_id, "capability_id")
+        toolset_digest = _ledger_digest(toolset_digest, "toolset_digest")
+        policy_digest = _ledger_digest(policy_digest, "policy_digest")
+        arguments_digest = _ledger_digest(arguments_digest, "arguments_digest")
+        preview = _bounded_text(preview, "permission preview", 4_096)
+        preview_digest = _ledger_digest(preview_digest, "preview_digest")
+        if (
+            not isinstance(capsule_generation, int)
+            or isinstance(capsule_generation, bool)
+            or not 1 <= capsule_generation <= 1_000_000_000
+            or policy_decision not in {"allow", "ask", "deny"}
+            or not isinstance(expires_at_milliseconds, int)
+            or isinstance(expires_at_milliseconds, bool)
+            or expires_at_milliseconds <= 0
+        ):
+            raise ValueError("invalid permission request")
+        timestamp = utc_now()
+        status: PermissionStatus = {
+            "allow": "approved",
+            "ask": "pending",
+            "deny": "denied",
+        }[policy_decision]  # type: ignore[assignment]
+        resolved_at = None if status == "pending" else timestamp
+        resolution_source = None if status == "pending" else "policy"
+        immutable = (
+            self.agent_id,
+            capsule_generation,
+            conversation_id,
+            turn_id,
+            run_id,
+            call_id,
+            capability_id,
+            toolset_digest,
+            policy_digest,
+            arguments_digest,
+            preview,
+            preview_digest,
+            policy_decision,
+            status,
+            expires_at_milliseconds,
+            timestamp,
+            resolved_at,
+            resolution_source,
+        )
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                self._validate_operation_target(conversation_id, turn_id, run_id)
+                if self._permission_row(permission_id) is not None:
+                    raise ConversationConflictError("permission identity already exists")
+                total, pending = self._connection.execute(
+                    """
+                    SELECT COUNT(*), SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)
+                    FROM permission_requests WHERE agent_id = ?
+                    """,
+                    (self.agent_id,),
+                ).fetchone()
+                if total >= MAX_PERMISSION_RECORDS_PER_AGENT:
+                    raise ConversationConflictError("permission ledger capacity is exhausted")
+                if status == "pending" and (pending or 0) >= MAX_PENDING_PERMISSIONS_PER_AGENT:
+                    raise ConversationConflictError("pending permission capacity is exhausted")
+                self._connection.execute(
+                    """
+                    INSERT INTO permission_requests(
+                        permission_id, agent_id, capsule_generation,
+                        conversation_id, turn_id, run_id, call_id, capability_id,
+                        toolset_digest, policy_digest, arguments_digest, preview,
+                        preview_digest, policy_decision, status,
+                        expires_at_milliseconds, created_at, resolved_at,
+                        resolution_source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (permission_id, *immutable),
+                )
+                self._insert_capability_audit_locked(
+                    run_id=run_id,
+                    permission_id=permission_id,
+                    kind="permission.requested",
+                    status=policy_decision,
+                    detail_digest=preview_digest,
+                    timestamp=timestamp,
+                )
+                if status != "pending":
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status=status,
+                        detail_digest=arguments_digest,
+                        timestamp=timestamp,
+                    )
+                row = self._permission_row(permission_id)
+                assert row is not None
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.IntegrityError as exc:
+                self._rollback()
+                raise ConversationConflictError(
+                    "permission call identity already exists"
+                ) from exc
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not record permission request"
+                ) from exc
+        return PermissionMutation(_permission_from_row(row), True)
+
+    def resolve_permission_request(
+        self,
+        permission_id: str,
+        status: Literal["approved", "denied", "expired", "cancelled"],
+        *,
+        resolution_source: Literal["operator", "system"],
+        now_milliseconds: int | None = None,
+    ) -> PermissionMutation:
+        permission_id = _validate_id(permission_id, "permission_id")
+        if status not in {"approved", "denied", "expired", "cancelled"}:
+            raise ValueError("invalid permission resolution")
+        now_value = int(time.time() * 1000) if now_milliseconds is None else now_milliseconds
+        if not isinstance(now_value, int) or isinstance(now_value, bool) or now_value <= 0:
+            raise ValueError("invalid permission resolution time")
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                row = self._permission_row(permission_id)
+                if row is None:
+                    raise TurnNotFoundError("permission request was not found")
+                existing = _permission_from_row(row)
+                changed = False
+                effective_status = status
+                effective_source = resolution_source
+                if status == "approved" and now_value >= existing.expires_at_milliseconds:
+                    effective_status = "expired"
+                    effective_source = "system"
+                if existing.status == "pending":
+                    cursor = self._connection.execute(
+                        """
+                        UPDATE permission_requests
+                        SET status = ?, resolved_at = ?, resolution_source = ?
+                        WHERE permission_id = ? AND agent_id = ? AND status = 'pending'
+                        """,
+                        (
+                            effective_status,
+                            timestamp,
+                            effective_source,
+                            permission_id,
+                            self.agent_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConversationConflictError(
+                            "permission resolution transition was lost"
+                        )
+                    changed = True
+                    self._insert_capability_audit_locked(
+                        run_id=existing.run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status=effective_status,
+                        detail_digest=existing.arguments_digest,
+                        timestamp=timestamp,
+                    )
+                elif (
+                    existing.status != effective_status
+                    or existing.resolution_source != effective_source
+                ):
+                    raise ConversationConflictError(
+                        "permission request already has another resolution"
+                    )
+                row = self._permission_row(permission_id)
+                assert row is not None
+                self._connection.commit()
+            except ConversationStoreError:
+                self._rollback()
+                raise
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not resolve permission request"
+                ) from exc
+        return PermissionMutation(_permission_from_row(row), changed)
+
+    def permission_requests(
+        self, *, pending_only: bool = False, limit: int = 64
+    ) -> tuple[PermissionRecord, ...]:
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 64:
+            raise ValueError("invalid permission request limit")
+        with self._lock:
+            self._ensure_open()
+            clause = "AND status = 'pending'" if pending_only else ""
+            rows = self._connection.execute(
+                f"""
+                SELECT permission_id, agent_id, capsule_generation,
+                       conversation_id, turn_id, run_id, call_id, capability_id,
+                       toolset_digest, policy_digest, arguments_digest, preview,
+                       preview_digest, policy_decision, status,
+                       expires_at_milliseconds, created_at, resolved_at,
+                       resolution_source
+                FROM permission_requests
+                WHERE agent_id = ? {clause}
+                ORDER BY created_at, permission_id LIMIT ?
+                """,
+                (self.agent_id, limit),
+            ).fetchall()
+        return tuple(_permission_from_row(row) for row in rows)
+
+    def get_permission_request(self, permission_id: str) -> PermissionRecord:
+        permission_id = _validate_id(permission_id, "permission_id")
+        with self._lock:
+            self._ensure_open()
+            row = self._permission_row(permission_id)
+        if row is None:
+            raise TurnNotFoundError("permission request was not found")
+        return _permission_from_row(row)
+
+    def cancel_pending_permissions_for_run(self, run_id: str) -> int:
+        run_id = _validate_id(run_id, "run_id")
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                pending = self._connection.execute(
+                    """
+                    SELECT permission_id, arguments_digest
+                    FROM permission_requests
+                    WHERE agent_id = ? AND run_id = ? AND status = 'pending'
+                    ORDER BY permission_id
+                    """,
+                    (self.agent_id, run_id),
+                ).fetchall()
+                cursor = self._connection.execute(
+                    """
+                    UPDATE permission_requests
+                    SET status = 'cancelled', resolved_at = ?,
+                        resolution_source = 'system'
+                    WHERE agent_id = ? AND run_id = ? AND status = 'pending'
+                    """,
+                    (timestamp, self.agent_id, run_id),
+                )
+                for permission_id, arguments_digest in pending:
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status="cancelled",
+                        detail_digest=arguments_digest,
+                        timestamp=timestamp,
+                    )
+                self._connection.commit()
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not cancel pending permissions"
+                ) from exc
+        return max(cursor.rowcount, 0)
+
+    def expire_pending_permissions(self, now_milliseconds: int | None = None) -> int:
+        now_value = int(time.time() * 1000) if now_milliseconds is None else now_milliseconds
+        if not isinstance(now_value, int) or isinstance(now_value, bool) or now_value <= 0:
+            raise ValueError("invalid permission expiry time")
+        timestamp = utc_now()
+        with self._lock:
+            self._ensure_open()
+            try:
+                self._begin_write()
+                pending = self._connection.execute(
+                    """
+                    SELECT permission_id, run_id, arguments_digest
+                    FROM permission_requests
+                    WHERE agent_id = ? AND status = 'pending'
+                      AND expires_at_milliseconds <= ?
+                    ORDER BY permission_id
+                    """,
+                    (self.agent_id, now_value),
+                ).fetchall()
+                cursor = self._connection.execute(
+                    """
+                    UPDATE permission_requests
+                    SET status = 'expired', resolved_at = ?,
+                        resolution_source = 'system'
+                    WHERE agent_id = ? AND status = 'pending'
+                      AND expires_at_milliseconds <= ?
+                    """,
+                    (timestamp, self.agent_id, now_value),
+                )
+                for permission_id, run_id, arguments_digest in pending:
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status="expired",
+                        detail_digest=arguments_digest,
+                        timestamp=timestamp,
+                    )
+                self._connection.commit()
+            except sqlite3.Error as exc:
+                self._rollback()
+                raise ConversationStoreUnavailableError(
+                    "could not expire pending permissions"
+                ) from exc
+        return max(cursor.rowcount, 0)
+
     def _operation_row(
         self, *, operation_id: str | None = None, idempotency_key_hash: str | None = None
     ) -> tuple[object, ...] | None:
@@ -1324,6 +2051,15 @@ class ConversationStore:
                     """,
                     (operation_id, *immutable, timestamp),
                 )
+                if run_id is not None:
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        operation_id=operation_id,
+                        kind="operation.intent",
+                        status="intent",
+                        detail_digest=request_digest,
+                        timestamp=timestamp,
+                    )
                 row = self._operation_row(operation_id=operation_id)
                 assert row is not None
                 self._connection.commit()
@@ -1381,6 +2117,15 @@ class ConversationStore:
                     if cursor.rowcount != 1:
                         raise ConversationConflictError("operation dispatch transition was lost")
                     changed = True
+                    if existing.run_id is not None:
+                        self._insert_capability_audit_locked(
+                            run_id=existing.run_id,
+                            operation_id=operation_id,
+                            kind="operation.dispatched",
+                            status="dispatched",
+                            detail_digest=executor_identity_digest,
+                            timestamp=timestamp,
+                        )
                 elif (
                     existing.executor_kind != executor_kind
                     or existing.executor_identity_digest != executor_identity_digest
@@ -1445,6 +2190,15 @@ class ConversationStore:
                     if cursor.rowcount != 1:
                         raise ConversationConflictError("operation outcome transition was lost")
                     changed = True
+                    if existing.run_id is not None:
+                        self._insert_capability_audit_locked(
+                            run_id=existing.run_id,
+                            operation_id=operation_id,
+                            kind="operation.outcome",
+                            status=status,
+                            detail_digest=outcome_digest,
+                            timestamp=timestamp,
+                        )
                 elif existing.status != status or existing.outcome_digest != outcome_digest:
                     raise ConversationConflictError("operation already has another outcome")
                 row = self._operation_row(operation_id=operation_id)
@@ -1461,6 +2215,15 @@ class ConversationStore:
         return OperationMutation(_operation_from_row(row), changed)
 
     def _recover_dispatched_operations_locked(self, timestamp: str) -> int:
+        dispatched = self._connection.execute(
+            """
+            SELECT operation_id, run_id
+            FROM operation_ledger
+            WHERE agent_id = ? AND status = 'dispatched'
+            ORDER BY operation_id
+            """,
+            (self.agent_id,),
+        ).fetchall()
         cursor = self._connection.execute(
             """
             UPDATE operation_ledger
@@ -1469,6 +2232,15 @@ class ConversationStore:
             """,
             (timestamp, self.agent_id),
         )
+        for operation_id, run_id in dispatched:
+            if run_id is not None:
+                self._insert_capability_audit_locked(
+                    run_id=run_id,
+                    operation_id=operation_id,
+                    kind="operation.outcome",
+                    status="outcome_unknown",
+                    timestamp=timestamp,
+                )
         return max(cursor.rowcount, 0)
 
     def recover_dispatched_operations(self) -> int:
@@ -1593,6 +2365,40 @@ class ConversationStore:
             existing.currency,
             existing.pricing_profile_digest,
         ) != outcome:
+            raise ConversationConflictError(
+                "provider call already has another usage outcome"
+            )
+        row = self._provider_usage_row(run_id, call_index)
+        assert row is not None
+        return row, changed
+
+    def _mark_provider_usage_incomplete_locked(
+        self,
+        run_id: str,
+        call_index: int,
+        *,
+        timestamp: str,
+    ) -> tuple[tuple[object, ...], bool]:
+        """Close one attempted provider call whose usage is unknowable."""
+
+        row = self._provider_usage_row(run_id, call_index)
+        if row is None:
+            raise TurnNotFoundError("provider call was not found")
+        existing = _provider_usage_from_row(row)
+        changed = False
+        if existing.status == "started":
+            cursor = self._connection.execute(
+                """
+                UPDATE provider_usage
+                SET status = 'incomplete', completed_at = ?
+                WHERE run_id = ? AND call_index = ? AND status = 'started'
+                """,
+                (timestamp, run_id, call_index),
+            )
+            if cursor.rowcount != 1:
+                raise ConversationConflictError("provider usage transition was lost")
+            changed = True
+        elif existing.status != "incomplete":
             raise ConversationConflictError(
                 "provider call already has another usage outcome"
             )
@@ -1761,7 +2567,8 @@ class ConversationStore:
         )
         if (
             not isinstance(payload, dict)
-            or payload.get("iteration") != call_index
+            or payload.get("provider_call_index", payload.get("iteration"))
+            != call_index
             or payload.get("context_plan_id") != context_plan_id
             or payload.get("estimated_input_tokens") != estimated_input_tokens
         ):
@@ -1829,14 +2636,30 @@ class ConversationStore:
             if isinstance(boundary_event, EventEnvelope)
             else None
         )
+        usage_complete = payload.get("usage_complete") if isinstance(payload, dict) else None
         if (
             not isinstance(payload, dict)
-            or payload.get("iteration") != call_index
+            or payload.get("provider_call_index", payload.get("iteration"))
+            != call_index
             or payload.get("input_tokens") != input_tokens
             or payload.get("output_tokens") != output_tokens
-            or payload.get("usage_complete") is not True
-            or payload.get("error_code") is not None
-            or payload.get("outcome") not in {"tool_use", "end_turn"}
+            or usage_complete not in {True, False}
+            or (
+                usage_complete is True
+                and (
+                    payload.get("error_code") is not None
+                    or payload.get("outcome") not in {"tool_use", "end_turn"}
+                )
+            )
+            or (
+                usage_complete is False
+                and (
+                    input_tokens != 0
+                    or output_tokens != 0
+                    or payload.get("outcome") not in {"error", "cancelled"}
+                    or not isinstance(payload.get("error_code"), str)
+                )
+            )
         ):
             raise ValueError("provider response boundary disagrees with its usage")
         outcome = (input_tokens, output_tokens, None, None, None)
@@ -1844,12 +2667,19 @@ class ConversationStore:
             self._ensure_open()
             try:
                 self._begin_write()
-                row, changed = self._complete_provider_usage_locked(
-                    run_id,
-                    call_index,
-                    outcome,
-                    timestamp=boundary_event.occurred_at,
-                )
+                if usage_complete:
+                    row, changed = self._complete_provider_usage_locked(
+                        run_id,
+                        call_index,
+                        outcome,
+                        timestamp=boundary_event.occurred_at,
+                    )
+                else:
+                    row, changed = self._mark_provider_usage_incomplete_locked(
+                        run_id,
+                        call_index,
+                        timestamp=boundary_event.occurred_at,
+                    )
                 self._append_running_boundary_locked(
                     boundary_event,
                     expected_kind="model.response.finished",
@@ -2165,6 +2995,14 @@ class ConversationStore:
             raise ConversationConflictError(
                 "Run journal cannot become an unavailable tombstone"
             )
+        dispatched_operations = self._connection.execute(
+            """
+            SELECT operation_id FROM operation_ledger
+            WHERE agent_id = ? AND run_id = ? AND status = 'dispatched'
+            ORDER BY operation_id
+            """,
+            (self.agent_id, run_id),
+        ).fetchall()
         self._connection.execute(
             """
             UPDATE operation_ledger
@@ -2174,6 +3012,14 @@ class ConversationStore:
             """,
             (timestamp, self.agent_id, run_id),
         )
+        for (operation_id,) in dispatched_operations:
+            self._insert_capability_audit_locked(
+                run_id=run_id,
+                operation_id=operation_id,
+                kind="operation.outcome",
+                status="outcome_unknown",
+                timestamp=timestamp,
+            )
         self._connection.execute(
             """
             UPDATE provider_usage
@@ -2452,6 +3298,7 @@ class ConversationStore:
         user_content: str,
         expected_revision: int,
         started_event: EventEnvelope,
+        context_projection: ContextProjectionBoundary | None = None,
     ) -> BeginTurnResult:
         """Accept a turn iff the compiled history revision is still current.
 
@@ -2481,6 +3328,21 @@ class ConversationStore:
             minimum_seq=1,
             exact_seq=1,
         )
+        encoded_projection: str | None = None
+        if context_projection is not None:
+            if (
+                not isinstance(context_projection, ContextProjectionBoundary)
+                or context_projection.agent_id != self.agent_id
+                or context_projection.conversation_id != conversation_id
+                or context_projection.turn_id != turn_id
+                or context_projection.run_id != run_id
+                or context_projection.conversation_revision != expected_revision
+                or context_projection.reason not in {
+                    "admission", "manual_compact", "semantic_summary"
+                }
+            ):
+                raise ValueError("context projection does not match the Turn")
+            encoded_projection = context_projection.to_json()
         timestamp = utc_now()
         with self._lock:
             self._ensure_open()
@@ -2559,6 +3421,23 @@ class ConversationStore:
                         len(encoded_event.encode("utf-8")),
                     ),
                 )
+                if encoded_projection is not None and context_projection is not None:
+                    self._connection.execute(
+                        """
+                        INSERT INTO context_projection_boundaries(
+                            run_id, projection_version, conversation_revision,
+                            boundary_digest, snapshot_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            context_projection.version,
+                            context_projection.conversation_revision,
+                            context_projection.boundary_digest,
+                            encoded_projection,
+                            timestamp,
+                        ),
+                    )
                 self._connection.commit()
             except ConversationStoreError:
                 self._rollback()
@@ -2683,6 +3562,33 @@ class ConversationStore:
                     if terminal_event is not None
                     else None
                 )
+                pending_permissions = self._connection.execute(
+                    """
+                    SELECT permission_id, arguments_digest
+                    FROM permission_requests
+                    WHERE agent_id = ? AND run_id = ? AND status = 'pending'
+                    ORDER BY permission_id
+                    """,
+                    (self.agent_id, run_id),
+                ).fetchall()
+                self._connection.execute(
+                    """
+                    UPDATE permission_requests
+                    SET status = 'cancelled', resolved_at = ?,
+                        resolution_source = 'system'
+                    WHERE agent_id = ? AND run_id = ? AND status = 'pending'
+                    """,
+                    (timestamp, self.agent_id, run_id),
+                )
+                for permission_id, arguments_digest in pending_permissions:
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status="cancelled",
+                        detail_digest=arguments_digest,
+                        timestamp=timestamp,
+                    )
                 cursor = self._connection.execute(
                     """
                     UPDATE conversation_turns
@@ -2792,9 +3698,17 @@ class ConversationStore:
         pending_tool_started = False
         finished_call_ids: list[str] = []
         model_request_count = 0
-        open_model_request: tuple[str, int] | None = None
+        open_model_request: tuple[str, int, int, str | None, int | None] | None = None
         last_model_outcome: str | None = None
         multi_tool_loop = False
+        visible_tool_ids: tuple[str, ...] = ()
+        overflow_recovery = False
+        pending_recovery: tuple[str, int, str, str] | None = None
+        recovery_count = 0
+        last_model_error: str | None = None
+        last_context_plan_id: str | None = None
+        last_context_plan_digest: str | None = None
+        last_provider_call_index = 0
 
         while True:
             row = cursor.fetchone()
@@ -2890,6 +3804,21 @@ class ConversationStore:
                     isinstance(features, list)
                     and MULTI_TOOL_LOOP_FEATURE in features
                 )
+                overflow_recovery = (
+                    isinstance(features, list)
+                    and OVERFLOW_RECOVERY_FEATURE in features
+                )
+                visible = payload.get("visible_tools")
+                if (
+                    not isinstance(visible, list)
+                    or visible != sorted(set(visible))
+                    or len(visible) > 32
+                    or any(item not in _RECOVERY_TOOL_SPECS for item in visible)
+                ):
+                    raise ConversationConflictError(
+                        "running turn has invalid visible Tools"
+                    )
+                visible_tool_ids = tuple(visible)
             elif kind == "run.started":
                 raise ConversationConflictError(
                     "running turn has more than one canonical start event"
@@ -2900,36 +3829,84 @@ class ConversationStore:
                     "running turn already has a terminal event"
                 )
             if kind == "model.request.started":
+                request_fields = {
+                    "request_id",
+                    "iteration",
+                    "context_plan_id",
+                    "context_plan_digest",
+                    "request_digest",
+                    "request_bytes",
+                    "estimated_input_tokens",
+                    "message_count",
+                    "tool_count",
+                    "tool_result_call_ids",
+                }
+                if overflow_recovery:
+                    request_fields |= {
+                        "attempt",
+                        "recovery_id",
+                        "provider_call_index",
+                    }
                 model_payload = _exact_recovery_payload(
                     payload,
-                    {
-                        "request_id",
-                        "iteration",
-                        "context_plan_id",
-                        "context_plan_digest",
-                        "request_digest",
-                        "request_bytes",
-                        "estimated_input_tokens",
-                        "message_count",
-                        "tool_count",
-                        "tool_result_call_ids",
-                    },
+                    request_fields,
                 )
                 iteration = model_payload.get("iteration")
+                attempt = model_payload.get("attempt", 0)
+                recovery_id = model_payload.get("recovery_id")
+                provider_call_index = model_payload.get("provider_call_index")
                 request_id = _recovery_worker_id(
                     model_payload.get("request_id"), "model request_id"
                 )
                 result_ids = model_payload.get("tool_result_call_ids")
+                expected_request_id = (
+                    f"model-{iteration}"
+                    if attempt == 0
+                    else f"model-{iteration}-recovery-1"
+                )
+                expected_iteration = (
+                    model_request_count
+                    if attempt == 1
+                    else model_request_count + 1
+                )
                 if (
                     not isinstance(iteration, int)
                     or isinstance(iteration, bool)
                     or not 1 <= iteration <= 8
-                    or request_id != f"model-{iteration}"
-                    or iteration != model_request_count + 1
+                    or attempt not in {0, 1}
+                    or request_id != expected_request_id
+                    or iteration != expected_iteration
+                    or (
+                        overflow_recovery
+                        and (
+                            not isinstance(provider_call_index, int)
+                            or isinstance(provider_call_index, bool)
+                            or provider_call_index != last_provider_call_index + 1
+                            or (
+                                attempt == 0 and recovery_id is not None
+                            )
+                            or (
+                                attempt == 1
+                                and (
+                                    pending_recovery is None
+                                    or recovery_id != pending_recovery[0]
+                                    or iteration != pending_recovery[1]
+                                    or model_payload.get("context_plan_id")
+                                    != pending_recovery[2]
+                                    or model_payload.get("context_plan_digest")
+                                    != pending_recovery[3]
+                                )
+                            )
+                        )
+                    )
                     or open_model_request is not None
                     or open_block_id is not None
                     or pending_call_id is not None
-                    or (model_request_count and last_model_outcome != "tool_use")
+                    or (
+                        attempt == 0
+                        and model_request_count
+                        and last_model_outcome != "tool_use"
+                    )
                     or not isinstance(model_payload.get("context_plan_id"), str)
                     or len(str(model_payload["context_plan_id"]).encode("utf-8"))
                     > 128
@@ -2968,10 +3945,10 @@ class ConversationStore:
                     validated_result_ids != finished_call_ids
                     or model_payload["tool_count"]
                     != (
-                        len(_RECOVERY_TOOL_SPECS)
+                        len(visible_tool_ids)
                         if multi_tool_loop and len(finished_call_ids) < 2
                         else (
-                            len(_RECOVERY_TOOL_SPECS)
+                            len(visible_tool_ids)
                             if iteration == 1
                             else 0
                         )
@@ -2980,21 +3957,41 @@ class ConversationStore:
                     raise ConversationConflictError(
                         "running turn has inconsistent model capabilities"
                     )
-                model_request_count = iteration
-                open_model_request = (request_id, iteration)
+                if attempt == 1:
+                    pending_recovery = None
+                else:
+                    model_request_count = iteration
+                if isinstance(provider_call_index, int):
+                    last_provider_call_index = provider_call_index
+                last_context_plan_id = str(model_payload["context_plan_id"])
+                last_context_plan_digest = str(model_payload["context_plan_digest"])
+                open_model_request = (
+                    request_id,
+                    iteration,
+                    int(attempt),
+                    recovery_id if isinstance(recovery_id, str) else None,
+                    provider_call_index if isinstance(provider_call_index, int) else None,
+                )
                 last_model_outcome = None
             elif kind == "model.response.finished":
+                response_fields = {
+                    "request_id",
+                    "iteration",
+                    "outcome",
+                    "input_tokens",
+                    "output_tokens",
+                    "usage_complete",
+                    "error_code",
+                }
+                if overflow_recovery:
+                    response_fields |= {
+                        "attempt",
+                        "recovery_id",
+                        "provider_call_index",
+                    }
                 model_payload = _exact_recovery_payload(
                     payload,
-                    {
-                        "request_id",
-                        "iteration",
-                        "outcome",
-                        "input_tokens",
-                        "output_tokens",
-                        "usage_complete",
-                        "error_code",
-                    },
+                    response_fields,
                 )
                 request_id = _recovery_worker_id(
                     model_payload.get("request_id"), "model request_id"
@@ -3006,8 +4003,23 @@ class ConversationStore:
                 usage_complete = model_payload.get("usage_complete")
                 error_code = model_payload.get("error_code")
                 successful = outcome in {"tool_use", "end_turn"}
+                response_identity = (
+                    request_id,
+                    iteration,
+                    int(model_payload.get("attempt", 0)),
+                    (
+                        model_payload.get("recovery_id")
+                        if isinstance(model_payload.get("recovery_id"), str)
+                        else None
+                    ),
+                    (
+                        model_payload.get("provider_call_index")
+                        if isinstance(model_payload.get("provider_call_index"), int)
+                        else None
+                    ),
+                )
                 if (
-                    open_model_request != (request_id, iteration)
+                    open_model_request != response_identity
                     or outcome not in {"tool_use", "end_turn", "error", "cancelled"}
                     or not isinstance(input_tokens, int)
                     or isinstance(input_tokens, bool)
@@ -3036,6 +4048,61 @@ class ConversationStore:
                     )
                 open_model_request = None
                 last_model_outcome = str(outcome)
+                last_model_error = error_code if isinstance(error_code, str) else None
+            elif kind == "model.recovery.started":
+                recovery_payload = _exact_recovery_payload(
+                    payload,
+                    {
+                        "recovery_id",
+                        "iteration",
+                        "attempt",
+                        "overflow_code",
+                        "from_context_plan_id",
+                        "from_context_plan_digest",
+                        "to_context_plan_id",
+                        "to_context_plan_digest",
+                        "boundary_digest",
+                    },
+                )
+                recovery_id = recovery_payload.get("recovery_id")
+                to_plan_id = recovery_payload.get("to_context_plan_id")
+                to_plan_digest = recovery_payload.get("to_context_plan_digest")
+                if (
+                    not overflow_recovery
+                    or recovery_count != 0
+                    or pending_recovery is not None
+                    or open_model_request is not None
+                    or not isinstance(recovery_id, str)
+                    or _RECOVERY_EVENT_ID.fullmatch(recovery_id) is None
+                    or recovery_payload.get("iteration") != model_request_count
+                    or recovery_payload.get("attempt") != 1
+                    or recovery_payload.get("overflow_code") != last_model_error
+                    or last_model_error
+                    not in {"model_context_overflow", "model_media_overflow"}
+                    or last_model_outcome != "error"
+                    or recovery_payload.get("from_context_plan_id")
+                    != last_context_plan_id
+                    or recovery_payload.get("from_context_plan_digest")
+                    != last_context_plan_digest
+                    or not isinstance(to_plan_id, str)
+                    or not isinstance(to_plan_digest, str)
+                    or _LEDGER_DIGEST.fullmatch(to_plan_digest) is None
+                    or not isinstance(recovery_payload.get("boundary_digest"), str)
+                    or _LEDGER_DIGEST.fullmatch(
+                        str(recovery_payload["boundary_digest"])
+                    )
+                    is None
+                ):
+                    raise ConversationConflictError(
+                        "running turn has an invalid model recovery boundary"
+                    )
+                pending_recovery = (
+                    recovery_id,
+                    model_request_count,
+                    to_plan_id,
+                    to_plan_digest,
+                )
+                recovery_count = 1
             elif kind == "assistant.block.started":
                 block_payload = _exact_recovery_payload(
                     payload, {"block_id", "block_type"}
@@ -3192,19 +4259,30 @@ class ConversationStore:
 
         closure_events: list[tuple[str, dict[str, object]]] = []
         if open_model_request is not None:
-            request_id, iteration = open_model_request
+            request_id, iteration, attempt, recovery_id, provider_call_index = (
+                open_model_request
+            )
+            closure_payload: dict[str, object] = {
+                "request_id": request_id,
+                "iteration": iteration,
+                "outcome": "error",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "usage_complete": False,
+                "error_code": "control_restarted",
+            }
+            if overflow_recovery:
+                closure_payload.update(
+                    {
+                        "attempt": attempt,
+                        "recovery_id": recovery_id,
+                        "provider_call_index": provider_call_index,
+                    }
+                )
             closure_events.append(
                 (
                     "model.response.finished",
-                    {
-                        "request_id": request_id,
-                        "iteration": iteration,
-                        "outcome": "error",
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "usage_complete": False,
-                        "error_code": "control_restarted",
-                    },
+                    closure_payload,
                 )
             )
         if open_block_id is not None:
@@ -3286,6 +4364,33 @@ class ConversationStore:
                 self._begin_write()
                 self._recover_dispatched_operations_locked(timestamp)
                 self._mark_started_usage_incomplete_locked(timestamp)
+                pending_permissions = self._connection.execute(
+                    """
+                    SELECT permission_id, run_id, arguments_digest
+                    FROM permission_requests
+                    WHERE agent_id = ? AND status = 'pending'
+                    ORDER BY permission_id
+                    """,
+                    (self.agent_id,),
+                ).fetchall()
+                self._connection.execute(
+                    """
+                    UPDATE permission_requests
+                    SET status = 'cancelled', resolved_at = ?,
+                        resolution_source = 'system'
+                    WHERE agent_id = ? AND status = 'pending'
+                    """,
+                    (timestamp, self.agent_id),
+                )
+                for permission_id, run_id, arguments_digest in pending_permissions:
+                    self._insert_capability_audit_locked(
+                        run_id=run_id,
+                        permission_id=permission_id,
+                        kind="permission.resolved",
+                        status="cancelled",
+                        detail_digest=arguments_digest,
+                        timestamp=timestamp,
+                    )
                 rows = self._connection.execute(
                     """
                     SELECT t.turn_id, t.conversation_id, t.run_id, t.position,
@@ -3525,6 +4630,8 @@ class ConversationStore:
 
 __all__ = [
     "BeginTurnResult",
+    "CapabilityAuditEvent",
+    "CapabilityAuditKind",
     "CommittedMessage",
     "Conversation",
     "ConversationConflictError",
@@ -3541,11 +4648,16 @@ __all__ = [
     "MAX_ASSISTANT_CONTENT_BYTES",
     "MAX_CONVERSATIONS_PER_AGENT",
     "MAX_DATABASE_BYTES",
+    "MAX_CAPABILITY_AUDIT_RECORDS_PER_AGENT",
     "MAX_LIST_LIMIT",
     "MAX_TITLE_BYTES",
     "MAX_TURNS_PER_CONVERSATION",
     "MAX_USER_CONTENT_BYTES",
     "MessageRole",
+    "PermissionDecision",
+    "PermissionMutation",
+    "PermissionRecord",
+    "PermissionStatus",
     "TerminalTurnStatus",
     "TurnNotFoundError",
     "TurnStatus",

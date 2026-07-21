@@ -33,7 +33,9 @@ jobs:
           test ! -e references/claude-code/materials
 
       - name: Validate shell entrypoints
-        run: bash -n env.sh bootstrap.sh start.sh stop.sh purge.sh governance.sh
+        run: >-
+          bash -n env.sh bootstrap.sh start.sh stop.sh purge.sh backup.sh
+          restore.sh release.sh governance.sh
 
       - name: Bootstrap the checkout-local environment
         run: ./bootstrap.sh

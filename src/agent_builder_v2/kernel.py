@@ -1,4 +1,4 @@
-"""The single finite Run loop for the greenfield walking skeleton."""
+"""The single finite Run loop for Agent Builder."""
 
 from __future__ import annotations
 
@@ -140,7 +140,7 @@ class HarnessKernel:
                 result_outcome = "cancelled"
                 result_content = "cancelled"
             else:
-                result = self.tools.execute(tool_id, arguments)
+                result = self.tools.execute(tool_id, arguments, call_id=call_id)
                 result_outcome = result.outcome
                 result_content = result.content
             self.state.pending_tools.remove(call_id)

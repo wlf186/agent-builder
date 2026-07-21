@@ -34,6 +34,7 @@ class TurnRuntimeSnapshot:
     max_total_input_tokens: int
     max_total_output_tokens: int
     wall_timeout_seconds: int
+    projection_reason: str
 
     def __post_init__(self) -> None:
         canonical_tools = tuple(sorted(self.effective_tools, key=lambda item: item.tool_id))
@@ -61,6 +62,9 @@ class TurnRuntimeSnapshot:
             or not isinstance(self.wall_timeout_seconds, int)
             or isinstance(self.wall_timeout_seconds, bool)
             or not 1 <= self.wall_timeout_seconds <= 3_600
+            or self.projection_reason not in {
+                "admission", "manual_compact", "semantic_summary"
+            }
         ):
             raise ValueError("invalid Turn runtime snapshot")
 
@@ -72,6 +76,7 @@ class TurnRuntimeSnapshot:
         loop_limits: LoopLimits,
         wall_timeout_seconds: int,
         effective_toolset: EffectiveToolSet | None = None,
+        projection_reason: str = "admission",
     ) -> TurnRuntimeSnapshot:
         if effective_toolset is None:
             catalog = ToolCatalog.create(context_plan.tools)
@@ -104,12 +109,14 @@ class TurnRuntimeSnapshot:
                 * loop_limits.max_model_iterations
             ),
             wall_timeout_seconds=wall_timeout_seconds,
+            projection_reason=projection_reason,
         )
 
     def public_metadata(self) -> dict[str, object]:
         return {
             "capsule_generation": self.capsule_generation,
-            "model_profile_digest": self.model_profile.model_digest,
+            "model_id": self.model_profile.catalog_model_id or self.model_profile.model,
+            "model_profile_digest": self.model_profile.profile_digest,
             "context_plan_id": self.context_plan.reference.plan_id,
             "context_plan_digest": self.context_plan.reference.digest,
             "toolset_digest": self.context_plan.reference.toolset_digest,
@@ -119,6 +126,7 @@ class TurnRuntimeSnapshot:
             "max_total_input_tokens": self.max_total_input_tokens,
             "max_total_output_tokens": self.max_total_output_tokens,
             "wall_timeout_seconds": self.wall_timeout_seconds,
+            "projection_reason": self.projection_reason,
         }
 
 

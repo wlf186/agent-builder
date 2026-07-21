@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import base64
 import hashlib
 import hmac
 from pathlib import Path
@@ -18,7 +19,9 @@ from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
 from agent_builder_v2.commands import CommandBus
 from agent_builder_v2.context import ContextCompiler, ContextPlan, ModelProfile
 from agent_builder_v2.context_audit import ContextRevealPolicy
+from agent_builder_v2.extensions import ExtensionCatalog
 from agent_builder_v2.contracts import EventEnvelope, StartRunCommand
+from agent_builder_v2.model_catalog import default_model_catalog
 from agent_builder_v2.query_engine import QueryEngineRegistry
 from agent_builder_v2.replay import (
     DurableReplay,
@@ -41,7 +44,9 @@ from agent_builder_v2.sessions import (
     ConversationStoreUnavailableError,
     ConversationSummary,
     ConversationTurn,
+    PermissionRecord,
 )
+from agent_builder_v2.skills import SkillRecord
 from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
 from agent_builder_v2.workspace_context import WorkspaceContextError
 
@@ -110,6 +115,33 @@ class _RunRecord:
     events: tuple[EventEnvelope, ...] = ()
 
 
+@dataclass(frozen=True)
+class _TaskRecord:
+    task_id: str = "d" * 32
+    state: str = "queued"
+
+    def public_metadata(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "agent_id": PROTOTYPE_AGENT_ID,
+            "capsule_generation": 1,
+            "conversation_id": "2" * 32,
+            "turn_id": "3" * 32,
+            "parent_run_id": RUN_ID,
+            "command_id": "runtime-compile",
+            "state": self.state,
+            "result": None,
+            "result_digest": None,
+            "error_code": None,
+            "output_bytes": 0,
+            "notification_count": 1,
+            "created_at": "2026-07-20T00:00:00.000Z",
+            "started_at": None,
+            "finished_at": None,
+            "updated_at": "2026-07-20T00:00:00.000Z",
+        }
+
+
 def _context_plan(
     message: str, agent_id: str = PROTOTYPE_AGENT_ID
 ) -> ContextPlan:
@@ -146,6 +178,16 @@ class _LifecycleManager:
     def __init__(self) -> None:
         self.draining: set[str] = set()
         self.runtimes: dict[str, object] = {}
+        catalog = default_model_catalog()
+        profile = _context_plan("catalog").model_profile
+        qualification = SimpleNamespace(
+            catalog_model_id="qwen3.5:2b",
+            model_profile=profile,
+        )
+        self.model_broker = SimpleNamespace(
+            catalog=catalog,
+            qualifications=(qualification,),
+        )
 
     def register(
         self,
@@ -181,6 +223,7 @@ class _RunService:
     capsule = object()
     model_qualification = SimpleNamespace(model="qwen3.5:2b")
     sandbox_qualification = object()
+    extension_executor = SimpleNamespace(catalog=ExtensionCatalog.empty())
 
     def __init__(self, agent_id: str = PROTOTYPE_AGENT_ID) -> None:
         self.agent_id = agent_id
@@ -198,6 +241,9 @@ class _RunService:
         self.foreign_on_get_call: int | None = None
         self.snapshot_only = False
         self.replay_error: BaseException | None = None
+        self.permissions: dict[str, PermissionRecord] = {}
+        self.tasks: dict[str, _TaskRecord] = {}
+        self.skills: dict[str, SkillRecord] = {}
 
     async def create_conversation(self, title: str) -> Conversation:
         conversation = Conversation(
@@ -350,6 +396,100 @@ class _RunService:
     async def cancel(self, run_id: str) -> None:
         self.cancelled.append(run_id)
 
+    async def list_permission_requests(
+        self, *, pending_only: bool = True
+    ) -> tuple[PermissionRecord, ...]:
+        return tuple(
+            value
+            for value in self.permissions.values()
+            if not pending_only or value.status == "pending"
+        )
+
+    async def resolve_permission_request(
+        self, permission_id: str, decision: str
+    ) -> PermissionRecord:
+        try:
+            current = self.permissions[permission_id]
+        except KeyError as exc:
+            raise KeyError("permission not found") from exc
+        if current.status != "pending":
+            raise ConversationConflictError("permission already resolved")
+        resolved = replace(
+            current,
+            status="approved" if decision == "approve" else "denied",
+            resolved_at="2026-07-20T00:00:01.000Z",
+            resolution_source="operator",
+        )
+        self.permissions[permission_id] = resolved
+        return resolved
+
+    async def capability_audit_events(
+        self, run_id: str, *, after_seq: int = 0, limit: int = 128
+    ) -> tuple[object, ...]:
+        if run_id not in self.run_identities:
+            raise KeyError("run not found")
+        return ()
+
+    async def submit_background_task(
+        self, run_id: str, arguments: dict[str, str] | None = None
+    ) -> _TaskRecord:
+        if run_id not in self.run_identities:
+            raise KeyError("run not found")
+        task = _TaskRecord()
+        self.tasks[task.task_id] = task
+        return task
+
+    async def list_background_tasks(self) -> tuple[_TaskRecord, ...]:
+        return tuple(self.tasks.values())
+
+    async def get_background_task(self, task_id: str) -> _TaskRecord:
+        try:
+            return self.tasks[task_id]
+        except KeyError as exc:
+            raise KeyError("Task not found") from exc
+
+    async def background_task_notifications(self, task_id: str) -> tuple[object, ...]:
+        if task_id not in self.tasks:
+            raise KeyError("Task not found")
+        return (
+            SimpleNamespace(
+                sequence=1,
+                kind="task.queued",
+                payload={"state": "queued"},
+                payload_digest="e" * 64,
+                created_at="2026-07-20T00:00:00.000Z",
+            ),
+        )
+
+    async def cancel_background_task(self, task_id: str) -> _TaskRecord:
+        current = await self.get_background_task(task_id)
+        cancelled = replace(current, state="cancelled")
+        self.tasks[task_id] = cancelled
+        return cancelled
+
+    async def list_skills(self) -> tuple[SkillRecord, ...]:
+        return tuple(self.skills.values())
+
+    async def install_skill(self, raw: bytes, expected_digest: str) -> SkillRecord:
+        assert raw == b"test-skill-archive"
+        assert expected_digest == hashlib.sha256(raw).hexdigest()
+        record = SkillRecord(
+            skill_id="b" * 32,
+            version="1.0.0",
+            display_name="Web Skill",
+            package_digest=expected_digest,
+            content_digest="c" * 64,
+            capabilities_json="[]",
+            installed_at="2026-07-20T00:00:00.000Z",
+            updated_at="2026-07-20T00:00:00.000Z",
+        )
+        self.skills[record.skill_id] = record
+        return record
+
+    async def delete_skill(self, skill_id: str) -> None:
+        if self.skills.pop(skill_id, None) is None:
+            raise KeyError("Skill not found")
+
     async def stream(
         self, run_id: str, after: int = 0
     ) -> AsyncIterator[EventEnvelope | None]:
@@ -500,11 +640,62 @@ def test_health_reports_qualified_runtime_dependencies(
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
+        "release": "0.2.0",
         "prototype": True,
         "agent_ready": True,
         "model": "qwen3.5:2b",
         "sandbox": "landlock+seccomp",
     }
+
+
+def test_extension_catalog_is_authenticated_and_hides_endpoints(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    assert client.get("/api/extensions").status_code == 401
+    client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    response = client.get("/api/extensions")
+    assert response.status_code == 200
+    assert response.json() == {"extensions": []}
+    assert "endpoint" not in response.text
+
+
+def test_skill_install_and_delete_are_authenticated_and_csrf_bound(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    agent = PROTOTYPE_AGENT_ID
+    assert client.get(f"/api/agents/{agent}/skills").status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    raw = b"test-skill-archive"
+    body = {
+        "archive_base64": base64.b64encode(raw).decode("ascii"),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    assert client.post(
+        f"/api/agents/{agent}/skills", json=body, headers=SAME_ORIGIN
+    ).status_code == 403
+    installed = client.post(
+        f"/api/agents/{agent}/skills",
+        json=body,
+        headers={**SAME_ORIGIN, "x-csrf-token": csrf},
+    )
+    assert installed.status_code == 201
+    skill_id = installed.json()["skill_id"]
+    assert "archive" not in installed.text
+    assert client.get(f"/api/agents/{agent}/skills").json()["skills"][0][
+        "skill_id"
+    ] == skill_id
+    assert client.delete(
+        f"/api/agents/{agent}/skills/{skill_id}",
+        headers={**SAME_ORIGIN, "x-csrf-token": csrf},
+    ).status_code == 204
+    assert client.get(f"/api/agents/{agent}/skills").json()["skills"] == []
 
 
 def test_timeline_exposes_complete_events_as_inert_text(
@@ -521,6 +712,9 @@ def test_timeline_exposes_complete_events_as_inert_text(
     assert 'id="replay-workbench"' in index.text
     assert 'id="sequence-lane-header"' in index.text
     assert 'id="turn-conversation-panel"' in index.text
+    assert 'id="command-help-list"' in index.text
+    assert 'id="command-result-json"' in index.text
+    assert 'id="permission-list"' in index.text
     assert 'id="event-inspector"' in index.text
     assert 'data-inspector-tab="business"' in index.text
     assert 'data-inspector-tab="envelope"' in index.text
@@ -528,6 +722,9 @@ def test_timeline_exposes_complete_events_as_inert_text(
     assert script.status_code == 200
     assert "JSON.stringify(envelope, null, 2)" in script.text
     assert "eventDetailJson.textContent =" in script.text
+    assert "commandResultJson.textContent =" in script.text
+    assert "preview.textContent = permission.preview" in script.text
+    assert "pollPendingPermissions(runContext)" in script.text
     assert ".innerHTML" not in script.text
 
 
@@ -561,7 +758,6 @@ def test_login_csrf_run_and_logout_session_flow(
     client, commands = web_client
 
     assert client.get("/api/auth/status").json() == {"authenticated": False}
-
     rejected = client.post(
         "/api/auth/login", json={"token": "0" * 64}, headers=SAME_ORIGIN
     )
@@ -621,6 +817,172 @@ def test_login_csrf_run_and_logout_session_flow(
     assert client.get("/api/session").status_code == 401
     assert client.get("/api/auth/status").json() == {"authenticated": False}
 
+
+def test_slash_commands_are_csrf_bound_and_never_become_model_turns(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, commands = web_client
+    assert client.get("/api/commands").status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+    registry = client.get("/api/commands")
+    assert registry.status_code == 200
+    assert [item["command_id"] for item in registry.json()["commands"]] == [
+        "cancel", "clear", "compact", "context", "model", "permissions", "status"
+    ]
+    created = client.post(
+        "/api/sessions", json={"title": "slash-boundary"}, headers=mutation
+    ).json()
+    session_id = created["session_id"]
+    before = len(commands.started)
+
+    missing_csrf = client.post(
+        f"/api/sessions/{session_id}/commands",
+        json={"command": "/status"},
+        headers=SAME_ORIGIN,
+    )
+    assert missing_csrf.status_code == 403
+    inline = client.post(
+        f"/api/sessions/{session_id}/runs",
+        json={"message": "/status"},
+        headers=mutation,
+    )
+    assert inline.status_code == 200
+    value = inline.json()
+    assert value["kind"] == "slash_command_result"
+    assert value["command_id"] == "status"
+    assert value["model_invoked"] is False
+    assert value["turn_created"] is False
+    assert len(commands.started) == before
+    detail = client.get(f"/api/sessions/{session_id}").json()
+    assert detail["messages"] == []
+
+    compact = client.post(
+        f"/api/sessions/{session_id}/commands",
+        json={"command": "/compact"},
+        headers=mutation,
+    )
+    assert compact.status_code == 200
+    assert compact.json()["ui_effect"] == {"compact_next_turn": True}
+    assert client.post(
+        f"/api/sessions/{session_id}/runs",
+        json={"message": "/status", "model_id": "qwen3.5:2b"},
+        headers=mutation,
+    ).status_code == 400
+    assert client.post(
+        f"/api/sessions/{session_id}/commands",
+        json={"command": "/unknown"},
+        headers=mutation,
+    ).status_code == 400
+
+    cleared = client.post(
+        f"/api/sessions/{session_id}/commands",
+        json={"command": "/clear"},
+        headers=mutation,
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["result"]["deleted"] is True
+    assert client.get(f"/api/sessions/{session_id}").status_code == 404
+
+
+def test_authenticated_model_catalog_is_content_bounded_and_selectable(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, commands = web_client
+    assert client.get("/api/models").status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+
+    listed = client.get("/api/models")
+    assert listed.status_code == 200
+    payload = listed.json()
+    assert payload["default_model_id"] == "qwen3.5:2b"
+    assert [item["model_id"] for item in payload["models"]] == ["qwen3.5:2b"]
+    assert payload["models"][0]["profile_digest"]
+    assert "iollama" not in listed.text
+    assert "11434" not in listed.text
+
+    started = client.post(
+        "/api/runs",
+        json={
+            "message": "use catalog selection",
+            "model_id": "qwen3.5:2b",
+            "compact": True,
+        },
+        headers={**SAME_ORIGIN, "x-csrf-token": csrf},
+    )
+    assert started.status_code == 202
+    assert commands.started[-1].model_id == "qwen3.5:2b"
+    assert commands.started[-1].compact is True
+
+    rejected = client.post(
+        "/api/runs",
+        json={
+            "message": "reject endpoint injection",
+            "model_id": "http://attacker.invalid/model",
+        },
+        headers={**SAME_ORIGIN, "x-csrf-token": csrf},
+    )
+    assert rejected.status_code == 400
+
+
+def test_background_task_api_is_agent_scoped_bounded_and_csrf_protected(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+    created = client.post(
+        "/api/runs", json={"message": "parent"}, headers=mutation
+    )
+    assert created.status_code == 202
+
+    endpoint = f"/api/agents/{PROTOTYPE_AGENT_ID}/runs/{RUN_ID}/tasks"
+    assert client.post(
+        endpoint,
+        json={"command_id": "runtime-compile"},
+        headers=SAME_ORIGIN,
+    ).status_code == 403
+    assert client.post(
+        endpoint,
+        json={"command_id": "../../bin/sh"},
+        headers=mutation,
+    ).status_code == 400
+    submitted = client.post(
+        endpoint,
+        json={"command_id": "runtime-compile"},
+        headers=mutation,
+    )
+    assert submitted.status_code == 202
+    task_id = submitted.json()["task_id"]
+    assert submitted.json()["parent_run_id"] == RUN_ID
+    assert submitted.json()["state"] == "queued"
+
+    listed = client.get(f"/api/agents/{PROTOTYPE_AGENT_ID}/tasks")
+    assert [item["task_id"] for item in listed.json()["tasks"]] == [task_id]
+    detail = client.get(f"/api/agents/{PROTOTYPE_AGENT_ID}/tasks/{task_id}")
+    assert detail.json()["command_id"] == "runtime-compile"
+    notices = client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/tasks/{task_id}/notifications"
+    )
+    assert notices.json()["notifications"][0]["kind"] == "task.queued"
+    cancelled = client.post(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/tasks/{task_id}/cancel",
+        headers=mutation,
+    )
+    assert cancelled.status_code == 202
+    assert cancelled.json()["state"] == "cancelled"
+    assert client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/tasks/{'f' * 32}"
+    ).status_code == 404
 
 def test_authenticated_agent_lifecycle_api_is_csrf_protected_and_isolated(
     web_client: tuple[TestClient, _Commands], tmp_path: Path
@@ -706,6 +1068,93 @@ def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
     assert client.get(f"/api/runs/{RUN_ID}/context").status_code == 404
     assert client.get(
         f"/api/agents/{PROTOTYPE_AGENT_ID}/sessions/{session_id}"
+    ).status_code == 404
+
+
+def test_permission_approval_is_authenticated_csrf_bound_and_operator_safe(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    service = client.app.state.run_service
+    permission_id = "d" * 32
+    service.permissions[permission_id] = PermissionRecord(
+        permission_id=permission_id,
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+        conversation_id="2" * 32,
+        turn_id="3" * 32,
+        run_id=RUN_ID,
+        call_id="call-permission-1",
+        capability_id="file/write",
+        toolset_digest="a" * 64,
+        policy_digest="b" * 64,
+        arguments_digest="c" * 64,
+        preview="Write workspace/example.txt (5 UTF-8 bytes)",
+        preview_digest="e" * 64,
+        policy_decision="ask",
+        status="pending",
+        expires_at_milliseconds=1_800_000_060_000,
+        created_at="2026-07-20T00:00:00.000Z",
+        resolved_at=None,
+        resolution_source=None,
+    )
+    service.run_identities[RUN_ID] = RunIdentity(
+        PROTOTYPE_AGENT_ID, "2" * 32, "3" * 32, RUN_ID
+    )
+
+    collection = f"/api/agents/{PROTOTYPE_AGENT_ID}/permissions"
+    member = f"{collection}/{permission_id}"
+    assert client.get(collection).status_code == 401
+    assert client.post(collection, json={}, headers=SAME_ORIGIN).status_code == 405
+
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf = login.json()["csrf_token"]
+    mutation = {**SAME_ORIGIN, "x-csrf-token": csrf}
+    listed = client.get(collection)
+    assert listed.status_code == 200
+    projection = listed.json()["permissions"][0]
+    assert projection["preview"] == "Write workspace/example.txt (5 UTF-8 bytes)"
+    assert "arguments" not in projection
+    assert "result" not in projection
+    audit = client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/runs/{RUN_ID}/capability-audit"
+    )
+    assert audit.status_code == 200
+    assert audit.json()["events"] == []
+    assert client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/runs/{RUN_ID}/capability-audit?limit=129"
+    ).status_code == 400
+
+    assert client.post(
+        member, json={"decision": "approve"}, headers=SAME_ORIGIN
+    ).status_code == 403
+    assert client.post(
+        member, json={"decision": "invent"}, headers=mutation
+    ).status_code == 400
+    assert client.post(
+        member,
+        json={"decision": "approve", "internal_approval": True},
+        headers=mutation,
+    ).status_code == 400
+    approved = client.post(
+        member, json={"decision": "approve"}, headers=mutation
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["resolution_source"] == "operator"
+    assert client.post(
+        member, json={"decision": "deny"}, headers=mutation
+    ).status_code == 409
+    assert client.get(collection).json() == {"permissions": []}
+    assert client.get(
+        f"/api/agents/{'f' * 32}/permissions"
+    ).status_code == 404
+    assert client.post(
+        f"{collection}/not-an-id",
+        json={"decision": "approve"},
+        headers=mutation,
     ).status_code == 404
 
 
@@ -951,10 +1400,10 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
     assert payload["content_exposure"] == "withheld"
     assert payload["provider_message_count"] == 2
     assert "provider_messages" not in payload
-    assert payload["renderer"]["version"] == "ordered-sections-v3"
+    assert payload["renderer"]["version"] == "ordered-sections-v5"
     assert (
         payload["renderer"]["section_registry_version"]
-        == "prompt-section-registry-v2"
+            == "prompt-section-registry-v4"
     )
     assert payload["renderer"]["leading_system_sections_merged"] is True
     assert payload["renderer"]["leading_system_section_count"] == 2

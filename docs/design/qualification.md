@@ -1,7 +1,7 @@
 ---
 owner: runtime-maintainers
 status: maintained
-last_reviewed: 2026-07-19
+last_reviewed: 2026-07-20
 review_cycle: quarterly
 ---
 
@@ -12,7 +12,22 @@ review_cycle: quarterly
 
 `scripts/qualify_runtime.py` 是本契约的标准库实现。它只验收一个已经由根 `start.sh`
 启动的 Gateway；cold checkout、启动故障注入、正常/强制停止、原生 `aarch64`、内核或
-设备实际 flush 和 SSD SMART 必须由外层 lifecycle/platform qualification 记录补齐。
+设备实际 flush 和 SSD SMART 在 host 授权可用时由外层 qualification 记录；不可用时必须
+显式记录观测缺口，不能用应用指标冒充物理设备结论。
+
+## 首发支持平台与物理设备观测
+
+首个 release 的受支持平台冻结为 GNU/Linux `x86_64`、glibc 2.28+、Landlock ABI 6+ 和
+seccomp 可用。`aarch64` 代码路径保留但不在首发支持矩阵；只有原生主机完成等价 cold
+checkout、真实模型、sandbox、soak 和 lifecycle RR 后才能加入，QEMU/cross build 不能替代。
+因此本合同的 release gate 只要求所有**受支持平台**有原生证据，不把未承诺平台写成假通过。
+
+SMART/NVMe health 是部署设备的运维观测，不是可移植应用测试。若 `/dev/nvme*` 与受信只读
+工具可用，release/operator RR 应记录前后 Data Units Written、Host Write Commands、
+Percentage Used、Available Spare、Media/Data Integrity Errors、Unsafe Shutdowns、Critical
+Warning 和温度；若容器未暴露设备或工具，必须记录 `ssd_smart_not_observed`，并以 `/proc`
+I/O、logical/allocated growth、WAL/temp/log peak 和显式 libc sync-call 上界关闭软件写放大
+gate。后一种结论只表示“未发现应用层不合理写入”，绝不声称测量了 NAND 磨损或设备健康。
 
 ## 调用与证据边界
 
@@ -159,7 +174,9 @@ summary。
 | API、Gateway identity、token identity findings | 0 |
 
 这些上限是当前单 Agent、顺序 workload 的资格 envelope，不是未来容量承诺。提高 Turn
-并发、引入文件/Task/Skill 或改变存储路径时，必须先更新本契约、写放大分析和测试。
+并发或改变存储路径时，必须先更新本契约、写放大分析和测试。Task、Skill、extension 与
+subagent 另需各自真实纵向 RR，证明语义边界写、终态 cleanup 和零 residual；它们不需要把
+不可信 stdout/token chunk 追加到本 workload。
 
 ## RR summary schema
 
@@ -170,6 +187,6 @@ stage/code，不记录异常消息。
 
 普通启动的 summary 明确记录未观察精确 libc sync-call；显式资格模式会用
 `metrics.libc_sync_calls` 收窄这一缺口。两种模式都固定保留：未观察内核物理 flush、
-direct/non-libc durability path、SSD SMART，且不替代原生 `aarch64` qualification。
-应用层 summary 通过只能作为 QUA-01 的一部分证据，不能单独关闭 GATE-01 或宣称生产
-就绪。
+direct/non-libc durability path 和 SSD SMART。应用层 summary 通过必须与受支持平台的
+cold checkout/lifecycle、当前能力真实纵向 RR 和 stop/restart residual audit 合并评审，
+不能单独声称物理 SSD 健康或扩大平台范围。

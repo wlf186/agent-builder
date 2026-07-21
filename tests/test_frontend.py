@@ -75,6 +75,11 @@ def test_timeline_has_explicit_truthful_actor_direction_and_action_mappings() ->
             "LLM / Broker → Harness",
             "收敛模型响应",
         ),
+        '"model.recovery.started"': (
+            "Harness",
+            "Harness 内部",
+            "切换溢出恢复投影",
+        ),
         '"assistant.block.started"': ("LLM", "LLM → Harness", "开始回答内容块"),
         '"assistant.block.delta"': ("LLM", "LLM → Harness", "流式生成回答增量"),
         '"assistant.block.finished"': ("LLM", "LLM → Harness", "完成回答内容块"),
@@ -446,6 +451,9 @@ def test_event_cards_summarize_model_iterations_without_body_or_full_digest() ->
     assert "payload.tool_count" in summary
     assert "payload.tool_result_call_ids" in summary
     assert 'envelope.kind === "model.response.finished"' in summary
+    assert 'envelope.kind === "model.recovery.started"' in summary
+    assert "payload.provider_call_index" in summary
+    assert "payload.attempt" in summary
     assert "payload.input_tokens" in summary
     assert "payload.output_tokens" in summary
     assert 'envelope.kind === "run.started"' in summary
@@ -540,3 +548,13 @@ def test_mutations_lock_controls_and_conflicts_refresh_server_state() -> None:
     assert "state.mutationPending = false" in deletion
     assert "error.status === 409" in deletion
     assert "await refreshSessions(state.sessionId)" in deletion
+
+
+def test_frontend_exposes_bounded_subagent_mailbox_and_child_replay() -> None:
+    assert 'id="subagent-panel"' in INDEX
+    assert 'id="subagent-list"' in INDEX
+    assert "async function refreshSubagents" in SCRIPT
+    assert "/subagents`" in SCRIPT
+    assert "content.textContent = message.content" in SCRIPT
+    assert 'kind: "subagent"' in SCRIPT
+    assert "expectedConversationId" in SCRIPT

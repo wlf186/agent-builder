@@ -14,8 +14,17 @@ import pytest
 
 import agent_builder_v2.ollama as ollama_module
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
-from agent_builder_v2.context import ContextCompiler, estimate_provider_input_tokens
+from agent_builder_v2.context import (
+    ContextCompiler,
+    ConversationMessage,
+    estimate_provider_input_tokens,
+)
 from agent_builder_v2.model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
+from agent_builder_v2.model_catalog import (
+    ModelCatalog,
+    ModelCatalogEntry,
+    ProviderEndpoint,
+)
 from agent_builder_v2.ollama import (
     HARNESS_TOOL_ID,
     MAX_CONCURRENT_MODEL_STREAMS,
@@ -149,6 +158,22 @@ def _chat_response(content: bytes, *, content_type: str = "application/x-ndjson"
     return response
 
 
+def _status_response(
+    status: int,
+    value: object,
+    *,
+    content_type: str = "application/json",
+) -> ChatFactory:
+    def response(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            headers={"Content-Type": content_type},
+            content=json.dumps(value, separators=(",", ":")).encode(),
+        )
+
+    return response
+
+
 async def _started_broker(
     factories: list[ChatFactory],
 ) -> tuple[OllamaBroker, _MockProvider]:
@@ -209,6 +234,305 @@ async def test_qualification_pins_safe_ip_and_fixed_identity() -> None:
         OllamaBroker(endpoint="http://attacker.invalid")  # type: ignore[call-arg]
     with pytest.raises(TypeError):
         OllamaBroker(model="larger-model")  # type: ignore[call-arg]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "value", "content_type", "expected_code"),
+    [
+        (400, {"error": "context length exceeds maximum"}, "application/json", "model_context_overflow"),
+        (413, {"error": "vision image is too large"}, "application/json", "model_media_overflow"),
+        (400, {"error": "invalid api token"}, "application/json", "model_unavailable"),
+        (401, {"error": "context length exceeds maximum"}, "application/json", "model_unavailable"),
+        (400, {"error": "context length exceeds maximum", "detail": "x"}, "application/json", "model_unavailable"),
+        (400, {"error": "context length exceeds maximum"}, "text/plain", "model_unavailable"),
+    ],
+)
+async def test_provider_overflow_classification_is_exact_and_fail_closed(
+    status: int,
+    value: object,
+    content_type: str,
+    expected_code: str,
+) -> None:
+    broker, _provider = await _started_broker(
+        [_status_response(status, value, content_type=content_type)]
+    )
+    try:
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(
+                broker.new_run(_plan(broker, "classify provider status")).stream_turn(
+                    "classify provider status"
+                )
+            )
+        assert raised.value.code == expected_code
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_classified_overflow_can_install_one_recovery_projection() -> None:
+    overflow = _status_response(
+        400, {"error": "prompt is too long and exceeds context limit"}
+    )
+    success = _chat_response(
+        _ndjson(_provider_frame(content="recovered", done=True, done_reason="stop"))
+    )
+    broker, provider = await _started_broker([overflow, success])
+    try:
+        profile = broker.qualification.model_profile  # type: ignore[union-attr]
+        history = (
+            ConversationMessage("1" * 32, "user", "older question " + "A" * 1024),
+            ConversationMessage("2" * 32, "assistant", "older answer " + "B" * 1024),
+            ConversationMessage("3" * 32, "user", "recent question"),
+            ConversationMessage("4" * 32, "assistant", "recent answer"),
+        )
+        compiler = ContextCompiler()
+        initial = compiler.compile(
+            "current question",
+            model_profile=profile,
+            tools=prototype_tool_specs(),
+            agent_id=PROTOTYPE_AGENT_ID,
+            capsule_generation=1,
+            history=history,
+        )
+        recovery = compiler.compile(
+            "current question",
+            model_profile=profile,
+            tools=prototype_tool_specs(),
+            agent_id=PROTOTYPE_AGENT_ID,
+            capsule_generation=1,
+            history=history,
+            force_compact=True,
+            collapse_to_recent=True,
+        )
+        assert recovery.reference != initial.reference
+        session = broker.new_run(initial)
+        observed: list[int] = []
+
+        async def observe(metadata: OllamaRequestMetadata) -> None:
+            observed.append(metadata.iteration)
+
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(
+                session.stream_turn("current question", on_request=observe)
+            )
+        assert raised.value.code == "model_context_overflow"
+        session.install_recovery_context(recovery)
+        frames = await _collect(
+            session.stream_turn("current question", on_request=observe)
+        )
+        assert frames[-1].kind == "stop"
+        assert observed == [1, 1]
+        chat = [
+            json.loads(request.content)
+            for request in provider.requests
+            if request.url.path == "/api/chat"
+        ]
+        assert len(chat) == 2
+        assert chat[0]["messages"] != chat[1]["messages"]
+        with pytest.raises(OllamaBrokerError) as reused:
+            session.install_recovery_context(recovery)
+        assert reused.value.code == "model_recovery_invalid"
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_stream_never_enables_overflow_recovery() -> None:
+    partial_then_error = _chat_response(
+        _ndjson(
+            _provider_frame(content="partial"),
+            {"error": "context length exceeds maximum"},
+        )
+    )
+    broker, _provider = await _started_broker([partial_then_error])
+    try:
+        plan = _plan(broker, "partial stream")
+        session = broker.new_run(plan)
+        with pytest.raises(OllamaBrokerError) as raised:
+            await _collect(session.stream_turn("partial stream"))
+        assert raised.value.code == "model_protocol_error"
+        with pytest.raises(OllamaBrokerError) as recovery:
+            session.install_recovery_context(plan)
+        assert recovery.value.code == "model_recovery_invalid"
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_catalog_qualifies_two_profiles_and_binds_each_request() -> None:
+    endpoint = ProviderEndpoint("trusted", "ollama", OLLAMA_HOST, OLLAMA_PORT)
+    catalog = ModelCatalog.create(
+        endpoints=(endpoint,),
+        models=(
+            ModelCatalogEntry(
+                "large-tools", "ollama", "large:1b", endpoint.endpoint_id,
+                32_768, 2_048,
+            ),
+            ModelCatalogEntry(
+                "small-text", "ollama", "small:1b", endpoint.endpoint_id,
+                8_192, 512, ("completion", "streaming"),
+            ),
+        ),
+        default_model_id="large-tools",
+    )
+    chat_bodies: list[dict[str, Any]] = []
+
+    async def provider(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/version":
+            return _json_response({"version": "0.23.2"})
+        if request.url.path == "/api/tags":
+            return _json_response({
+                "models": [
+                    {"name": "large:1b", "digest": "a" * 64, "size": 100},
+                    {"name": "small:1b", "digest": "b" * 64, "size": 80},
+                ]
+            })
+        if request.url.path == "/api/show":
+            model = json.loads(request.content)["model"]
+            return _json_response({
+                "capabilities": (
+                    ["completion", "tools"] if model == "large:1b"
+                    else ["completion"]
+                ),
+                "model_info": {
+                    "general.architecture": "test",
+                    "test.context_length": (
+                        65_536 if model == "large:1b" else 16_384
+                    ),
+                },
+            })
+        if request.url.path == "/api/chat":
+            body = json.loads(request.content)
+            chat_bodies.append(body)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "application/x-ndjson"},
+                content=_ndjson(_provider_frame(
+                    content="ok",
+                    done=True,
+                    done_reason="stop",
+                    model=body["model"],
+                )),
+            )
+        return _json_response({"error": "unexpected"}, status=500)
+
+    broker = OllamaBroker(
+        catalog=catalog,
+        transport=httpx.MockTransport(provider),
+        resolver=_resolver,
+    )
+    try:
+        default = await broker.start()
+        small = broker.qualification_for("small-text")
+        assert default.catalog_model_id == "large-tools"
+        assert default.model_profile.operational_context_tokens == 32_768
+        assert default.model_profile.supports_tools is True
+        assert small.model_profile.operational_context_tokens == 8_192
+        assert small.model_profile.supports_tools is False
+        for qualification, tools in (
+            (default, prototype_tool_specs()),
+            (small, ()),
+        ):
+            plan = ContextCompiler().compile(
+                "answer directly",
+                model_profile=qualification.model_profile,
+                tools=tools,
+                agent_id=PROTOTYPE_AGENT_ID,
+                capsule_generation=1,
+            )
+            frames = await _collect(
+                broker.new_run(plan).stream_turn("answer directly")
+            )
+            assert frames[-1].kind == "stop"
+        assert [body["model"] for body in chat_bodies] == ["large:1b", "small:1b"]
+        assert chat_bodies[0]["options"]["num_ctx"] == 32_768
+        assert chat_bodies[1]["options"]["num_ctx"] == 8_192
+        assert chat_bodies[0]["tools"]
+        assert chat_bodies[1]["tools"] == []
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_semantic_summary_uses_empty_toolset_and_binds_validated_usage() -> None:
+    def summary_response(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        assert body["stream"] is True
+        assert body["tools"] == []
+        assert "format" not in body
+        assert "UNTRUSTED_TRANSCRIPT_JSON" in body["messages"][1]["content"]
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/x-ndjson"},
+            content=_ndjson({
+                "model": OLLAMA_MODEL,
+                "message": {"role": "assistant", "content": json.dumps({
+                    "facts": ["code is SUM-91"],
+                    "decisions": ["keep isolation"],
+                    "open_tasks": [],
+                    "files": [],
+                    "references": [],
+                })},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 120,
+                "eval_count": 30,
+            }),
+        )
+
+    broker, _provider = await _started_broker([summary_response])
+    try:
+        source = (
+            ConversationMessage("1" * 32, "user", "remember SUM-91"),
+            ConversationMessage("2" * 32, "assistant", "remembered"),
+        )
+        snapshot = await broker.summarize(source)
+
+        assert snapshot.source_message_ids == ("1" * 32, "2" * 32)
+        assert snapshot.content.facts == ("code is SUM-91",)
+        assert snapshot.input_tokens == 120
+        assert snapshot.output_tokens == 30
+        assert snapshot.model_profile_digest == broker.qualification.model_profile.profile_digest  # type: ignore[union-attr]
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_summaries_open_bounded_circuit_without_immediate_retry() -> None:
+    def invalid_summary(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/x-ndjson"},
+            content=_ndjson({
+                "model": OLLAMA_MODEL,
+                "message": {"role": "assistant", "content": "not-json"},
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 10,
+                "eval_count": 2,
+            }),
+        )
+
+    broker, provider = await _started_broker(
+        [invalid_summary, invalid_summary, invalid_summary]
+    )
+    source = (
+        ConversationMessage("1" * 32, "user", "untrusted"),
+        ConversationMessage("2" * 32, "assistant", "data"),
+    )
+    try:
+        for _index in range(3):
+            with pytest.raises(OllamaBrokerError) as failure:
+                await broker.summarize(source)
+            assert failure.value.code == "summary_invalid"
+        chat_count = sum(request.url.path == "/api/chat" for request in provider.requests)
+        with pytest.raises(OllamaBrokerError) as circuit:
+            await broker.summarize(source)
+        assert circuit.value.code == "summary_circuit_open"
+        assert sum(request.url.path == "/api/chat" for request in provider.requests) == chat_count
+    finally:
+        await broker.close()
 
 
 @pytest.mark.asyncio
@@ -377,6 +701,57 @@ async def test_two_turn_tool_loop_preserves_assistant_call_and_tool_result() -> 
             {"role": "assistant", "content": "", "tool_calls": [provider_tool_call]},
             {"role": "tool", "tool_name": "builtin_echo", "content": "hello"},
         ]
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_large_tool_result_uses_bounded_projection_before_readmission() -> None:
+    canonical = "x" * 8_192
+    provider_tool_call = {
+        "id": "call_large",
+        "function": {
+            "index": 0,
+            "name": "builtin_echo",
+            "arguments": {"text": canonical},
+        },
+    }
+    first = _chat_response(
+        _ndjson(
+            _provider_frame(tool_calls=[provider_tool_call]),
+            _provider_frame(done=True, done_reason="stop"),
+        )
+    )
+    second = _chat_response(
+        _ndjson(
+            _provider_frame(content="done"),
+            _provider_frame(done=True, done_reason="stop"),
+        )
+    )
+    broker, provider = await _started_broker([first, second])
+    try:
+        plan = _plan(broker, "echo a bounded large result")
+        session = broker.new_run(plan)
+        await _collect(session.stream_turn("echo a bounded large result"))
+        await _collect(
+            session.stream_turn(
+                "echo a bounded large result",
+                (OllamaToolResult("call_large", HARNESS_TOOL_ID, canonical),),
+            )
+        )
+
+        requests = [
+            json.loads(request.content)
+            for request in provider.requests
+            if request.url.path == "/api/chat"
+        ]
+        projected = requests[1]["messages"][-1]["content"]
+        assert canonical not in projected
+        assert "call_id=call_large" in projected
+        assert "original_bytes=8192" in projected
+        assert "reason=provider_projection_limit" in projected
+        assert len(projected.encode("utf-8")) <= 4_096
+        assert session.messages[-2]["content"] == projected
     finally:
         await broker.close()
 

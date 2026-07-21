@@ -1,4 +1,4 @@
-"""Framework-neutral commands and events for the V2 walking skeleton."""
+"""Framework-neutral commands and events for the runtime."""
 
 from __future__ import annotations
 
@@ -75,6 +75,8 @@ class StartRunCommand:
     agent_id: str
     message: str
     conversation_id: str | None = None
+    model_id: str | None = None
+    compact: bool = False
 
     def validate(self) -> None:
         if not self.agent_id or len(self.agent_id) > 64:
@@ -89,6 +91,13 @@ class StartRunCommand:
             self.conversation_id
         ):
             raise ValueError("invalid conversation_id")
+        if self.model_id is not None and (
+            not isinstance(self.model_id, str)
+            or re.fullmatch(r"[A-Za-z0-9._:/+-]{1,128}", self.model_id) is None
+        ):
+            raise ValueError("invalid model_id")
+        if not isinstance(self.compact, bool):
+            raise ValueError("invalid compact flag")
 
 
 @dataclass(frozen=True)

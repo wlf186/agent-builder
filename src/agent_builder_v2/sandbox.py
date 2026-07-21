@@ -789,12 +789,170 @@ def apply_read_only_command_confinement(workspace: Path, executable: Path) -> No
         os.close(ruleset_fd)
 
 
-def _build_seccomp_filter(machine: str) -> list[_SockFilter]:
+def apply_bounded_bash_sandbox(
+    bash_path: Path,
+    work_root: Path,
+    *,
+    expected_parent_pid: int,
+) -> SandboxAttestation:
+    """Confine one pre-parsed builtin-only Bash image.
+
+    Exactly one image replacement is required to enter Bash. Process creation,
+    networking and every filesystem write remain denied. Landlock exposes the
+    exact Bash inode, loader libraries and the private cwd, but not the Agent
+    workspace, Capsule Python environment or command output paths.
+    """
+
+    qualification = require_qualified_host()
+    bash = _capture_rule_root(bash_path, expect_directory=False)
+    work = _capture_rule_root(work_root, expect_directory=True)
+    bash_metadata = os.stat(bash.path, follow_symlinks=False)
+    work_metadata = os.stat(work.path, follow_symlinks=False)
+    if (
+        bash_metadata.st_uid not in {0, os.getuid()}
+        or work_metadata.st_uid != os.getuid()
+        or not stat.S_ISREG(bash_metadata.st_mode)
+    ):
+        raise SandboxUnavailableError("bounded Bash sandbox root is unsafe")
+    readable = [bash, work]
+    for candidate in _SYSTEM_READABLE_CANDIDATES:
+        captured = _optional_rule_root(candidate)
+        if captured is not None:
+            readable.append(captured)
+    ruleset_fd = _new_ruleset_fd()
+    read_directory = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_READ_DIR
+    read_file = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_IOCTL_DEV
+    try:
+        seen: set[tuple[int, int]] = set()
+        for root in readable:
+            identity = (root.device, root.inode)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            _add_path_rule(
+                ruleset_fd,
+                root,
+                read_directory if root.is_directory else read_file,
+            )
+        parent_pid = configure_parent_death_signal(expected_parent_pid)
+        _set_process_nondumpable()
+        _set_no_new_privileges()
+        result = _libc().syscall(_SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
+        if result != 0:
+            error = ctypes.get_errno()
+            raise SandboxUnavailableError(
+                f"could not enter bounded Bash Landlock domain: errno={error}"
+            )
+    finally:
+        os.close(ruleset_fd)
+    _install_seccomp_filter(
+        qualification.machine, allow_image_replace=True
+    )
+    return SandboxAttestation(
+        landlock_abi=qualification.landlock_abi,
+        seccomp_arch=qualification.machine,
+        seccomp_mode=_SECCOMP_MODE_FILTER,
+        no_new_privileges=True,
+        parent_pid=parent_pid,
+    )
+
+
+def apply_singleton_command_sandbox(
+    source_root: Path,
+    output_root: Path,
+    work_root: Path,
+    *,
+    expected_parent_pid: int,
+) -> SandboxAttestation:
+    """Install the fail-closed sandbox for one fixed, in-process command.
+
+    The command payload is already executing when this function is called.
+    Seccomp therefore denies every later fork/clone/exec/setsid path: the
+    supervised PID is the complete descendant container, rather than merely
+    the leader of a process group.  Landlock exposes only trusted source as
+    read-only and one exact Run output directory as writable.
+    """
+
+    qualification = require_qualified_host()
+    source = _capture_rule_root(source_root, expect_directory=True)
+    output = _capture_rule_root(output_root, expect_directory=True)
+    work = _capture_rule_root(work_root, expect_directory=True)
+    for root in (source, output, work):
+        metadata = os.stat(root.path, follow_symlinks=False)
+        if metadata.st_uid != os.getuid():
+            raise SandboxUnavailableError("command sandbox root has the wrong owner")
+    if stat.S_IMODE(os.stat(output.path, follow_symlinks=False).st_mode) & 0o077:
+        raise SandboxUnavailableError("command output root is not private")
+    identities = {(item.device, item.inode) for item in (source, output, work)}
+    if len(identities) != 3:
+        raise SandboxUnavailableError("command sandbox roots overlap")
+
+    readable = [source, work, _capture_rule_root(Path(sys.base_prefix), expect_directory=True)]
+    for candidate in _SYSTEM_READABLE_CANDIDATES:
+        captured = _optional_rule_root(candidate)
+        if captured is not None:
+            readable.append(captured)
+    ruleset_fd = _new_ruleset_fd()
+    read_directory = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_READ_DIR
+    read_file = _ACCESS_EXECUTE | _ACCESS_READ_FILE | _ACCESS_IOCTL_DEV
+    output_rights = (
+        _ACCESS_READ_FILE
+        | _ACCESS_READ_DIR
+        | _ACCESS_WRITE_FILE
+        | _ACCESS_REMOVE_FILE
+        | _ACCESS_MAKE_REG
+        | _ACCESS_TRUNCATE
+    )
+    try:
+        seen: set[tuple[int, int]] = set()
+        for root in readable:
+            identity = (root.device, root.inode)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            _add_path_rule(
+                ruleset_fd,
+                root,
+                read_directory if root.is_directory else read_file,
+            )
+        if (output.device, output.inode) in seen:
+            raise SandboxUnavailableError("command output overlaps a readable root")
+        _add_path_rule(ruleset_fd, output, output_rights)
+        parent_pid = configure_parent_death_signal(expected_parent_pid)
+        _set_process_nondumpable()
+        _set_no_new_privileges()
+        result = _libc().syscall(_SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd, 0)
+        if result != 0:
+            error = ctypes.get_errno()
+            raise SandboxUnavailableError(
+                f"could not enter command Landlock domain: errno={error}"
+            )
+    finally:
+        os.close(ruleset_fd)
+    _install_seccomp_filter(qualification.machine)
+    return SandboxAttestation(
+        landlock_abi=qualification.landlock_abi,
+        seccomp_arch=qualification.machine,
+        seccomp_mode=_SECCOMP_MODE_FILTER,
+        no_new_privileges=True,
+        parent_pid=parent_pid,
+    )
+
+
+def _build_seccomp_filter(
+    machine: str, *, allow_image_replace: bool = False
+) -> list[_SockFilter]:
     normalised = _MACHINE_ALIASES.get(machine.lower(), machine.lower())
     specification = _SECCOMP_ARCHITECTURES.get(normalised)
     if specification is None:
         raise SandboxUnavailableError(f"unsupported seccomp architecture: {normalised}")
-    audit_arch, reject_x32, blocked_syscalls = specification
+    audit_arch, reject_x32, blocked = specification
+    blocked_syscalls = set(blocked)
+    if allow_image_replace:
+        for syscall_number in (
+            (59, 322) if normalised == "x86_64" else (221, 281)
+        ):
+            blocked_syscalls.discard(syscall_number)
     instructions: list[_SockFilter] = [
         _SockFilter(_BPF_LD_W_ABS, 0, 0, 4),
         _SockFilter(_BPF_JMP_JEQ_K, 1, 0, audit_arch),
@@ -823,8 +981,12 @@ def _build_seccomp_filter(machine: str) -> list[_SockFilter]:
     return instructions
 
 
-def _install_seccomp_filter(machine: str) -> None:
-    instructions = _build_seccomp_filter(machine)
+def _install_seccomp_filter(
+    machine: str, *, allow_image_replace: bool = False
+) -> None:
+    instructions = _build_seccomp_filter(
+        machine, allow_image_replace=allow_image_replace
+    )
     program_array = (_SockFilter * len(instructions))(*instructions)
     program = _SockFprog(len=len(instructions), filter=program_array)
     _set_no_new_privileges()
@@ -880,7 +1042,9 @@ __all__ = [
     "apply_worker_sandbox",
     "apply_worker_umask",
     "apply_checkout_write_confinement",
+    "apply_bounded_bash_sandbox",
     "apply_read_only_command_confinement",
+    "apply_singleton_command_sandbox",
     "close_worker_file_descriptors",
     "configure_parent_death_signal",
     "host_qualification",

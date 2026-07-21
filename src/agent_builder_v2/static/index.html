@@ -322,6 +322,24 @@
               </div>
             </section>
 
+            <section
+              id="subagent-panel"
+              class="panel subagent-panel"
+              aria-labelledby="subagent-title"
+              hidden
+            >
+              <header class="conversation-heading">
+                <div>
+                  <p class="section-label">SUBAGENT MAILBOX</p>
+                  <h2 id="subagent-title">子智能体委派</h2>
+                </div>
+              </header>
+              <p class="conversation-hint">
+                父 Task、子 Run 与双向消息是独立事实；选择子 Run 可在左侧查看其完整事件序列。
+              </p>
+              <div id="subagent-list" class="subagent-list"></div>
+            </section>
+
             <section class="panel composer-panel composer-dock" aria-labelledby="composer-title">
               <div class="composer-heading">
                 <div>
@@ -330,6 +348,14 @@
                 </div>
               </div>
               <form id="run-form">
+                <label for="model-select">本轮模型</label>
+                <select id="model-select" disabled>
+                  <option value="">正在读取受信模型目录…</option>
+                </select>
+                <label class="inline-check" for="compact-input">
+                  <input id="compact-input" type="checkbox" disabled />
+                  本轮前手动生成语义摘要（保留最近完整 Turn）
+                </label>
                 <label for="message-input">用户消息</label>
                 <textarea
                   id="message-input"
@@ -338,6 +364,21 @@
                   required
                   disabled
                 ></textarea>
+                <details id="command-help" class="command-help">
+                  <summary>Slash Commands</summary>
+                  <ul id="command-help-list" aria-label="可用 Slash Command"></ul>
+                </details>
+                <section id="command-result" class="command-result" aria-live="polite" hidden>
+                  <div class="command-result-heading">
+                    <strong id="command-result-title">命令结果</strong>
+                    <button id="command-result-close" class="quiet" type="button">关闭</button>
+                  </div>
+                  <pre id="command-result-json"></pre>
+                </section>
+                <section id="permission-panel" class="permission-panel" hidden>
+                  <h3>待审批能力</h3>
+                  <div id="permission-list"></div>
+                </section>
                 <div class="actions">
                   <button id="run-button" type="submit" disabled>发送</button>
                   <button id="cancel-button" class="danger" type="button" disabled>

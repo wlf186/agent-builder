@@ -9,8 +9,10 @@ from pathlib import Path
 from .agents import AgentRegistry
 from .commands import CommandBus
 from .control import RunService
+from .extensions import ExtensionCatalog
 from .ollama import OllamaBroker, OllamaQualification
 from .query_engine import QueryEngineRegistry
+from .subagents import SubagentCoordinator
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,16 +41,19 @@ class AgentRuntimeManager:
         registry: AgentRegistry,
         *,
         model_broker: OllamaBroker | None = None,
+        extension_catalog: ExtensionCatalog | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve(strict=True)
         self.source_root = source_root.resolve(strict=True)
         self.registry = registry
         self.model_broker = model_broker or OllamaBroker()
+        self.extension_catalog = extension_catalog or ExtensionCatalog.empty()
         self._runtimes: dict[str, AgentRuntime] = {}
         self._draining: set[str] = set()
         self._lock = asyncio.Lock()
         self._started = False
         self._closing = False
+        self.subagents = SubagentCoordinator(self.registry, self.for_agent)
 
     @property
     def qualification(self) -> OllamaQualification | None:
@@ -64,6 +69,7 @@ class AgentRuntimeManager:
                     raise RuntimeError("Agent runtime manager lost qualification")
                 return qualification
             qualification = await self.model_broker.start()
+            self.subagents.bind_loop(asyncio.get_running_loop())
             self._started = True
             return qualification
 
@@ -90,7 +96,9 @@ class AgentRuntimeManager:
                 agent_id=agent_id,
                 model_broker=self.model_broker,
                 manage_model_broker=False,
+                extension_catalog=self.extension_catalog,
             )
+            service.subagent_coordinator = self.subagents
             try:
                 await service.initialize()
             except BaseException:
@@ -106,7 +114,11 @@ class AgentRuntimeManager:
                 generation=record.generation,
                 run_service=service,
                 query_engines=query_engines,
-                commands=CommandBus(query_engines),
+                commands=CommandBus(
+                    query_engines,
+                    services=service,
+                    model_catalog=getattr(self.model_broker, "catalog", None),
+                ),
             )
             self._runtimes[agent_id] = runtime
             return runtime
@@ -120,6 +132,7 @@ class AgentRuntimeManager:
             self._draining.add(agent_id)
             runtime = self._runtimes.pop(agent_id, None)
         if runtime is not None:
+            await self.subagents.cancel_agent(agent_id)
             await runtime.query_engines.close()
             await runtime.run_service.close()
 
@@ -138,6 +151,8 @@ class AgentRuntimeManager:
             runtimes = tuple(self._runtimes.values())
             self._runtimes.clear()
         for runtime in runtimes:
+            await self.subagents.cancel_agent(runtime.agent_id)
             await runtime.query_engines.close()
             await runtime.run_service.close()
+        await self.subagents.close()
         await self.model_broker.close()

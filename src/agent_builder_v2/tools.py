@@ -21,10 +21,13 @@ _RESULT_KIND = frozenset({"text"})
 _RESULT_TRUST = frozenset({"untrusted_tool_data"})
 _PROGRESS_MODE = frozenset({"none", "bounded"})
 _CANCELLATION = frozenset({"cooperative", "not_cancellable"})
+_RESULT_PROJECTION = frozenset({"identity_or_digest_placeholder_v1"})
 _POLICY_REVISION = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 _RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
 _AGENT_ID = re.compile(r"^[a-f0-9-]{32,64}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
+_TOOL_CALL_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+MAX_PROVIDER_TOOL_RESULT_HISTORY_BYTES = 16 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +84,11 @@ class ToolInputField:
             if not isinstance(value, str):
                 raise ValueError(f"{self.name} must be a string")
             assert self.maximum_utf8_bytes is not None
-            if len(value.encode("utf-8")) > self.maximum_utf8_bytes:
+            try:
+                encoded = value.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError(f"{self.name} is not valid UTF-8") from exc
+            if len(encoded) > self.maximum_utf8_bytes:
                 raise ValueError(f"{self.name} exceeds its byte limit")
             return value
         if self.value_kind == "integer":
@@ -125,7 +132,7 @@ class ToolInputField:
 class ToolSpec:
     """One immutable capability definition shared by model and executor paths.
 
-    The walking skeleton intentionally supports only one bounded string field.
+    This capability intentionally supports only one bounded string field.
     Extending the schema vocabulary must happen here so provider exposure,
     Worker validation and execution cannot silently drift apart.
     """
@@ -147,6 +154,8 @@ class ToolSpec:
     progress_mode: str
     max_progress_events: int
     cancellation: str
+    max_provider_projection_bytes: int = 4_096
+    result_projection: str = "identity_or_digest_placeholder_v1"
 
     def __post_init__(self) -> None:
         if (
@@ -159,7 +168,7 @@ class ToolSpec:
             or not isinstance(self.description, str)
             or not self.description.strip()
             or len(self.description.encode("utf-8")) > 1_024
-            or self.contract_version not in {"1", "2"}
+            or self.contract_version not in {"1", "2", "3"}
             or not isinstance(self.input_fields, tuple)
             or not 1 <= len(self.input_fields) <= 32
             or any(not isinstance(item, ToolInputField) for item in self.input_fields)
@@ -189,6 +198,12 @@ class ToolSpec:
             or not 0 <= self.max_progress_events <= 256
             or (self.progress_mode == "none") != (self.max_progress_events == 0)
             or self.cancellation not in _CANCELLATION
+            or not isinstance(self.max_provider_projection_bytes, int)
+            or isinstance(self.max_provider_projection_bytes, bool)
+            or not 512
+            <= self.max_provider_projection_bytes
+            <= min(self.max_result_bytes, MAX_PROVIDER_TOOL_RESULT_HISTORY_BYTES)
+            or self.result_projection not in _RESULT_PROJECTION
         ):
             raise ValueError("invalid Tool specification")
 
@@ -248,7 +263,7 @@ class ToolSpec:
                 "risk": self.risk,
                 "timeout_seconds": self.timeout_seconds,
             }
-        return {
+        manifest = {
             "tool_id": self.tool_id,
             "provider_name": self.provider_name,
             "contract_version": self.contract_version,
@@ -268,6 +283,14 @@ class ToolSpec:
             "risk": self.risk,
             "timeout_seconds": self.timeout_seconds,
         }
+        if self.contract_version == "3":
+            manifest.update(
+                {
+                    "max_provider_projection_bytes": self.max_provider_projection_bytes,
+                    "result_projection": self.result_projection,
+                }
+            )
+        return manifest
 
     def ollama_definition(self) -> dict[str, object]:
         manifest = self.canonical_manifest()
@@ -290,8 +313,167 @@ class ToolResult:
     progress: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class ToolResultProjection:
+    call_id: str
+    tool_id: str
+    content: str
+    original_bytes: int
+    content_digest: str
+    truncated: bool
+    truncation_reason: str
+    projection_digest: str
+
+
+def _tool_result_content_digest(content: bytes) -> str:
+    return hashlib.sha256(
+        b"agent-builder-tool-result-content-v1\0" + content
+    ).hexdigest()
+
+
+def _tool_result_placeholder(
+    call_id: str, original_bytes: int, content_digest: str
+) -> str:
+    return (
+        "[tool-result compacted; "
+        f"call_id={call_id}; original_bytes={original_bytes}; "
+        f"sha256={content_digest}; reason=provider_projection_limit]"
+    )
+
+
+def _tool_result_projection_digest(
+    spec: ToolSpec,
+    *,
+    call_id: str,
+    content: str,
+    original_bytes: int,
+    content_digest: str,
+    truncated: bool,
+    truncation_reason: str,
+) -> str:
+    encoded = json.dumps(
+        {
+            "tool_id": spec.tool_id,
+            "contract_version": spec.contract_version,
+            "call_id": call_id,
+            "content": content,
+            "original_bytes": original_bytes,
+            "content_digest": content_digest,
+            "truncated": truncated,
+            "truncation_reason": truncation_reason,
+            "projection_policy": spec.result_projection,
+            "projection_budget_bytes": spec.max_provider_projection_bytes,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(
+        b"agent-builder-tool-result-projection-v1\0" + encoded
+    ).hexdigest()
+
+
+def project_tool_result(
+    spec: ToolSpec, call_id: str, canonical_content: object
+) -> ToolResultProjection:
+    if _TOOL_CALL_ID.fullmatch(call_id) is None:
+        raise ValueError("invalid Tool result call identity")
+    content = spec.validate_result(canonical_content)
+    encoded = content.encode("utf-8")
+    original_bytes = len(encoded)
+    content_digest = _tool_result_content_digest(encoded)
+    truncated = original_bytes > spec.max_provider_projection_bytes
+    projected = (
+        _tool_result_placeholder(call_id, original_bytes, content_digest)
+        if truncated
+        else content
+    )
+    if len(projected.encode("utf-8")) > spec.max_provider_projection_bytes:
+        raise ValueError("Tool result placeholder exceeds its projection budget")
+    reason = "provider_projection_limit" if truncated else "none"
+    digest = _tool_result_projection_digest(
+        spec,
+        call_id=call_id,
+        content=projected,
+        original_bytes=original_bytes,
+        content_digest=content_digest,
+        truncated=truncated,
+        truncation_reason=reason,
+    )
+    return ToolResultProjection(
+        call_id,
+        spec.tool_id,
+        projected,
+        original_bytes,
+        content_digest,
+        truncated,
+        reason,
+        digest,
+    )
+
+
+def validate_tool_result_projection(
+    spec: ToolSpec, projection: ToolResultProjection
+) -> ToolResultProjection:
+    try:
+        projected_bytes = len(projection.content.encode("utf-8"))
+    except (AttributeError, UnicodeEncodeError):
+        raise ValueError("invalid Tool result projection") from None
+    if (
+        not isinstance(projection, ToolResultProjection)
+        or projection.tool_id != spec.tool_id
+        or _TOOL_CALL_ID.fullmatch(projection.call_id) is None
+        or not isinstance(projection.original_bytes, int)
+        or isinstance(projection.original_bytes, bool)
+        or not 0 <= projection.original_bytes <= spec.max_result_bytes
+        or not isinstance(projection.content_digest, str)
+        or _DIGEST.fullmatch(projection.content_digest) is None
+        or not isinstance(projection.truncated, bool)
+        or not isinstance(projection.truncation_reason, str)
+        or projection.truncation_reason
+        not in {"none", "provider_projection_limit"}
+        or not isinstance(projection.projection_digest, str)
+        or projected_bytes > spec.max_provider_projection_bytes
+    ):
+        raise ValueError("invalid Tool result projection")
+    if projection.truncated:
+        expected_content = _tool_result_placeholder(
+            projection.call_id,
+            projection.original_bytes,
+            projection.content_digest,
+        )
+        if (
+            projection.original_bytes <= spec.max_provider_projection_bytes
+            or projection.truncation_reason != "provider_projection_limit"
+            or projection.content != expected_content
+        ):
+            raise ValueError("invalid compacted Tool result projection")
+    else:
+        encoded = projection.content.encode("utf-8")
+        if (
+            projection.truncation_reason != "none"
+            or projection.original_bytes != len(encoded)
+            or projection.content_digest != _tool_result_content_digest(encoded)
+        ):
+            raise ValueError("invalid identity Tool result projection")
+    expected_digest = _tool_result_projection_digest(
+        spec,
+        call_id=projection.call_id,
+        content=projection.content,
+        original_bytes=projection.original_bytes,
+        content_digest=projection.content_digest,
+        truncated=projection.truncated,
+        truncation_reason=projection.truncation_reason,
+    )
+    if projection.projection_digest != expected_digest:
+        raise ValueError("Tool result projection digest changed")
+    return projection
+
+
 ToolArguments = dict[str, str | int | bool]
 ToolHandler = Callable[[ToolArguments], ToolResult]
+BrokeredToolHandler = Callable[[str, ToolArguments, str], ToolResult]
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +596,7 @@ class ToolUseContext:
     toolset_digest: str
     policy_digest: str
     arguments_digest: str
+    preview_digest: str
     expires_at_milliseconds: int
 
     def __post_init__(self) -> None:
@@ -424,7 +607,7 @@ class ToolUseContext:
             or not 1 <= self.capsule_generation <= 1_000_000_000
             or _RESOURCE_ID.fullmatch(self.conversation_id) is None
             or _RESOURCE_ID.fullmatch(self.run_id) is None
-            or _RESOURCE_ID.fullmatch(self.call_id) is None
+            or _TOOL_CALL_ID.fullmatch(self.call_id) is None
             or _TOOL_ID.fullmatch(self.tool_id) is None
             or any(
                 _DIGEST.fullmatch(item) is None
@@ -432,6 +615,7 @@ class ToolUseContext:
                     self.toolset_digest,
                     self.policy_digest,
                     self.arguments_digest,
+                    self.preview_digest,
                 )
             )
             or not isinstance(self.expires_at_milliseconds, int)
@@ -467,11 +651,355 @@ PROTOTYPE_ECHO_SPEC_V1 = ToolSpec(
     cancellation="cooperative",
 )
 
-PROTOTYPE_ECHO_SPEC = ToolSpec(
+PROTOTYPE_ECHO_SPEC_V2 = ToolSpec(
     **{
         **PROTOTYPE_ECHO_SPEC_V1.__dict__,
         "contract_version": "2",
     }
+)
+
+PROTOTYPE_ECHO_SPEC = ToolSpec(
+    **{
+        **PROTOTYPE_ECHO_SPEC_V2.__dict__,
+        "contract_version": "3",
+        "max_provider_projection_bytes": 4_096,
+        "result_projection": "identity_or_digest_placeholder_v1",
+    }
+)
+
+FILE_STAT_SPEC = ToolSpec(
+    tool_id="file/stat",
+    provider_name="file_stat",
+    contract_version="3",
+    description=(
+        "Safely inspect one UTF-8 regular file in this agent workspace. "
+        "The path must be relative and symlinks are rejected."
+    ),
+    input_fields=(
+        ToolInputField("path", "string", maximum_utf8_bytes=1_024),
+    ),
+    max_result_bytes=12_288,
+    read_only=True,
+    destructive=False,
+    concurrency="safe",
+    risk="read_only",
+    timeout_seconds=1,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/stat",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+FILE_READ_TEXT_SPEC = ToolSpec(
+    tool_id="file/read_text",
+    provider_name="file_read_text",
+    contract_version="3",
+    description=(
+        "Read a bounded UTF-8 range from one regular file in this agent workspace. "
+        "Use a relative path; optional byte or line offset and limits are fail-closed."
+    ),
+    input_fields=(
+        ToolInputField("path", "string", maximum_utf8_bytes=1_024),
+        ToolInputField(
+            "offset_bytes", "integer", required=False,
+            minimum_integer=0, maximum_integer=1_048_576,
+        ),
+        ToolInputField(
+            "line_offset", "integer", required=False,
+            minimum_integer=0, maximum_integer=100_000,
+        ),
+        ToolInputField(
+            "max_bytes", "integer", required=False,
+            minimum_integer=1, maximum_integer=4_096,
+        ),
+        ToolInputField(
+            "max_lines", "integer", required=False,
+            minimum_integer=1, maximum_integer=256,
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=True,
+    destructive=False,
+    concurrency="safe",
+    risk="read_only",
+    timeout_seconds=1,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/read_text",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+FILE_GLOB_SPEC = ToolSpec(
+    tool_id="file/glob",
+    provider_name="file_glob",
+    contract_version="3",
+    description=(
+        "List bounded UTF-8 regular files matching a safe workspace-relative glob. "
+        "Results are stable, receipt-bound, and never follow links."
+    ),
+    input_fields=(
+        ToolInputField("pattern", "string", maximum_utf8_bytes=256),
+        ToolInputField(
+            "max_results", "integer", required=False,
+            minimum_integer=1, maximum_integer=128,
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=True,
+    destructive=False,
+    concurrency="safe",
+    risk="read_only",
+    timeout_seconds=2,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/glob",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+FILE_GREP_SPEC = ToolSpec(
+    tool_id="file/grep",
+    provider_name="file_grep",
+    contract_version="3",
+    description=(
+        "Search bounded UTF-8 workspace files by literal text or a safe regex subset. "
+        "Provide a relative glob pattern and query; links and special files are rejected."
+    ),
+    input_fields=(
+        ToolInputField("pattern", "string", maximum_utf8_bytes=256),
+        ToolInputField("query", "string", maximum_utf8_bytes=256),
+        ToolInputField("regex", "boolean", required=False),
+        ToolInputField("case_sensitive", "boolean", required=False),
+        ToolInputField(
+            "max_results", "integer", required=False,
+            minimum_integer=1, maximum_integer=128,
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=True,
+    destructive=False,
+    concurrency="safe",
+    risk="read_only",
+    timeout_seconds=2,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/grep",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+FILE_EDIT_SPEC = ToolSpec(
+    tool_id="file/edit",
+    provider_name="file_edit",
+    contract_version="3",
+    description=(
+        "Replace exactly one matching UTF-8 fragment in a workspace file after a "
+        "complete file/read_text receipt. Requires explicit operator approval."
+    ),
+    input_fields=(
+        ToolInputField("path", "string", maximum_utf8_bytes=1_024),
+        ToolInputField("old_text", "string", maximum_utf8_bytes=4_096),
+        ToolInputField("new_text", "string", maximum_utf8_bytes=4_096),
+        ToolInputField("path_identity", "string", maximum_utf8_bytes=64),
+        ToolInputField("content_digest", "string", maximum_utf8_bytes=64),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="mutation",
+    timeout_seconds=2,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/edit",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+FILE_WRITE_SPEC = ToolSpec(
+    tool_id="file/write",
+    provider_name="file_write",
+    contract_version="3",
+    description=(
+        "Create or fully replace one UTF-8 workspace file atomically. Existing-file "
+        "replacement requires a complete file/read_text receipt and all mutations "
+        "require explicit operator approval."
+    ),
+    input_fields=(
+        ToolInputField("path", "string", maximum_utf8_bytes=1_024),
+        ToolInputField("content", "string", maximum_utf8_bytes=8_192),
+        ToolInputField("create", "boolean"),
+        ToolInputField(
+            "path_identity", "string", required=False, maximum_utf8_bytes=64
+        ),
+        ToolInputField(
+            "content_digest", "string", required=False, maximum_utf8_bytes=64
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=True,
+    concurrency="serialized",
+    risk="mutation",
+    timeout_seconds=2,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="file/write",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+EXEC_RUN_SPEC_V1 = ToolSpec(
+    tool_id="exec/run",
+    provider_name="exec_run",
+    contract_version="3",
+    description=(
+        "Run one operator-approved command from the trusted project-local allowlist. "
+        "The v1 allowlist contains only runtime-compile and never invokes a shell."
+    ),
+    input_fields=(
+        ToolInputField("command_id", "string", maximum_utf8_bytes=64),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="execution",
+    timeout_seconds=15,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="exec/run",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+EXEC_RUN_SPEC = ToolSpec(
+    tool_id="exec/run",
+    provider_name="exec_run",
+    contract_version="3",
+    description=(
+        "Run one operator-approved command: runtime-compile or a bounded-bash "
+        "single builtin command. Bash expansion, pipes, redirection, environment "
+        "assignment, subprocesses and network are denied."
+    ),
+    input_fields=(
+        ToolInputField("command_id", "string", maximum_utf8_bytes=64),
+        ToolInputField(
+            "script", "string", required=False, maximum_utf8_bytes=1_024
+        ),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="execution",
+    timeout_seconds=15,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="exec/run",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+EXTENSION_CALL_SPEC = ToolSpec(
+    tool_id="extension/call",
+    provider_name="extension_call",
+    contract_version="3",
+    description=(
+        "Call one method from the operator-configured MCP/LSP catalog through "
+        "pinned HTTPS JSON-RPC. Local stdio and request-defined endpoints are disabled."
+    ),
+    input_fields=(
+        ToolInputField("extension_id", "string", maximum_utf8_bytes=36),
+        ToolInputField("method", "string", maximum_utf8_bytes=128),
+        ToolInputField("params_json", "string", maximum_utf8_bytes=8_192),
+    ),
+    max_result_bytes=16_384,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="execution",
+    timeout_seconds=8,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="extension/call",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+SKILL_RUN_SPEC = ToolSpec(
+    tool_id="skill/run",
+    provider_name="skill_run",
+    contract_version="3",
+    description=(
+        "Run one explicitly installed, versioned Agent Skill in its dedicated "
+        "environment and singleton network-denied sandbox."
+    ),
+    input_fields=(
+        ToolInputField("skill_id", "string", maximum_utf8_bytes=36),
+        ToolInputField("input_json", "string", maximum_utf8_bytes=4_096),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="execution",
+    timeout_seconds=15,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="skill/run",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
+)
+
+AGENT_DELEGATE_SPEC = ToolSpec(
+    tool_id="agent/delegate",
+    provider_name="agent_delegate",
+    contract_version="3",
+    description=(
+        "Delegate one bounded message to a different active Agent. The child runs "
+        "in its own Capsule, Conversation, Worker and sandbox; explicit operator "
+        "approval is required and only its bounded answer returns."
+    ),
+    input_fields=(
+        ToolInputField("child_agent_id", "string", maximum_utf8_bytes=36),
+        ToolInputField("message", "string", maximum_utf8_bytes=4_096),
+    ),
+    max_result_bytes=12_288,
+    read_only=False,
+    destructive=False,
+    concurrency="serialized",
+    risk="execution",
+    timeout_seconds=45,
+    result_kind="text",
+    result_trust="untrusted_tool_data",
+    result_source="agent/delegate",
+    progress_mode="none",
+    max_progress_events=0,
+    cancellation="cooperative",
+    max_provider_projection_bytes=8_192,
 )
 
 
@@ -493,6 +1021,43 @@ def prototype_effective_toolset() -> EffectiveToolSet:
     )
 
 
+def runtime_tool_catalog() -> ToolCatalog:
+    return ToolCatalog.create(
+        (
+            PROTOTYPE_ECHO_SPEC,
+            AGENT_DELEGATE_SPEC,
+            EXEC_RUN_SPEC,
+            EXTENSION_CALL_SPEC,
+            SKILL_RUN_SPEC,
+            FILE_EDIT_SPEC,
+            FILE_GLOB_SPEC,
+            FILE_GREP_SPEC,
+            FILE_READ_TEXT_SPEC,
+            FILE_STAT_SPEC,
+            FILE_WRITE_SPEC,
+        )
+    )
+
+
+def runtime_tool_policy() -> ToolPolicy:
+    return ToolPolicy(
+        revision="runtime-execution-policy-v1",
+        allowed_tool_ids=(
+            "agent/delegate", "builtin/echo", "exec/run", "extension/call", "file/edit", "file/glob", "file/grep",
+            "file/read_text", "file/stat", "file/write", "skill/run"
+        ),
+        allowed_risks=("execution", "mutation", "read_only"),
+    )
+
+
+def runtime_effective_toolset() -> EffectiveToolSet:
+    return EffectiveToolSet.resolve(runtime_tool_catalog(), runtime_tool_policy())
+
+
+def runtime_tool_specs() -> tuple[ToolSpec, ...]:
+    return runtime_effective_toolset().specs
+
+
 def prototype_tool_specs() -> tuple[ToolSpec, ...]:
     return prototype_effective_toolset().specs
 
@@ -508,6 +1073,22 @@ def prototype_tool_specs_for_ids(tool_ids: object) -> tuple[ToolSpec, ...]:
     ):
         raise ValueError("invalid effective Tool identities")
     catalog = prototype_tool_catalog().by_id()
+    if any(item not in catalog for item in tool_ids):
+        raise ValueError("unknown effective Tool identity")
+    return tuple(catalog[item] for item in tool_ids)
+
+
+def runtime_tool_specs_for_ids(tool_ids: object) -> tuple[ToolSpec, ...]:
+    """Resolve an untrusted Worker command against the runtime catalog."""
+
+    if (
+        not isinstance(tool_ids, list)
+        or len(tool_ids) > 32
+        or any(not isinstance(item, str) for item in tool_ids)
+        or tool_ids != sorted(set(tool_ids))
+    ):
+        raise ValueError("invalid effective Tool identities")
+    catalog = runtime_tool_catalog().by_id()
     if any(item not in catalog for item in tool_ids):
         raise ValueError("unknown effective Tool identity")
     return tuple(catalog[item] for item in tool_ids)
@@ -532,8 +1113,10 @@ def toolset_digest(specs: tuple[ToolSpec, ...]) -> str:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, brokered_handler: BrokeredToolHandler | None = None) -> None:
         self._tools: dict[str, tuple[ToolSpec, ToolHandler]] = {}
+        self._brokered: dict[str, ToolSpec] = {}
+        self._brokered_handler = brokered_handler
 
     def register(self, spec: ToolSpec, handler: ToolHandler) -> None:
         if spec.tool_id in self._tools:
@@ -545,22 +1128,52 @@ class ToolRegistry:
             raise ValueError(f"duplicate provider tool: {spec.provider_name}")
         self._tools[spec.tool_id] = (spec, handler)
 
+    def register_brokered(self, spec: ToolSpec) -> None:
+        if spec.tool_id in self._tools or spec.tool_id in self._brokered:
+            raise ValueError(f"duplicate tool: {spec.tool_id}")
+        if any(
+            existing.provider_name == spec.provider_name
+            for existing, _ in self._tools.values()
+        ) or any(
+            existing.provider_name == spec.provider_name
+            for existing in self._brokered.values()
+        ):
+            raise ValueError(f"duplicate provider tool: {spec.provider_name}")
+        if self._brokered_handler is None:
+            raise ValueError("brokered Tool handler is unavailable")
+        self._brokered[spec.tool_id] = spec
+
     def spec(self, tool_id: str) -> ToolSpec:
+        if tool_id in self._brokered:
+            return self._brokered[tool_id]
         try:
             return self._tools[tool_id][0]
         except KeyError as exc:
             raise ValueError(f"unknown tool: {tool_id}") from exc
 
     def specs(self) -> tuple[ToolSpec, ...]:
-        return tuple(spec for spec, _handler in self._tools.values())
+        return tuple(spec for spec, _handler in self._tools.values()) + tuple(
+            self._brokered.values()
+        )
 
-    def execute(self, tool_id: str, arguments: dict[str, Any]) -> ToolResult:
+    def execute(
+        self,
+        tool_id: str,
+        arguments: dict[str, Any],
+        *,
+        call_id: str | None = None,
+    ) -> ToolResult:
         spec = self.spec(tool_id)
         try:
             validated = spec.validate_arguments(arguments)
         except ValueError as exc:
             return ToolResult("failed", str(exc))
-        result = self._tools[tool_id][1](validated)
+        if tool_id in self._brokered:
+            if call_id is None or self._brokered_handler is None:
+                return ToolResult("failed", "Brokered Tool context is unavailable")
+            result = self._brokered_handler(tool_id, validated, call_id)
+        else:
+            result = self._tools[tool_id][1](validated)
         try:
             content = spec.validate_result(result.content)
         except ValueError as exc:
@@ -608,15 +1221,47 @@ def prototype_tools(
     return registry
 
 
+def runtime_tools(
+    effective_specs: tuple[ToolSpec, ...],
+    brokered_handler: BrokeredToolHandler,
+) -> ToolRegistry:
+    registry = ToolRegistry(brokered_handler)
+    catalog = runtime_tool_catalog().by_id()
+    if any(catalog.get(spec.tool_id) != spec for spec in effective_specs):
+        raise ValueError("effective Tool specification is outside the runtime catalog")
+    for spec in effective_specs:
+        if spec.tool_id == PROTOTYPE_ECHO_SPEC.tool_id:
+            registry.register(
+                spec,
+                lambda arguments: ToolResult("succeeded", arguments["text"]),
+            )
+        else:
+            registry.register_brokered(spec)
+    return registry
+
+
 __all__ = [
     "PROTOTYPE_ECHO_SPEC",
     "PROTOTYPE_ECHO_SPEC_V1",
+    "PROTOTYPE_ECHO_SPEC_V2",
+    "FILE_READ_TEXT_SPEC",
+    "FILE_STAT_SPEC",
+    "FILE_GLOB_SPEC",
+    "FILE_GREP_SPEC",
+    "FILE_EDIT_SPEC",
+    "FILE_WRITE_SPEC",
+    "EXEC_RUN_SPEC",
+    "EXEC_RUN_SPEC_V1",
+    "EXTENSION_CALL_SPEC",
+    "SKILL_RUN_SPEC",
+    "MAX_PROVIDER_TOOL_RESULT_HISTORY_BYTES",
     "EffectiveToolSet",
     "ToolCatalog",
     "ToolInputField",
     "ToolPolicy",
     "ToolRegistry",
     "ToolResult",
+    "ToolResultProjection",
     "ToolSpec",
     "ToolUseContext",
     "prototype_tool_specs",
@@ -625,5 +1270,13 @@ __all__ = [
     "prototype_tool_policy",
     "prototype_effective_toolset",
     "prototype_tools",
+    "runtime_effective_toolset",
+    "runtime_tool_catalog",
+    "runtime_tool_policy",
+    "runtime_tool_specs",
+    "runtime_tool_specs_for_ids",
+    "runtime_tools",
+    "project_tool_result",
     "toolset_digest",
+    "validate_tool_result_projection",
 ]

@@ -18,6 +18,7 @@ from agent_builder_v2.replay import (
 )
 from agent_builder_v2.tools import (
     PROTOTYPE_ECHO_SPEC_V1,
+    PROTOTYPE_ECHO_SPEC_V2,
     prototype_tool_specs,
     toolset_digest,
 )
@@ -212,11 +213,14 @@ def test_strict_decoder_round_trips_a_canonical_event() -> None:
     assert _decode(event) == event
 
 
-def test_retained_v1_tool_manifest_digest_remains_replayable() -> None:
+@pytest.mark.parametrize(
+    "legacy_spec", (PROTOTYPE_ECHO_SPEC_V1, PROTOTYPE_ECHO_SPEC_V2)
+)
+def test_retained_tool_manifest_digest_remains_replayable(legacy_spec: object) -> None:
     payload = _started_payload()
     context = payload["context_plan"]
     assert isinstance(context, dict)
-    context["toolset_digest"] = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
+    context["toolset_digest"] = toolset_digest((legacy_spec,))  # type: ignore[arg-type]
     snapshot, gaps = project_durable_run(
         (_event(1, "run.started", payload), _event(2, "run.failed", _failed()))
     )

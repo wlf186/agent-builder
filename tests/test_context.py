@@ -17,6 +17,7 @@ from agent_builder_v2.context import (
     ContextPlan,
     ContextPlanError,
     ContextPlanReference,
+    CONTEXT_RENDERER_VERSION,
     ModelProfile,
     PROMPT_SECTION_REGISTRY_VERSION,
     PROVIDER_TEMPLATE_TOKEN_RESERVE,
@@ -238,7 +239,7 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     assert payload["provider_message_count"] == len(plan.provider_messages())
     assert "provider_messages" not in payload
     assert payload["renderer"] == {
-        "version": "ordered-sections-v3",
+        "version": CONTEXT_RENDERER_VERSION,
         "section_registry_version": PROMPT_SECTION_REGISTRY_VERSION,
         "leading_system_sections_merged": True,
         "leading_system_section_count": 2,
@@ -280,7 +281,7 @@ def test_operator_inspection_is_ordered_defensive_and_withholds_content() -> Non
     sections[0]["id"] = "changed"
     fresh = inspection.to_dict()
     assert fresh["context_plan"]["plan_id"] == plan.reference.plan_id
-    assert fresh["renderer"]["version"] == "ordered-sections-v3"
+    assert fresh["renderer"]["version"] == CONTEXT_RENDERER_VERSION
     assert fresh["sections"][0]["id"] == "platform.contract"
     same_key = plan.operator_inspection(inspection_key)
     different_key = plan.operator_inspection(b"z" * 32)
@@ -383,6 +384,24 @@ def test_invalid_capacity_reference_and_over_budget_context_fail_closed() -> Non
         )
     assert "x" * 128 not in str(raised.value)
 
+    recent_pair_too_large = tuple(
+        ConversationMessage(
+            f"{index + 20:032x}",
+            "user" if index % 2 == 0 else "assistant",
+            f"history-{index}-" + "z" * 2_000,
+        )
+        for index in range(4)
+    )
+    with pytest.raises(ContextPlanError, match="model input budget"):
+        ContextCompiler().compile(
+            "current",
+            history=recent_pair_too_large,
+            model_profile=_profile(native=4_096, operational=4_096, output=256),
+            tools=(),
+            agent_id=PROTOTYPE_AGENT_ID,
+            capsule_generation=1,
+        )
+
 
 def test_context_plan_rejects_stale_digest_after_in_memory_tampering() -> None:
     plan = _plan("trusted message")
@@ -464,7 +483,8 @@ def test_dynamic_context_window_drops_only_oldest_complete_turn_pairs() -> None:
         capsule_generation=1,
     )
 
-    assert plan.windowing_strategy == "completed-turn-tail-v1"
+    assert plan.windowing_strategy == "completed-turn-collapse-v2"
+    assert plan.collapse_projection is not None
     assert 0 < plan.included_history_message_count < len(history)
     assert plan.included_history_message_count % 2 == 0
     assert plan.estimated_input_tokens <= plan.policy.compact_target_tokens
@@ -477,6 +497,15 @@ def test_dynamic_context_window_drops_only_oldest_complete_turn_pairs() -> None:
     ]
     assert history[-1].content in included_contents
     assert history[0].content not in included_contents
+    assert plan.collapse_projection.collapsed_message_ids == tuple(
+        message.message_id
+        for message in history[: -plan.included_history_message_count]
+    )
+    assert plan.collapse_projection.preserved_message_ids == tuple(
+        message.message_id
+        for message in history[-plan.included_history_message_count :]
+    )
+    assert plan.collapse_projection.projection_digest in plan.provider_messages()[0]["content"]
 
 
 def test_section_count_also_forces_a_bounded_complete_pair_tail_window() -> None:
@@ -497,8 +526,41 @@ def test_section_count_also_forces_a_bounded_complete_pair_tail_window() -> None
         capsule_generation=1,
     )
 
-    assert plan.windowing_strategy == "completed-turn-tail-v1"
+    assert plan.windowing_strategy == "completed-turn-collapse-v2"
+    assert plan.collapse_projection is not None
     assert plan.included_history_message_count <= 124
     assert plan.included_history_message_count % 2 == 0
     assert len(plan.sections) <= 128
     assert plan.provider_messages()[-2]["content"] == history[-1].content
+
+
+def test_reactive_projection_collapses_to_only_the_newest_complete_pair() -> None:
+    history = tuple(
+        ConversationMessage(
+            f"{index + 1:032x}",
+            "user" if index % 2 == 0 else "assistant",
+            f"turn-{index}",
+        )
+        for index in range(8)
+    )
+    plan = ContextCompiler().compile(
+        "current",
+        history=history,
+        model_profile=_profile(),
+        tools=(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+        force_compact=True,
+        collapse_to_recent=True,
+    )
+
+    assert plan.windowing_strategy == "completed-turn-collapse-v2"
+    assert plan.included_history_message_count == 2
+    assert plan.collapse_projection is not None
+    assert plan.collapse_projection.preserved_message_ids == (
+        history[-2].message_id,
+        history[-1].message_id,
+    )
+    assert plan.collapse_projection.collapsed_message_ids == tuple(
+        item.message_id for item in history[:-2]
+    )

@@ -4,6 +4,7 @@
 .runtime/
 data/*
 !data/.gitkeep
+backups/
 
 # Private historical and third-party research material
 _legacy-reference/

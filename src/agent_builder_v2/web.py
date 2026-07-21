@@ -1,8 +1,10 @@
-"""Authenticated all-interface Web Gateway for the greenfield prototype."""
+"""Authenticated all-interface Web Gateway for Agent Builder."""
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hmac
 import ipaddress
 import json
@@ -35,6 +37,7 @@ from .commands import RUN_ID, CommandBus
 from .contracts import StartRunCommand
 from .control import RunService
 from .context_audit import ContextRevealPolicy
+from .model_catalog import ModelCatalogError
 from .query_engine import (
     QueryContextUnavailableError,
     QueryEngineOwnershipError,
@@ -50,7 +53,11 @@ from .sessions import (
     ConversationNotFoundError,
     ConversationStoreUnavailableError,
     ConversationSummary,
+    PermissionRecord,
+    TurnNotFoundError,
 )
+from .skills import SkillError
+from .tasks import TaskError
 from .workspace_context import WorkspaceContextError
 
 
@@ -142,6 +149,32 @@ class LoginLimiter:
 
 def _repository_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def _permission_response(record: PermissionRecord) -> dict[str, object]:
+    """Return only the operator-safe, bounded permission projection."""
+
+    return {
+        "permission_id": record.permission_id,
+        "agent_id": record.agent_id,
+        "capsule_generation": record.capsule_generation,
+        "conversation_id": record.conversation_id,
+        "turn_id": record.turn_id,
+        "run_id": record.run_id,
+        "call_id": record.call_id,
+        "capability_id": record.capability_id,
+        "toolset_digest": record.toolset_digest,
+        "policy_digest": record.policy_digest,
+        "arguments_digest": record.arguments_digest,
+        "preview": record.preview,
+        "preview_digest": record.preview_digest,
+        "policy_decision": record.policy_decision,
+        "status": record.status,
+        "expires_at_milliseconds": record.expires_at_milliseconds,
+        "created_at": record.created_at,
+        "resolved_at": record.resolved_at,
+        "resolution_source": record.resolution_source,
+    }
 
 
 def _source_root() -> Path:
@@ -597,7 +630,7 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         app.state.run_service = run_service
         app.state.query_engines = query_engines
         app.state.context_reveal = context_reveal
-        app.state.commands = CommandBus(query_engines)
+        app.state.commands = prototype_runtime.commands
         app.state.login_limiter = LoginLimiter()
         app.state.cookie_secure = cookie_secure
         try:
@@ -674,6 +707,9 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         )
         return {
             "status": "ok",
+            "release": "0.2.0",
+            # Compatibility marker for the pinned default Agent, not the
+            # support status of the whole release.
             "prototype": True,
             "agent_ready": ready,
             "model": (
@@ -769,6 +805,37 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         records = await asyncio.to_thread(registry.list)
         return {"agents": [record.to_dict() for record in records]}
 
+    @app.get("/api/models")
+    async def list_models(request: Request) -> dict[str, object]:
+        _require_session(request)
+        if request.query_params:
+            raise HTTPException(400, "unsupported model query parameter")
+        manager: AgentRuntimeManager = request.app.state.runtime_manager
+        catalog = manager.model_broker.catalog
+        qualifications = {
+            item.catalog_model_id: item
+            for item in manager.model_broker.qualifications
+        }
+        value = catalog.public_metadata()
+        models: list[dict[str, object]] = []
+        for item in value["models"]:  # type: ignore[index]
+            assert isinstance(item, dict)
+            qualification = qualifications.get(str(item["model_id"]))
+            if qualification is None:
+                continue
+            profile = qualification.model_profile
+            models.append(
+                {
+                    **item,
+                    "native_context_tokens": profile.native_context_tokens,
+                    "operational_context_tokens": profile.operational_context_tokens,
+                    "max_output_tokens": profile.max_output_tokens,
+                    "estimator_id": profile.estimator_id,
+                    "profile_digest": profile.profile_digest,
+                }
+            )
+        return {**value, "models": models}
+
     @app.post("/api/agents", status_code=201)
     async def create_agent(request: Request) -> dict[str, object]:
         _require_csrf(request)
@@ -845,6 +912,50 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             await manager.end_drain(agent_id)
         return Response(status_code=204)
 
+    @app.get("/api/agents/{agent_id}/permissions")
+    async def list_agent_permissions(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if request.query_params:
+            raise HTTPException(400, "unsupported permission query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            records = await runtime.run_service.list_permission_requests(
+                pending_only=True
+            )
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "permission state is unavailable") from exc
+        return {
+            "permissions": [_permission_response(record) for record in records]
+        }
+
+    @app.post("/api/agents/{agent_id}/permissions/{permission_id}")
+    async def resolve_agent_permission(
+        agent_id: str, permission_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(permission_id):
+            raise HTTPException(404, "permission not found")
+        body = await _read_json_object(request)
+        if set(body) != {"decision"} or body.get("decision") not in {
+            "approve",
+            "deny",
+        }:
+            raise HTTPException(400, "invalid permission decision")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            record = await runtime.run_service.resolve_permission_request(
+                permission_id, body["decision"]
+            )
+        except (TurnNotFoundError, KeyError) as exc:
+            raise HTTPException(404, "permission not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "permission is no longer pending") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "permission state is unavailable") from exc
+        return _permission_response(record)
+
     @app.get("/api/agents/{agent_id}/sessions")
     async def list_agent_conversations(
         agent_id: str, request: Request
@@ -856,6 +967,95 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         except ConversationStoreUnavailableError as exc:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return {"sessions": [_summary_response(item) for item in conversations]}
+
+    @app.get("/api/commands")
+    async def list_slash_commands(request: Request) -> dict[str, object]:
+        _require_session(request)
+        return request.app.state.commands.registry.public_metadata()
+
+    @app.get("/api/extensions")
+    async def list_extensions(request: Request) -> dict[str, object]:
+        _require_session(request)
+        executor = request.app.state.run_service.extension_executor
+        if executor is None:
+            raise HTTPException(503, "extension catalog is unavailable")
+        return {"extensions": list(executor.catalog.public_metadata())}
+
+    @app.get("/api/agents/{agent_id}/commands")
+    async def list_agent_slash_commands(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        runtime = await _runtime_for_agent(request, agent_id)
+        return runtime.commands.registry.public_metadata()
+
+    @app.get("/api/agents/{agent_id}/extensions")
+    async def list_agent_extensions(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        runtime = await _runtime_for_agent(request, agent_id)
+        executor = runtime.run_service.extension_executor
+        if executor is None:
+            raise HTTPException(503, "extension catalog is unavailable")
+        return {
+            "agent_id": agent_id,
+            "extensions": list(executor.catalog.public_metadata()),
+        }
+
+    @app.get("/api/agents/{agent_id}/skills")
+    async def list_agent_skills(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if request.query_params:
+            raise HTTPException(400, "unsupported Skill query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        skills = await runtime.run_service.list_skills()
+        return {
+            "agent_id": agent_id,
+            "skills": [item.public_metadata() for item in skills],
+        }
+
+    @app.post("/api/agents/{agent_id}/skills", status_code=201)
+    async def install_agent_skill(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if (
+            set(body) != {"archive_base64", "sha256"}
+            or not isinstance(body.get("archive_base64"), str)
+            or not isinstance(body.get("sha256"), str)
+            or len(body["sha256"]) != 64
+        ):
+            raise HTTPException(400, "invalid Skill install request")
+        try:
+            raw = base64.b64decode(body["archive_base64"], validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise HTTPException(400, "invalid Skill archive encoding") from exc
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            record = await runtime.run_service.install_skill(raw, body["sha256"])
+        except SkillError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return record.public_metadata()
+
+    @app.delete("/api/agents/{agent_id}/skills/{skill_id}", status_code=204)
+    async def delete_agent_skill(
+        agent_id: str, skill_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if SAFE_ID.fullmatch(skill_id) is None:
+            raise HTTPException(404, "Skill not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            await runtime.run_service.delete_skill(skill_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Skill not found") from exc
+        except SkillError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return Response(status_code=204)
 
     @app.post("/api/agents/{agent_id}/sessions", status_code=201)
     async def create_agent_conversation(
@@ -879,6 +1079,29 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return _summary_response(conversation)
 
+    @app.post("/api/agents/{agent_id}/sessions/{conversation_id}/commands")
+    async def execute_agent_slash_command(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) != {"command"} or not isinstance(body.get("command"), str):
+            raise HTTPException(400, "command must be a string")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            result = await runtime.commands.execute_slash(
+                conversation_id, body["command"]
+            )
+        except (ConversationNotFoundError, QueryEngineOwnershipError) as exc:
+            raise HTTPException(404, "conversation or Run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "command conflicts with active state") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, "command service is unavailable") from exc
+        return result.to_dict()
+
     @app.get("/api/agents/{agent_id}/sessions/{conversation_id}")
     async def get_agent_conversation(
         agent_id: str, conversation_id: str, request: Request
@@ -896,6 +1119,38 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         except ConversationStoreUnavailableError as exc:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return _conversation_response(conversation)
+
+    @app.get(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/subagents"
+    )
+    async def list_agent_conversation_subagents(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id) or request.query_params:
+            raise HTTPException(404, "conversation not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            # Resolve ownership before consulting the parent-local link store.
+            await runtime.query_engines.get_conversation(conversation_id)
+            records = await runtime.run_service.list_subagent_links(
+                conversation_id
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, "subagent state is unavailable") from exc
+        return {
+            "agent_id": agent_id,
+            "conversation_id": conversation_id,
+            "delegations": [
+                {
+                    **link.public_metadata(),
+                    "mailbox": [item.public_metadata() for item in mailbox],
+                }
+                for link, mailbox in records
+            ],
+        }
 
     @app.delete(
         "/api/agents/{agent_id}/sessions/{conversation_id}", status_code=204
@@ -933,6 +1188,24 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if set(body) != {"message"} or not isinstance(body.get("message"), str):
             raise HTTPException(400, "message is required")
         runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            slash = runtime.commands.registry.parse(body["message"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if slash is not None:
+            try:
+                command_result = await runtime.commands.execute_slash(
+                    conversation_id, body["message"]
+                )
+            except (ConversationNotFoundError, QueryEngineOwnershipError) as exc:
+                raise HTTPException(404, "conversation or Run not found") from exc
+            except ConversationConflictError as exc:
+                raise HTTPException(409, "command conflicts with active state") from exc
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(503, "command service is unavailable") from exc
+            return JSONResponse(command_result.to_dict(), status_code=200)
         try:
             record = await runtime.commands.start(
                 StartRunCommand(
@@ -992,6 +1265,76 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
         )
 
+    @app.get("/api/agents/{agent_id}/runs/{run_id}/replay")
+    async def replay_agent_run(
+        agent_id: str, run_id: str, request: Request
+    ) -> dict[str, object]:
+        """Return a bounded durable replay page from one explicit Agent."""
+
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if set(request.query_params.keys()) - {"after", "limit"}:
+            raise HTTPException(400, "unsupported replay query parameter")
+        after = _replay_query_integer(
+            request, "after", default=0, minimum=0, maximum=MAX_REPLAY_SEQUENCE
+        )
+        limit = _replay_query_integer(
+            request, "limit", default=MAX_REPLAY_PAGE,
+            minimum=1, maximum=MAX_REPLAY_PAGE,
+        )
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            value = await runtime.query_engines.replay(
+                run_id, after=after, limit=limit
+            )
+        except QueryEngineOwnershipError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "run replay is unavailable") from exc
+        except QueryReplayCursorError as exc:
+            raise HTTPException(
+                416, "replay cursor is outside the durable Run"
+            ) from exc
+        except (
+            ConversationStoreUnavailableError,
+            QueryReplayUnavailableError,
+        ) as exc:
+            raise HTTPException(503, "durable replay is unavailable") from exc
+        return _replay_response(value)
+
+    @app.get("/api/agents/{agent_id}/runs/{run_id}/capability-audit")
+    async def agent_run_capability_audit(
+        agent_id: str, run_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        if set(request.query_params.keys()) - {"after", "limit"}:
+            raise HTTPException(400, "unsupported capability audit query parameter")
+        after = _replay_query_integer(
+            request, "after", default=0, minimum=0, maximum=1_000_000_000
+        )
+        limit = _replay_query_integer(
+            request, "limit", default=128, minimum=1, maximum=128
+        )
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            events = await runtime.run_service.capability_audit_events(
+                run_id, after_seq=after, limit=limit
+            )
+        except (TurnNotFoundError, KeyError) as exc:
+            raise HTTPException(404, "run not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "capability audit is unavailable") from exc
+        return {
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "events": [event.to_dict() for event in events],
+            "next_cursor": events[-1].audit_seq if events else after,
+            "has_more": len(events) == limit,
+        }
+
     @app.post(
         "/api/agents/{agent_id}/runs/{run_id}/cancel", status_code=202
     )
@@ -1007,6 +1350,109 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         except (KeyError, QueryEngineOwnershipError) as exc:
             raise HTTPException(404, "run not found") from exc
         return {"accepted": True}
+
+    @app.post(
+        "/api/agents/{agent_id}/runs/{run_id}/tasks", status_code=202
+    )
+    async def submit_agent_background_task(
+        agent_id: str, run_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(404, "run not found")
+        body = await _read_json_object(request)
+        if not (
+            body == {"command_id": "runtime-compile"}
+            or (
+                set(body) == {"command_id", "script"}
+                and body.get("command_id") == "bounded-bash"
+                and isinstance(body.get("script"), str)
+            )
+        ):
+            raise HTTPException(400, "invalid background Task command")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            task = await runtime.run_service.submit_background_task(run_id, body)
+        except KeyError as exc:
+            raise HTTPException(404, "run not found") from exc
+        except (TaskError, ValueError) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, "background Task service is unavailable") from exc
+        return task.public_metadata()
+
+    @app.get("/api/agents/{agent_id}/tasks")
+    async def list_agent_background_tasks(
+        agent_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if request.query_params:
+            raise HTTPException(400, "unsupported Task query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            tasks = await runtime.run_service.list_background_tasks()
+        except RuntimeError as exc:
+            raise HTTPException(503, "background Task service is unavailable") from exc
+        return {"agent_id": agent_id, "tasks": [task.public_metadata() for task in tasks]}
+
+    @app.get("/api/agents/{agent_id}/tasks/{task_id}")
+    async def get_agent_background_task(
+        agent_id: str, task_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(task_id) or request.query_params:
+            raise HTTPException(404, "Task not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            task = await runtime.run_service.get_background_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+        return task.public_metadata()
+
+    @app.get("/api/agents/{agent_id}/tasks/{task_id}/notifications")
+    async def get_agent_background_task_notifications(
+        agent_id: str, task_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_session(request)
+        if not RUN_ID.fullmatch(task_id) or request.query_params:
+            raise HTTPException(404, "Task not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            notifications = (
+                await runtime.run_service.background_task_notifications(task_id)
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+        return {
+            "agent_id": agent_id,
+            "task_id": task_id,
+            "notifications": [
+                {
+                    "sequence": item.sequence,
+                    "kind": item.kind,
+                    "payload": item.payload,
+                    "payload_digest": item.payload_digest,
+                    "created_at": item.created_at,
+                }
+                for item in notifications
+            ],
+        }
+
+    @app.post(
+        "/api/agents/{agent_id}/tasks/{task_id}/cancel", status_code=202
+    )
+    async def cancel_agent_background_task(
+        agent_id: str, task_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(task_id):
+            raise HTTPException(404, "Task not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            task = await runtime.run_service.cancel_background_task(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Task not found") from exc
+        return task.public_metadata()
 
     @app.get("/api/agents/{agent_id}/runs/{run_id}/context")
     async def inspect_agent_run_context(
@@ -1121,6 +1567,28 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return _summary_response(conversation)
 
+    @app.post("/api/sessions/{conversation_id}/commands")
+    async def execute_slash_command(
+        conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        body = await _read_json_object(request)
+        if set(body) != {"command"} or not isinstance(body.get("command"), str):
+            raise HTTPException(400, "command must be a string")
+        try:
+            result = await request.app.state.commands.execute_slash(
+                conversation_id, body["command"]
+            )
+        except (ConversationNotFoundError, QueryEngineOwnershipError) as exc:
+            raise HTTPException(404, "conversation or Run not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "command conflicts with active state") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(503, "command service is unavailable") from exc
+        return result.to_dict()
+
     @app.get("/api/sessions/{conversation_id}")
     async def get_conversation(
         conversation_id: str, request: Request
@@ -1165,17 +1633,49 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
         body = await _read_json_object(request)
-        if set(body) != {"message"}:
+        if "message" not in body or set(body) - {"message", "model_id", "compact"}:
             raise HTTPException(400, "message is required")
         message = body.get("message")
         if not isinstance(message, str):
             raise HTTPException(400, "message must be a string")
+        try:
+            slash = request.app.state.commands.registry.parse(message)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if slash is not None:
+            if set(body) != {"message"}:
+                raise HTTPException(400, "slash commands do not accept Run options")
+            try:
+                command_result = await request.app.state.commands.execute_slash(
+                    conversation_id, message
+                )
+            except (ConversationNotFoundError, QueryEngineOwnershipError) as exc:
+                raise HTTPException(404, "conversation or Run not found") from exc
+            except ConversationConflictError as exc:
+                raise HTTPException(409, "command conflicts with active state") from exc
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            except RuntimeError as exc:
+                raise HTTPException(503, "command service is unavailable") from exc
+            return JSONResponse(command_result.to_dict(), status_code=200)
+        model_id = body.get("model_id")
+        if model_id is not None and not isinstance(model_id, str):
+            raise HTTPException(400, "model_id must be a string")
+        try:
+            request.app.state.runtime_manager.model_broker.catalog.select(model_id)
+        except ModelCatalogError as exc:
+            raise HTTPException(400, "model is not available") from exc
+        compact = body.get("compact", False)
+        if not isinstance(compact, bool):
+            raise HTTPException(400, "compact must be a boolean")
         try:
             record = await request.app.state.commands.start(
                 StartRunCommand(
                     agent_id=PROTOTYPE_AGENT_ID,
                     message=message,
                     conversation_id=conversation_id,
+                    model_id=model_id,
+                    compact=compact,
                 )
             )
         except ConversationNotFoundError as exc:
@@ -1198,12 +1698,37 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
     async def start_run(request: Request) -> dict[str, str]:
         _require_csrf(request)
         body = await _read_json_object(request)
+        if "message" not in body or set(body) - {"message", "model_id", "compact"}:
+            raise HTTPException(400, "message is required")
         message = body.get("message")
         if not isinstance(message, str):
             raise HTTPException(400, "message must be a string")
         try:
+            slash = request.app.state.commands.registry.parse(message)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if slash is not None:
+            raise HTTPException(
+                400, "slash commands require an existing Conversation"
+            )
+        model_id = body.get("model_id")
+        if model_id is not None and not isinstance(model_id, str):
+            raise HTTPException(400, "model_id must be a string")
+        try:
+            request.app.state.runtime_manager.model_broker.catalog.select(model_id)
+        except ModelCatalogError as exc:
+            raise HTTPException(400, "model is not available") from exc
+        compact = body.get("compact", False)
+        if not isinstance(compact, bool):
+            raise HTTPException(400, "compact must be a boolean")
+        try:
             record = await request.app.state.commands.start(
-                StartRunCommand(agent_id=PROTOTYPE_AGENT_ID, message=message)
+                StartRunCommand(
+                    agent_id=PROTOTYPE_AGENT_ID,
+                    message=message,
+                    model_id=model_id,
+                    compact=compact,
+                )
             )
         except WorkspaceContextError as exc:
             raise HTTPException(409, "Agent workspace context is unsafe") from exc

@@ -31,9 +31,21 @@ from .contracts import (
     EventEnvelope,
 )
 from .tools import (
+    FILE_GLOB_SPEC,
+    FILE_GREP_SPEC,
+    FILE_EDIT_SPEC,
+    FILE_READ_TEXT_SPEC,
+    FILE_STAT_SPEC,
+    FILE_WRITE_SPEC,
+    EXEC_RUN_SPEC_V1,
+    EXEC_RUN_SPEC,
+    EXTENSION_CALL_SPEC,
+    SKILL_RUN_SPEC,
+    PROTOTYPE_ECHO_SPEC,
     PROTOTYPE_ECHO_SPEC_V1,
+    PROTOTYPE_ECHO_SPEC_V2,
     ToolSpec,
-    prototype_tool_specs,
+    runtime_tool_specs,
     toolset_digest,
 )
 
@@ -56,6 +68,7 @@ PROJECTION_VERSION = "run-ui-v2"
 LEGACY_PROJECTION_VERSION = "run-ui-v1"
 MODEL_BOUNDARY_FEATURE = "model-call-boundaries-v1"
 MULTI_TOOL_LOOP_FEATURE = "sequential-multi-tool-v1"
+OVERFLOW_RECOVERY_FEATURE = "one-shot-overflow-recovery-v1"
 SANDBOX_POLICY = "harness-v2-worker-v1"
 
 _RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -68,16 +81,111 @@ _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _PLAN_ID = re.compile(r"^context-[a-f0-9]{24}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 _TOOL_SPECS: dict[str, ToolSpec] = {
-    spec.tool_id: spec for spec in prototype_tool_specs()
+    spec.tool_id: spec for spec in runtime_tool_specs()
 }
-_VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in prototype_tool_specs())
-_TOOLSET_DIGEST = toolset_digest(prototype_tool_specs())
+_VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in runtime_tool_specs())
+_TOOLSET_DIGEST = toolset_digest(runtime_tool_specs())
 _LEGACY_TOOLSET_DIGEST = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
+_LEGACY_TOOLSET_DIGEST_V2 = toolset_digest((PROTOTYPE_ECHO_SPEC_V2,))
+_LEGACY_TOOLSET_DIGEST_V3 = toolset_digest((PROTOTYPE_ECHO_SPEC,))
+_LEGACY_RUNTIME_READ_TOOLSET_DIGEST = toolset_digest(
+    (PROTOTYPE_ECHO_SPEC, FILE_READ_TEXT_SPEC, FILE_STAT_SPEC)
+)
+_LEGACY_RUNTIME_SEARCH_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+    )
+)
+_LEGACY_RUNTIME_MUTATION_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        FILE_EDIT_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+        FILE_WRITE_SPEC,
+    )
+)
+_LEGACY_RUNTIME_EXEC_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        EXEC_RUN_SPEC_V1,
+        FILE_EDIT_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+        FILE_WRITE_SPEC,
+    )
+)
+_LEGACY_RUNTIME_BASH_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        EXEC_RUN_SPEC,
+        FILE_EDIT_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+        FILE_WRITE_SPEC,
+    )
+)
+_LEGACY_RUNTIME_EXTENSION_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        EXEC_RUN_SPEC,
+        EXTENSION_CALL_SPEC,
+        FILE_EDIT_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+        FILE_WRITE_SPEC,
+    )
+)
+_RUNTIME_SKILL_TOOLSET_DIGEST = toolset_digest(
+    (
+        PROTOTYPE_ECHO_SPEC,
+        EXEC_RUN_SPEC,
+        FILE_EDIT_SPEC,
+        FILE_GLOB_SPEC,
+        FILE_GREP_SPEC,
+        FILE_READ_TEXT_SPEC,
+        FILE_STAT_SPEC,
+        FILE_WRITE_SPEC,
+        SKILL_RUN_SPEC,
+    )
+)
+_RUNTIME_SUBAGENT_TOOL_IDS = (
+    "agent/delegate", "builtin/echo", "exec/run", "file/edit", "file/glob",
+    "file/grep", "file/read_text", "file/stat", "file/write",
+)
+_RUNTIME_SUBAGENT_TOOLSET_DIGEST = toolset_digest(
+    tuple(_TOOL_SPECS[item] for item in _RUNTIME_SUBAGENT_TOOL_IDS)
+)
+_RUNTIME_SUBAGENT_SKILL_TOOL_IDS = (*_RUNTIME_SUBAGENT_TOOL_IDS, "skill/run")
+_RUNTIME_SUBAGENT_SKILL_TOOLSET_DIGEST = toolset_digest(
+    tuple(_TOOL_SPECS[item] for item in _RUNTIME_SUBAGENT_SKILL_TOOL_IDS)
+)
+_RUNTIME_SUBAGENT_EXTENSION_TOOL_IDS = (
+    "agent/delegate", "builtin/echo", "exec/run", "extension/call",
+    "file/edit", "file/glob", "file/grep", "file/read_text", "file/stat",
+    "file/write",
+)
+_RUNTIME_SUBAGENT_EXTENSION_TOOLSET_DIGEST = toolset_digest(
+    tuple(_TOOL_SPECS[item] for item in _RUNTIME_SUBAGENT_EXTENSION_TOOL_IDS)
+)
 _DURABLE_KINDS = frozenset(
     {
         "run.started",
         "model.request.started",
         "model.response.finished",
+        "model.recovery.started",
         "assistant.block.started",
         "assistant.block.finished",
         "assistant.block.discarded",
@@ -519,7 +627,22 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         or _DIGEST.fullmatch(digest) is None
         or plan_id != f"context-{digest[:24]}"
         or value.get("toolset_digest")
-        not in {_TOOLSET_DIGEST, _LEGACY_TOOLSET_DIGEST}
+        not in {
+            _TOOLSET_DIGEST,
+            _LEGACY_TOOLSET_DIGEST,
+            _LEGACY_TOOLSET_DIGEST_V2,
+            _LEGACY_TOOLSET_DIGEST_V3,
+            _LEGACY_RUNTIME_READ_TOOLSET_DIGEST,
+            _LEGACY_RUNTIME_SEARCH_TOOLSET_DIGEST,
+            _LEGACY_RUNTIME_MUTATION_TOOLSET_DIGEST,
+            _LEGACY_RUNTIME_EXEC_TOOLSET_DIGEST,
+            _LEGACY_RUNTIME_BASH_TOOLSET_DIGEST,
+            _LEGACY_RUNTIME_EXTENSION_TOOLSET_DIGEST,
+                _RUNTIME_SKILL_TOOLSET_DIGEST,
+                _RUNTIME_SUBAGENT_TOOLSET_DIGEST,
+                _RUNTIME_SUBAGENT_SKILL_TOOLSET_DIGEST,
+                _RUNTIME_SUBAGENT_EXTENSION_TOOLSET_DIGEST,
+        }
         or not isinstance(history_digest, str)
         or _DIGEST.fullmatch(history_digest) is None
     ):
@@ -555,16 +678,22 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         or included_count % 2
         or included_count > history_count
         or omitted_count != history_count - included_count
-        or strategy not in {"full", "completed-turn-tail-v1"}
+        or strategy not in {
+            "full", "completed-turn-tail-v1", "completed-turn-collapse-v2",
+            "semantic-summary-v1",
+        }
         or (strategy == "full" and included_count != history_count)
         or (
-            strategy == "completed-turn-tail-v1"
+            strategy in {
+                "completed-turn-tail-v1", "completed-turn-collapse-v2",
+                "semantic-summary-v1",
+            }
             and included_count >= history_count
         )
             or not (
-                3 + included_count + int(strategy == "completed-turn-tail-v1")
+                3 + included_count + int(strategy != "full")
                 <= section_count
-                <= 6 + included_count + int(strategy == "completed-turn-tail-v1")
+                <= 6 + included_count + int(strategy != "full")
             )
     ):
         raise ReplayCorruptionError("invalid run.started history metadata")
@@ -624,29 +753,91 @@ def _validate_started_payload(payload: object) -> dict[str, object]:
         "context_plan",
     }
     current_expected = {*legacy_expected, "protocol_features"}
+    catalog_expected = {
+        *current_expected,
+        "model_id",
+        "model_profile_digest",
+    }
     if (
         not isinstance(payload, dict)
         or frozenset(payload)
-        not in {frozenset(legacy_expected), frozenset(current_expected)}
+        not in {
+            frozenset(legacy_expected),
+            frozenset(current_expected),
+            frozenset(catalog_expected),
+        }
     ):
         raise ReplayCorruptionError("invalid run.started payload")
     model = payload.get("model")
     visible_tools = payload.get("visible_tools")
+    context_metadata = _validate_context_plan_metadata(payload.get("context_plan"))
+    if context_metadata["toolset_digest"] == _TOOLSET_DIGEST:
+        expected_visible_tools = _VISIBLE_TOOL_IDS
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_READ_TOOLSET_DIGEST:
+        expected_visible_tools = ("builtin/echo", "file/read_text", "file/stat")
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_SEARCH_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "file/glob", "file/grep", "file/read_text", "file/stat"
+        )
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_MUTATION_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "file/edit", "file/glob", "file/grep",
+            "file/read_text", "file/stat", "file/write",
+        )
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_EXEC_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "exec/run", "file/edit", "file/glob", "file/grep",
+            "file/read_text", "file/stat", "file/write",
+        )
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_BASH_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "exec/run", "file/edit", "file/glob", "file/grep",
+            "file/read_text", "file/stat", "file/write",
+        )
+    elif context_metadata["toolset_digest"] == _LEGACY_RUNTIME_EXTENSION_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "exec/run", "extension/call", "file/edit", "file/glob",
+            "file/grep", "file/read_text", "file/stat", "file/write",
+        )
+    elif context_metadata["toolset_digest"] == _RUNTIME_SKILL_TOOLSET_DIGEST:
+        expected_visible_tools = (
+            "builtin/echo", "exec/run", "file/edit", "file/glob", "file/grep",
+            "file/read_text", "file/stat", "file/write", "skill/run",
+        )
+    elif context_metadata["toolset_digest"] == _RUNTIME_SUBAGENT_TOOLSET_DIGEST:
+        expected_visible_tools = _RUNTIME_SUBAGENT_TOOL_IDS
+    elif context_metadata["toolset_digest"] == _RUNTIME_SUBAGENT_SKILL_TOOLSET_DIGEST:
+        expected_visible_tools = _RUNTIME_SUBAGENT_SKILL_TOOL_IDS
+    elif context_metadata["toolset_digest"] == _RUNTIME_SUBAGENT_EXTENSION_TOOLSET_DIGEST:
+        expected_visible_tools = _RUNTIME_SUBAGENT_EXTENSION_TOOL_IDS
+    else:
+        expected_visible_tools = ("builtin/echo",)
     if (
         payload.get("prototype") is not True
         or not isinstance(model, str)
         or _SAFE_NAME.fullmatch(model) is None
         or not isinstance(visible_tools, list)
-        or tuple(visible_tools) != _VISIBLE_TOOL_IDS
+        or tuple(visible_tools) != expected_visible_tools
         or payload.get("sandbox") != SANDBOX_POLICY
     ):
         raise ReplayCorruptionError("invalid run.started payload")
+    if "model_id" in payload and (
+        not isinstance(payload.get("model_id"), str)
+        or _SAFE_NAME.fullmatch(str(payload["model_id"])) is None
+        or not isinstance(payload.get("model_profile_digest"), str)
+        or _DIGEST.fullmatch(str(payload["model_profile_digest"])) is None
+    ):
+        raise ReplayCorruptionError("invalid run.started model snapshot")
     if "protocol_features" in payload and payload.get("protocol_features") not in (
         [MODEL_BOUNDARY_FEATURE],
         [MODEL_BOUNDARY_FEATURE, MULTI_TOOL_LOOP_FEATURE],
+        [
+            MODEL_BOUNDARY_FEATURE,
+            MULTI_TOOL_LOOP_FEATURE,
+            OVERFLOW_RECOVERY_FEATURE,
+        ],
     ):
         raise ReplayCorruptionError("invalid run.started protocol features")
-    _validate_context_plan_metadata(payload.get("context_plan"))
     return payload
 
 
@@ -660,10 +851,15 @@ def _has_multi_tool_loop_feature(started: dict[str, object]) -> bool:
     return isinstance(features, list) and MULTI_TOOL_LOOP_FEATURE in features
 
 
+def _has_overflow_recovery_feature(started: dict[str, object]) -> bool:
+    features = started.get("protocol_features")
+    return isinstance(features, list) and OVERFLOW_RECOVERY_FEATURE in features
+
+
 def _validate_model_request_payload(
     payload: object, started: dict[str, object]
 ) -> dict[str, object]:
-    expected = {
+    legacy_expected = {
         "request_id",
         "iteration",
         "context_plan_id",
@@ -675,6 +871,13 @@ def _validate_model_request_payload(
         "tool_count",
         "tool_result_call_ids",
     }
+    recovery_schema = _has_overflow_recovery_feature(started)
+    expected = (
+        legacy_expected
+        | {"attempt", "recovery_id", "provider_call_index"}
+        if recovery_schema
+        else legacy_expected
+    )
     if not isinstance(payload, dict) or set(payload) != expected:
         raise ReplayCorruptionError("invalid model.request.started payload")
     context = started.get("context_plan")
@@ -685,11 +888,48 @@ def _validate_model_request_payload(
         payload.get("iteration"), minimum=1, maximum=8, field="model iteration"
     )
     request_id = _worker_id(payload.get("request_id"), "model request_id")
+    attempt = 0
+    if recovery_schema:
+        attempt = _bounded_integer(
+            payload.get("attempt"), minimum=0, maximum=1, field="model attempt"
+        )
+        _bounded_integer(
+            payload.get("provider_call_index"),
+            minimum=1,
+            maximum=64,
+            field="provider call index",
+        )
+        recovery_id = payload.get("recovery_id")
+        if (
+            (attempt == 0 and recovery_id is not None)
+            or (
+                attempt == 1
+                and (
+                    not isinstance(recovery_id, str)
+                    or _RESOURCE_ID.fullmatch(recovery_id) is None
+                )
+            )
+        ):
+            raise ReplayCorruptionError("invalid model recovery identity")
     result_ids = payload.get("tool_result_call_ids")
+    expected_request_id = (
+        f"model-{iteration}"
+        if attempt == 0
+        else f"model-{iteration}-recovery-1"
+    )
     if (
-        request_id != f"model-{iteration}"
-        or payload.get("context_plan_id") != context.get("plan_id")
-        or payload.get("context_plan_digest") != context.get("digest")
+        request_id != expected_request_id
+        or (
+            attempt == 0
+            and (
+                payload.get("context_plan_id") != context.get("plan_id")
+                or payload.get("context_plan_digest") != context.get("digest")
+            )
+        )
+        or not isinstance(payload.get("context_plan_id"), str)
+        or _PLAN_ID.fullmatch(str(payload.get("context_plan_id"))) is None
+        or not isinstance(payload.get("context_plan_digest"), str)
+        or _DIGEST.fullmatch(str(payload.get("context_plan_digest"))) is None
         or not isinstance(payload.get("request_digest"), str)
         or _DIGEST.fullmatch(str(payload.get("request_digest"))) is None
         or not isinstance(result_ids, list)
@@ -744,7 +984,7 @@ def _validate_model_request_payload(
 def _validate_model_response_payload(
     payload: object, started: dict[str, object]
 ) -> dict[str, object]:
-    expected = {
+    legacy_expected = {
         "request_id",
         "iteration",
         "outcome",
@@ -753,12 +993,47 @@ def _validate_model_response_payload(
         "usage_complete",
         "error_code",
     }
+    recovery_schema = _has_overflow_recovery_feature(started)
+    expected = (
+        legacy_expected
+        | {"attempt", "recovery_id", "provider_call_index"}
+        if recovery_schema
+        else legacy_expected
+    )
     if not isinstance(payload, dict) or set(payload) != expected:
         raise ReplayCorruptionError("invalid model.response.finished payload")
     iteration = _bounded_integer(
-        payload.get("iteration"), minimum=1, maximum=3, field="model iteration"
+        payload.get("iteration"), minimum=1, maximum=8, field="model iteration"
     )
     request_id = _worker_id(payload.get("request_id"), "model request_id")
+    attempt = 0
+    if recovery_schema:
+        attempt = _bounded_integer(
+            payload.get("attempt"), minimum=0, maximum=1, field="model attempt"
+        )
+        _bounded_integer(
+            payload.get("provider_call_index"),
+            minimum=1,
+            maximum=64,
+            field="provider call index",
+        )
+        recovery_id = payload.get("recovery_id")
+        if (
+            (attempt == 0 and recovery_id is not None)
+            or (
+                attempt == 1
+                and (
+                    not isinstance(recovery_id, str)
+                    or _RESOURCE_ID.fullmatch(recovery_id) is None
+                )
+            )
+        ):
+            raise ReplayCorruptionError("invalid model recovery identity")
+    expected_request_id = (
+        f"model-{iteration}"
+        if attempt == 0
+        else f"model-{iteration}-recovery-1"
+    )
     input_tokens = _bounded_integer(
         payload.get("input_tokens"),
         minimum=0,
@@ -778,7 +1053,7 @@ def _validate_model_response_payload(
     if not isinstance(context, dict):
         raise ReplayCorruptionError("invalid model response context")
     if (
-        request_id != f"model-{iteration}"
+        request_id != expected_request_id
         or outcome not in {"tool_use", "end_turn", "error", "cancelled"}
         or not isinstance(complete, bool)
         or input_tokens > context.get("input_budget_tokens", 0)
@@ -813,7 +1088,9 @@ def _validate_model_usage_rollup(
     expected_input = sum(int(item["input_tokens"]) for item in completed)
     expected_output = sum(int(item["output_tokens"]) for item in completed)
     expected_last_input = int(completed[-1]["input_tokens"]) if completed else 0
-    expected_complete = model_calls[-1].get("usage_complete") is True
+    expected_complete = all(
+        item.get("usage_complete") is True for item in model_calls
+    )
     if usage != {
         "input_tokens": expected_input,
         "output_tokens": expected_output,
@@ -870,8 +1147,7 @@ def _validate_terminal_payload(
             payload.get("reason") != "end_turn"
             or not isinstance(iterations, int)
             or isinstance(iterations, bool)
-            or not 1 <= iterations <= 3
-            or usage.get("complete") is not True
+            or not 1 <= iterations <= 4
         ):
             raise ReplayCorruptionError("invalid run.completed payload")
     elif kind == "run.failed":
@@ -906,7 +1182,9 @@ def _tool_spec(tool_id: object) -> ToolSpec:
     return spec
 
 
-def _validate_tool_arguments(spec: ToolSpec, value: object) -> dict[str, str]:
+def _validate_tool_arguments(
+    spec: ToolSpec, value: object
+) -> dict[str, str | int | bool]:
     try:
         return spec.validate_arguments(value)
     except (UnicodeError, ValueError) as exc:
@@ -921,7 +1199,11 @@ def _validate_tool_result(spec: ToolSpec, value: object) -> str:
 
 
 def _validate_tool_outcome(
-    *, spec: ToolSpec, arguments: dict[str, str], outcome: object, result: object
+    *,
+    spec: ToolSpec,
+    arguments: dict[str, str | int | bool],
+    outcome: object,
+    result: object,
 ) -> str:
     if outcome not in {"succeeded", "failed", "cancelled"}:
         raise ReplayCorruptionError("invalid Tool outcome")
@@ -968,7 +1250,7 @@ def _validate_snapshot_document(
     maximum_tools = 2 if _has_multi_tool_loop_feature(started) else 1
     if len(tools) > maximum_tools:
         raise ReplayCorruptionError("projection has too many Tool calls")
-    if len(model_calls) > 3:
+    if len(model_calls) > (5 if _has_overflow_recovery_feature(started) else 4):
         raise ReplayCorruptionError("projection has too many model calls")
     boundary_feature = _has_model_boundary_feature(started)
     if model_calls and not boundary_feature:
@@ -978,8 +1260,8 @@ def _validate_snapshot_document(
     known_sequences: set[int] = {1}
     open_model_calls = 0
     last_model_sequence = 1
-    for expected_iteration, item in enumerate(model_calls, start=1):
-        if not isinstance(item, dict) or set(item) != {
+    for call_index, item in enumerate(model_calls):
+        base_fields = {
             "request_id",
             "iteration",
             "context_plan_id",
@@ -998,22 +1280,28 @@ def _validate_snapshot_document(
             "output_tokens",
             "usage_complete",
             "error_code",
-        }:
+        }
+        if _has_overflow_recovery_feature(started):
+            base_fields |= {"attempt", "recovery_id", "provider_call_index"}
+        if not isinstance(item, dict) or set(item) != base_fields:
             raise ReplayCorruptionError("projection model call is invalid")
+        request_fields = [
+            "request_id",
+            "iteration",
+            "context_plan_id",
+            "context_plan_digest",
+            "request_digest",
+            "request_bytes",
+            "estimated_input_tokens",
+            "message_count",
+            "tool_count",
+            "tool_result_call_ids",
+        ]
+        if _has_overflow_recovery_feature(started):
+            request_fields += ["attempt", "recovery_id", "provider_call_index"]
         request_payload = {
             key: item[key]
-            for key in (
-                "request_id",
-                "iteration",
-                "context_plan_id",
-                "context_plan_digest",
-                "request_digest",
-                "request_bytes",
-                "estimated_input_tokens",
-                "message_count",
-                "tool_count",
-                "tool_result_call_ids",
-            )
+            for key in request_fields
         }
         _validate_model_request_payload(request_payload, started)
         request_seq = _snapshot_sequence(
@@ -1021,8 +1309,31 @@ def _validate_snapshot_document(
             field="model request sequence",
             through_seq=through_seq,
         )
+        attempt = item.get("attempt", 0)
+        previous_call = model_calls[call_index - 1] if call_index else None
+        expected_iteration = (
+            1
+            if previous_call is None
+            else (
+                int(previous_call["iteration"])
+                if attempt == 1
+                else int(previous_call["iteration"]) + 1
+            )
+        )
         if (
             item.get("iteration") != expected_iteration
+            or (
+                attempt == 1
+                and (
+                    not isinstance(previous_call, dict)
+                    or previous_call.get("attempt", 0) != 0
+                    or previous_call.get("outcome") != "error"
+                    or previous_call.get("error_code")
+                    not in {"model_context_overflow", "model_media_overflow"}
+                    or previous_call.get("context_plan_digest")
+                    == item.get("context_plan_digest")
+                )
+            )
             or request_seq <= last_model_sequence
             or request_seq in known_sequences
         ):
@@ -1030,7 +1341,7 @@ def _validate_snapshot_document(
         known_sequences.add(request_seq)
         if item.get("state") == "started":
             if (
-                expected_iteration != len(model_calls)
+                call_index != len(model_calls) - 1
                 or any(
                     item.get(field) is not None
                     for field in (
@@ -1056,6 +1367,14 @@ def _validate_snapshot_document(
                 "usage_complete": item["usage_complete"],
                 "error_code": item["error_code"],
             }
+            if _has_overflow_recovery_feature(started):
+                response_payload.update(
+                    {
+                        "attempt": item["attempt"],
+                        "recovery_id": item["recovery_id"],
+                        "provider_call_index": item["provider_call_index"],
+                    }
+                )
             _validate_model_response_payload(response_payload, started)
             response_seq = _snapshot_sequence(
                 item.get("response_seq"),
@@ -1235,8 +1554,19 @@ def _validate_snapshot_document(
         if index:
             previous = model_calls[index - 1]
             assert isinstance(previous, dict)
+            recovery_transition = (
+                call.get("attempt") == 1
+                and previous.get("attempt", 0) == 0
+                and previous.get("iteration") == call.get("iteration")
+                and previous.get("outcome") == "error"
+                and previous.get("error_code")
+                in {"model_context_overflow", "model_media_overflow"}
+            )
             if (
-                previous.get("outcome") != "tool_use"
+                (
+                    previous.get("outcome") != "tool_use"
+                    and not recovery_transition
+                )
                 or not isinstance(previous.get("response_seq"), int)
                 or request_seq <= int(previous["response_seq"])
             ):
@@ -1278,7 +1608,7 @@ def _validate_snapshot_document(
             _validate_model_usage_rollup(model_calls, terminal_payload)
         if terminal["kind"] == "run.completed":
             expected_iterations = (
-                len(model_calls)
+                max((int(item["iteration"]) for item in model_calls), default=0)
                 if boundary_feature
                 else len(tools) + 1
             )
@@ -1337,6 +1667,8 @@ def project_durable_run(
     tools: list[dict[str, object]] = []
     model_calls: list[dict[str, object]] = []
     open_model_call: int | None = None
+    pending_recovery: dict[str, object] | None = None
+    recovery_count = 0
     model_boundaries_seen = False
     gaps: list[ReplayGap] = []
     terminal: dict[str, object] | None = None
@@ -1389,16 +1721,50 @@ def project_durable_run(
             previous_outcome = (
                 model_calls[-1].get("outcome") if model_calls else None
             )
+            attempt = payload.get("attempt", 0)
+            is_recovery = attempt == 1
+            previous_iteration = (
+                model_calls[-1].get("iteration") if model_calls else 0
+            )
+            expected_iteration = (
+                previous_iteration
+                if is_recovery
+                else (int(previous_iteration) + 1)
+            )
             if (
                 open_model_call is not None
                 or open_block is not None
                 or pending_tool is not None
-                or iteration != len(model_calls) + 1
+                or iteration != expected_iteration
                 or payload.get("tool_result_call_ids") != expected_results
                 or (not model_calls and (blocks or tools))
-                or (model_calls and previous_outcome != "tool_use")
+                or (
+                    is_recovery
+                    and (
+                        pending_recovery is None
+                        or payload.get("recovery_id")
+                        != pending_recovery.get("recovery_id")
+                        or payload.get("context_plan_id")
+                        != pending_recovery.get("to_context_plan_id")
+                        or payload.get("context_plan_digest")
+                        != pending_recovery.get("to_context_plan_digest")
+                    )
+                )
+                or (
+                    not is_recovery
+                    and model_calls
+                    and previous_outcome != "tool_use"
+                )
+                or (
+                    model_calls
+                    and payload.get("provider_call_index") is not None
+                    and payload.get("provider_call_index")
+                    != int(model_calls[-1].get("provider_call_index", 0)) + 1
+                )
             ):
                 raise ReplayCorruptionError("model request is out of sequence")
+            if is_recovery:
+                pending_recovery = None
             model_boundaries_seen = True
             model_calls.append(
                 {
@@ -1424,6 +1790,10 @@ def project_durable_run(
             if (
                 payload.get("request_id") != request.get("request_id")
                 or payload.get("iteration") != request.get("iteration")
+                or payload.get("attempt", 0) != request.get("attempt", 0)
+                or payload.get("recovery_id") != request.get("recovery_id")
+                or payload.get("provider_call_index")
+                != request.get("provider_call_index")
                 or (
                     payload.get("outcome") == "tool_use"
                     and request.get("tool_count") == 0
@@ -1441,6 +1811,69 @@ def project_durable_run(
                 "error_code": payload["error_code"],
             }
             open_model_call = None
+        elif event.kind == "model.recovery.started":
+            if (
+                started_payload is None
+                or not _has_overflow_recovery_feature(started_payload)
+            ):
+                raise ReplayCorruptionError("model recovery feature is not advertised")
+            payload = _exact_payload(
+                event,
+                {
+                    "recovery_id",
+                    "iteration",
+                    "attempt",
+                    "overflow_code",
+                    "from_context_plan_id",
+                    "from_context_plan_digest",
+                    "to_context_plan_id",
+                    "to_context_plan_digest",
+                    "boundary_digest",
+                },
+            )
+            recovery_id = payload.get("recovery_id")
+            latest = model_calls[-1] if model_calls else None
+            if (
+                recovery_count != 0
+                or pending_recovery is not None
+                or open_model_call is not None
+                or open_block is not None
+                or pending_tool is not None
+                or not isinstance(recovery_id, str)
+                or _RESOURCE_ID.fullmatch(recovery_id) is None
+                or payload.get("attempt") != 1
+                or payload.get("overflow_code")
+                not in {"model_context_overflow", "model_media_overflow"}
+                or not isinstance(latest, dict)
+                or latest.get("attempt") != 0
+                or latest.get("iteration") != payload.get("iteration")
+                or latest.get("outcome") != "error"
+                or latest.get("usage_complete") is not False
+                or latest.get("error_code") != payload.get("overflow_code")
+                or latest.get("context_plan_id")
+                != payload.get("from_context_plan_id")
+                or latest.get("context_plan_digest")
+                != payload.get("from_context_plan_digest")
+                or any(
+                    not isinstance(payload.get(field), str)
+                    or _PLAN_ID.fullmatch(str(payload[field])) is None
+                    for field in ("from_context_plan_id", "to_context_plan_id")
+                )
+                or any(
+                    not isinstance(payload.get(field), str)
+                    or _DIGEST.fullmatch(str(payload[field])) is None
+                    for field in (
+                        "from_context_plan_digest",
+                        "to_context_plan_digest",
+                        "boundary_digest",
+                    )
+                )
+                or payload.get("from_context_plan_digest")
+                == payload.get("to_context_plan_digest")
+            ):
+                raise ReplayCorruptionError("model recovery boundary is invalid")
+            pending_recovery = payload
+            recovery_count = 1
         elif event.kind == "assistant.block.started":
             payload = _exact_payload(event, {"block_id", "block_type"})
             block_id = _worker_id(payload.get("block_id"), "block_id")
@@ -1592,8 +2025,13 @@ def project_durable_run(
                 open_block is not None
                 or pending_tool is not None
                 or open_model_call is not None
+                or (
+                    pending_recovery is not None
+                    and event.kind == "run.completed"
+                )
             ):
                 raise ReplayCorruptionError("terminal leaves an operation open")
+            pending_recovery = None
             terminal_payload = _validate_terminal_payload(
                 event.kind, event.payload
             )
@@ -1601,7 +2039,7 @@ def project_durable_run(
                 _validate_model_usage_rollup(model_calls, terminal_payload)
             if event.kind == "run.completed":
                 expected_iterations = (
-                    len(model_calls)
+                    max((int(item["iteration"]) for item in model_calls), default=0)
                     if _has_model_boundary_feature(started_payload)
                     else len(tools) + 1
                 )

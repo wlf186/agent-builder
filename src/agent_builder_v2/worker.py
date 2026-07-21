@@ -1,4 +1,4 @@
-"""One-process-per-Run Worker entrypoint for the walking skeleton."""
+"""One-process-per-Run Worker entrypoint."""
 
 from __future__ import annotations
 
@@ -13,7 +13,12 @@ from typing import Any
 from .context import ContextPlanError, ContextPlanReference
 from .contracts import LoopLimits, MAX_MESSAGE_BYTES
 from .kernel import CancellationToken, HarnessKernel
-from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES, BrokeredStreamingModel
+from .model import (
+    BROKER_PROTOCOL_VERSION,
+    MAX_BROKER_FRAME_BYTES,
+    BrokeredCapabilityClient,
+    BrokeredStreamingModel,
+)
 from .sandbox import (
     SandboxAttestation,
     apply_worker_sandbox,
@@ -21,7 +26,7 @@ from .sandbox import (
     close_worker_file_descriptors,
     verify_worker_file_descriptors,
 )
-from .tools import prototype_tool_specs_for_ids, prototype_tools, toolset_digest
+from .tools import runtime_tool_specs_for_ids, runtime_tools, toolset_digest
 
 
 # JSON control characters can expand to six bytes (for example ``\u0000``).
@@ -137,7 +142,7 @@ def _read_command() -> dict[str, Any]:
     except ValueError as exc:
         raise ValueError("invalid loop limits") from exc
     try:
-        effective_tools = prototype_tool_specs_for_ids(
+        effective_tools = runtime_tool_specs_for_ids(
             value.get("effective_tool_ids")
         )
     except ValueError as exc:
@@ -182,9 +187,12 @@ def main() -> int:
     model = BrokeredStreamingModel(
         sys.stdin.buffer, sys.stdout.buffer, effective_tools=effective_tools
     )
+    capability_client = BrokeredCapabilityClient(
+        sys.stdin.buffer, sys.stdout.buffer, effective_tools
+    )
     kernel = HarnessKernel(
         model=model,
-        tools=prototype_tools(effective_tools),
+        tools=runtime_tools(effective_tools, capability_client.execute),
         cancellation=cancellation,
         loop_limits=command["loop_limits"],
     )

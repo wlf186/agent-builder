@@ -1,7 +1,7 @@
 ---
 owner: repository-maintainers
 status: maintained
-last_reviewed: 2026-07-18
+last_reviewed: 2026-07-20
 review_cycle: quarterly
 ---
 
@@ -22,6 +22,7 @@ review_cycle: quarterly
 | 运行时拓扑和组件边界 | `docs/design/architecture.md` | runtime maintainers | 进程、模块、数据流或依赖方向变化 |
 | canonical event / SSE | `docs/design/event-protocol.md` | runtime maintainers | 字段、事件、顺序、持久性、cursor 或限制变化 |
 | Agent/Run 所有权与清理 | `docs/design/agent-capsule.md` | runtime maintainers | Capsule 目录、环境、生命周期、隔离或删除变化 |
+| 发布、平台、备份与回滚 | `docs/design/release.md` | runtime maintainers | release scope、平台、资格、产物或运维流程变化 |
 | 当前路线与缺口 | `docs/plans/runtime-rebuild.md` | plan owner | 工作开始、完成、换方向、阻塞或验收变化 |
 | Claude Code 研究范围 | `references/claude-code/*.md` | research maintainers | 材料、版本、hash、来源或使用边界变化 |
 

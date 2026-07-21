@@ -78,6 +78,38 @@ def test_supervisor_publishes_complete_private_identity_before_child_launch(
     assert list(runtime.glob(".gateway.pid.*.tmp")) == []
 
 
+def test_supervisor_removes_only_its_exact_incomplete_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repository = tmp_path / "repository"
+    runtime = repository / ".runtime" / "control-plane"
+    runtime.mkdir(parents=True)
+    pid_file = runtime / "gateway.pid"
+    monkeypatch.setenv("AGENT_BUILDER_ROOT", str(repository))
+    checkout, managed_path = log_supervisor._managed_pid_path(
+        str(runtime), str(pid_file)
+    )
+    monkeypatch.setattr(log_supervisor.os, "getpid", lambda: 12345)
+    monkeypatch.setattr(log_supervisor.os, "getpgrp", lambda: 12345)
+    monkeypatch.setattr(
+        log_supervisor, "_process_marker", lambda _pid: "linux:67890"
+    )
+    log_supervisor._publish_gateway_pid_record(managed_path, checkout)
+
+    assert log_supervisor._remove_initial_pid_record_if_owned(
+        managed_path, checkout
+    ) is True
+    assert not pid_file.exists()
+
+    log_supervisor._publish_gateway_pid_record(managed_path, checkout)
+    pid_file.write_text("changed\n", encoding="utf-8")
+    os.chmod(pid_file, 0o600)
+    assert log_supervisor._remove_initial_pid_record_if_owned(
+        managed_path, checkout
+    ) is False
+    assert pid_file.read_text(encoding="utf-8") == "changed\n"
+
+
 def test_supervisor_refuses_existing_or_linked_pid_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

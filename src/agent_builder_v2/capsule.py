@@ -1,4 +1,4 @@
-"""Minimal Agent Capsule ownership for the greenfield prototype."""
+"""Agent Capsule ownership and lifecycle containment."""
 
 from __future__ import annotations
 
@@ -548,9 +548,9 @@ class CapsuleManager:
         runtime_root = self.runtime_agents / agent_id
         self._ensure_real_directory(data_root)
         self._ensure_real_directory(runtime_root)
-        for child in ("workspace", "artifacts"):
+        for child in ("workspace", "artifacts", "skills"):
             self._ensure_real_directory(data_root / child)
-        for child in ("runs", "logs"):
+        for child in ("runs", "tasks", "logs", "skills"):
             self._ensure_real_directory(runtime_root / child)
 
         manifest = data_root / "manifest.json"
@@ -618,8 +618,9 @@ class CapsuleManager:
             self._environment_root(prepared.runtime_root, prepared.generation)
         )
         runs_root = current.runtime_root / "runs"
-        if any(runs_root.iterdir()):
-            raise RuntimeError("Agent has Run roots during generation promotion")
+        tasks_root = current.runtime_root / "tasks"
+        if any(runs_root.iterdir()) or any(tasks_root.iterdir()):
+            raise RuntimeError("Agent has Run or Task roots during generation promotion")
         self._replace_manifest(
             current.data_root / "manifest.json",
             current.agent_id,
@@ -685,6 +686,7 @@ class CapsuleManager:
     def delete_agent(self, capsule: AgentCapsule) -> None:
         self._validate_capsule(capsule)
         self.cleanup_orphan_run_roots(capsule)
+        self.cleanup_orphan_task_roots(capsule)
         roots = (capsule.data_root, capsule.runtime_root)
         if self._process_references_roots(roots):
             raise RuntimeError("Agent roots are still referenced by a process")
@@ -721,3 +723,58 @@ class CapsuleManager:
         except FileNotFoundError:
             return
         shutil.rmtree(root)
+
+    def create_task_root(self, capsule: AgentCapsule, task_id: str) -> Path:
+        self._validate_capsule(capsule)
+        if not SAFE_ID.fullmatch(task_id):
+            raise ValueError("invalid task_id")
+        root = capsule.runtime_root / "tasks" / task_id
+        try:
+            os.lstat(root)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError("Task root already exists")
+        self._ensure_real_directory(root)
+        for child in ("home", "tmp", "xdg", "work", "output"):
+            self._ensure_real_directory(root / child)
+        return root
+
+    def remove_task_root(self, capsule: AgentCapsule, task_id: str) -> None:
+        self._validate_capsule(capsule)
+        if not SAFE_ID.fullmatch(task_id):
+            raise ValueError("invalid task_id")
+        root = capsule.runtime_root / "tasks" / task_id
+        try:
+            self._require_real_directory(root)
+        except FileNotFoundError:
+            return
+        if self._process_references_roots((root,)):
+            raise RuntimeError("Task root is still referenced by a process")
+        shutil.rmtree(root)
+
+    def cleanup_orphan_task_roots(
+        self, capsule: AgentCapsule, maximum_roots: int = 128
+    ) -> int:
+        self._validate_capsule(capsule)
+        if not 1 <= maximum_roots <= 1_024:
+            raise ValueError("maximum Task roots is invalid")
+        tasks_root = capsule.runtime_root / "tasks"
+        self._require_real_directory(tasks_root)
+        entries = list(tasks_root.iterdir())
+        if len(entries) > maximum_roots:
+            raise RuntimeError("orphan Task scan exceeded its safety bound")
+        removed = 0
+        for root in entries:
+            metadata = os.lstat(root)
+            if (
+                not SAFE_ID.fullmatch(root.name)
+                or not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise RuntimeError("unsafe Task root found during recovery")
+            if self._process_references_roots((root,)):
+                raise RuntimeError("residual Task process is still alive")
+            shutil.rmtree(root)
+            removed += 1
+        return removed

@@ -10,12 +10,14 @@ import os
 import re
 import signal
 import stat
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from .capsule import AgentCapsule, CapsuleManager, PROTOTYPE_AGENT_ID, SAFE_ID
-from .context import ConversationMessage, ContextCompiler, ContextPlan
+from .context import ConversationMessage, ContextCompiler, ContextPlan, ContextPlanError
+from .context_projection import ContextProjectionBoundary
 from .contracts import (
     LoopLimits,
     RUN_CURSOR_RESERVED_THROUGH,
@@ -36,14 +38,27 @@ from .ollama import (
     OllamaRunSession,
     OllamaToolResult,
 )
+from .file_read import FileReadExecutor
+from .file_search import FileSearchExecutor
+from .file_write import FileMutationExecutor, FileWriteError, FullReadReceipt
+from .extensions import ExtensionCatalog, ExtensionError, ExtensionExecutor
+from .command_exec import CommandExecutionError, CommandExecutor
+from .permissions import (
+    CapabilityBroker,
+    CapabilityPolicy,
+    CapabilityRequest,
+)
 from .replay import DurableReplay, RunIdentity
 from .sandbox import HostQualification, require_qualified_host
 from .sessions import (
+    CapabilityAuditEvent,
     Conversation,
     ConversationDeleteResult,
     ConversationNotFoundError,
+    ConversationConflictError,
     ConversationStore,
     ConversationSummary,
+    PermissionRecord,
 )
 from .state import (
     EventJournal,
@@ -51,14 +66,31 @@ from .state import (
     JournalUnavailableError,
 )
 from .sync_counter import qualification_environment
+from .tasks import (
+    BackgroundTaskManager,
+    TaskNotification,
+    TaskParentIdentity,
+    TaskRecord,
+    TaskStore,
+)
+from .subagents import (
+    MailboxMessage,
+    SubagentCoordinator,
+    SubagentError,
+    SubagentLink,
+    SubagentStore,
+)
+from .skills import SkillError, SkillExecutor, SkillRecord, SkillRegistry
 from .tools import (
     EffectiveToolSet,
+    ToolPolicy,
     ToolSpec,
-    prototype_tool_catalog,
-    prototype_tool_policy,
+    project_tool_result,
+    runtime_tool_catalog,
+    runtime_tool_policy,
     toolset_digest,
 )
-from .workspace_context import collect_prompt_sources
+from .workspace_context import PromptSourceSnapshot, collect_prompt_sources
 
 
 WORKER_EVENT_KINDS = frozenset(
@@ -382,6 +414,9 @@ class RunRecord:
     conversation_managed: bool = False
     conversation_revision: int | None = None
     context_plan: ContextPlan | None = None
+    recovery_context_plan: ContextPlan | None = None
+    recovery_history: tuple[ConversationMessage, ...] = field(default=(), repr=False)
+    recovery_prompt_sources: PromptSourceSnapshot | None = field(default=None, repr=False)
     effective_tools: tuple[ToolSpec, ...] = ()
     events: list[EventEnvelope] = field(default_factory=list)
     terminal_kind: str | None = None
@@ -404,8 +439,17 @@ class RunRecord:
         str, tuple[str, dict[str, str]]
     ] = field(default_factory=dict)
     broker_tool_results: list[OllamaToolResult] = field(default_factory=list)
+    brokered_capability_calls: set[str] = field(default_factory=set)
+    brokered_capability_results: dict[str, tuple[str, str]] = field(
+        default_factory=dict, repr=False
+    )
+    file_read_receipts: dict[str, FullReadReceipt] = field(
+        default_factory=dict, repr=False
+    )
     model_request_count: int = 0
     model_response_count: int = 0
+    provider_call_count: int = 0
+    overflow_recovery_count: int = 0
     broker_stop_iteration: int | None = None
     final_assistant_content: str | None = field(default=None, repr=False)
     model_failure: tuple[str, bool] | None = None
@@ -454,6 +498,8 @@ class RunService:
         model_broker: OllamaBroker | None = None,
         manage_model_broker: bool | None = None,
         context_compiler: ContextCompiler | None = None,
+        extension_catalog: ExtensionCatalog | None = None,
+        subagent_coordinator: SubagentCoordinator | None = None,
     ) -> None:
         self.repository_root = repository_root.resolve(strict=True)
         self.source_root = source_root.resolve(strict=True)
@@ -477,12 +523,54 @@ class RunService:
             else manage_model_broker
         )
         self.context_compiler = context_compiler or ContextCompiler()
-        self.tool_catalog = prototype_tool_catalog()
-        self.tool_policy = prototype_tool_policy()
+        self.extension_catalog = extension_catalog or ExtensionCatalog.empty()
+        self.subagent_coordinator = subagent_coordinator
+        self.tool_catalog = runtime_tool_catalog()
+        self.tool_policy = runtime_tool_policy()
+        unavailable_optional = {"skill/run"}
+        if not self.extension_catalog.public_metadata():
+            unavailable_optional.add("extension/call")
+        if unavailable_optional:
+            self.tool_catalog = type(self.tool_catalog).create(
+                tuple(
+                    spec
+                    for spec in self.tool_catalog.specs
+                    if spec.tool_id not in unavailable_optional
+                )
+            )
+            self.tool_policy = ToolPolicy(
+                revision=self.tool_policy.revision,
+                allowed_tool_ids=tuple(
+                    tool_id
+                    for tool_id in self.tool_policy.allowed_tool_ids
+                    if tool_id not in unavailable_optional
+                ),
+                denied_tool_ids=self.tool_policy.denied_tool_ids,
+                allowed_risks=self.tool_policy.allowed_risks,
+            )
         self.effective_toolset = EffectiveToolSet.resolve(
             self.tool_catalog, self.tool_policy
         )
         self.effective_tools = self.effective_toolset.specs
+        self.capability_policy = CapabilityPolicy(
+            revision="capability-policy-v4",
+            allow=("file/glob", "file/grep", "file/read_text", "file/stat"),
+            ask=(
+                "agent/delegate", "exec/run", "extension/call", "file/edit", "file/write", "skill/run"
+            ),
+            default="deny",
+        )
+        self.capability_broker: CapabilityBroker | None = None
+        self.file_read_executor: FileReadExecutor | None = None
+        self.file_search_executor: FileSearchExecutor | None = None
+        self.file_mutation_executor: FileMutationExecutor | None = None
+        self.command_executor: CommandExecutor | None = None
+        self.extension_executor: ExtensionExecutor | None = None
+        self.task_store: TaskStore | None = None
+        self.task_manager: BackgroundTaskManager | None = None
+        self.subagent_store: SubagentStore | None = None
+        self.skill_registry: SkillRegistry | None = None
+        self.skill_executor: SkillExecutor | None = None
         self.model_qualification: OllamaQualification | None = None
         self.sandbox_qualification: HostQualification | None = None
         self.runs: dict[str, RunRecord] = {}
@@ -537,14 +625,75 @@ class RunService:
                 self.capsule.data_root / "state.sqlite",
                 self.capsule.agent_id,
             )
+            self.capability_broker = CapabilityBroker(
+                self.conversations,
+                generation_provider=lambda: (
+                    self.capsule.generation if self.capsule is not None else 0
+                ),
+                toolset_digest_provider=lambda: self.effective_toolset.toolset_digest,
+                policy=self.capability_policy,
+            )
+            self.file_read_executor = FileReadExecutor(self.capsule)
+            self.file_search_executor = FileSearchExecutor(self.capsule)
+            self.file_mutation_executor = FileMutationExecutor(self.capsule)
+            self.command_executor = CommandExecutor(
+                self.repository_root, self.source_root, self.capsule
+            )
+            # External endpoints are operator construction, never request data.
+            # The default release catalog is intentionally empty/fail-closed.
+            self.extension_executor = ExtensionExecutor(self.extension_catalog)
+            self.skill_registry = SkillRegistry(
+                self.repository_root,
+                self.capsule,
+                self.capsule.data_root / "state.sqlite",
+            )
+            self.skill_executor = SkillExecutor(
+                self.skill_registry, self.command_executor
+            )
+            if self.skill_registry.list():
+                self._set_skill_tool_available(True)
+            self.task_store = TaskStore(
+                self.capsule.data_root / "state.sqlite", self.capsule.agent_id
+            )
+            self.task_manager = BackgroundTaskManager(
+                self.capsule,
+                self.capsules,
+                self.command_executor,
+                self.task_store,
+            )
+            await self.task_manager.initialize()
+            self.subagent_store = SubagentStore(
+                self.capsule.data_root / "state.sqlite", self.capsule.agent_id
+            )
+            await asyncio.to_thread(self.subagent_store.recover_incomplete)
             await asyncio.to_thread(
                 self.conversations.recover_running_as_interrupted
             )
             await asyncio.to_thread(self.journal.prune_to_recent_runs, 256)
         except BaseException:
+            if self.task_manager is not None:
+                await self.task_manager.close()
+                self.task_manager = None
+                self.task_store = None
+            elif self.task_store is not None:
+                self.task_store.close()
+                self.task_store = None
+            if self.subagent_store is not None:
+                self.subagent_store.close()
+                self.subagent_store = None
             if self.conversations is not None:
                 self.conversations.close()
                 self.conversations = None
+            self.capability_broker = None
+            self.file_read_executor = None
+            self.file_search_executor = None
+            self.file_mutation_executor = None
+            self.command_executor = None
+            self.extension_executor = None
+            if self.skill_registry is not None:
+                self.skill_registry.close()
+                self.skill_registry = None
+            self.skill_executor = None
             if self.journal is not None:
                 self.journal.close()
                 self.journal = None
@@ -575,12 +724,29 @@ class RunService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._drain_control_tasks()
+        if self.task_manager is not None:
+            await self.task_manager.close()
+            self.task_manager = None
+            self.task_store = None
+        if self.subagent_store is not None:
+            self.subagent_store.close()
+            self.subagent_store = None
+        if self.skill_registry is not None:
+            self.skill_registry.close()
+            self.skill_registry = None
+        self.skill_executor = None
         if self.journal is not None:
             self.journal.close()
             self.journal = None
         if self.conversations is not None:
             self.conversations.close()
             self.conversations = None
+        self.capability_broker = None
+        self.file_read_executor = None
+        self.file_search_executor = None
+        self.file_mutation_executor = None
+        self.command_executor = None
+        self.extension_executor = None
         self.model_qualification = None
         self.sandbox_qualification = None
         if self._manage_model_broker:
@@ -590,6 +756,50 @@ class RunService:
         if self.conversations is None:
             raise RuntimeError("conversation store is unavailable")
         return self.conversations
+
+    def _set_skill_tool_available(self, available: bool) -> None:
+        catalog = runtime_tool_catalog()
+        policy = runtime_tool_policy()
+        excluded = set()
+        if not available:
+            excluded.add("skill/run")
+        if not self.extension_catalog.public_metadata():
+            excluded.add("extension/call")
+        self.tool_catalog = type(catalog).create(
+            tuple(spec for spec in catalog.specs if spec.tool_id not in excluded)
+        )
+        self.tool_policy = ToolPolicy(
+            revision=policy.revision,
+            allowed_tool_ids=tuple(
+                item for item in policy.allowed_tool_ids if item not in excluded
+            ),
+            denied_tool_ids=policy.denied_tool_ids,
+            allowed_risks=policy.allowed_risks,
+        )
+        self.effective_toolset = EffectiveToolSet.resolve(
+            self.tool_catalog, self.tool_policy
+        )
+        self.effective_tools = self.effective_toolset.specs
+
+    async def list_skills(self) -> tuple[SkillRecord, ...]:
+        if self.skill_registry is None:
+            raise RuntimeError("Skill registry is unavailable")
+        return await asyncio.to_thread(self.skill_registry.list)
+
+    async def install_skill(self, raw: bytes, expected_digest: str) -> SkillRecord:
+        if self._closing or self.skill_registry is None:
+            raise RuntimeError("Skill registry is unavailable")
+        record = await asyncio.to_thread(
+            self.skill_registry.install, raw, expected_digest
+        )
+        self._set_skill_tool_available(True)
+        return record
+
+    async def delete_skill(self, skill_id: str) -> None:
+        if self._closing or self.skill_registry is None:
+            raise RuntimeError("Skill registry is unavailable")
+        await asyncio.to_thread(self.skill_registry.delete, skill_id)
+        self._set_skill_tool_available(bool(self.skill_registry.list()))
 
     async def create_conversation(self, title: str = "新会话") -> Conversation:
         if self._closing:
@@ -655,6 +865,64 @@ class RunService:
             conversation_id,
         )
 
+    async def list_permission_requests(
+        self, *, pending_only: bool = True
+    ) -> tuple[PermissionRecord, ...]:
+        await asyncio.to_thread(
+            self._conversation_store().expire_pending_permissions
+        )
+        return await asyncio.to_thread(
+            self._conversation_store().permission_requests,
+            pending_only=pending_only,
+            limit=64,
+        )
+
+    async def resolve_permission_request(
+        self, permission_id: str, decision: str
+    ) -> PermissionRecord:
+        if decision not in {"approve", "deny"}:
+            raise ValueError("invalid permission decision")
+        broker = self.capability_broker
+        if broker is None:
+            raise RuntimeError("capability broker is unavailable")
+        existing = await asyncio.to_thread(
+            self._conversation_store().get_permission_request,
+            permission_id,
+        )
+        try:
+            record = self.get(existing.run_id)
+        except KeyError:
+            mutation = await asyncio.to_thread(
+                self._conversation_store().resolve_permission_request,
+                permission_id,
+                "cancelled",
+                resolution_source="system",
+            )
+            return mutation.record
+        if record.terminal_kind is not None or record.cancel_requested:
+            mutation = await asyncio.to_thread(
+                self._conversation_store().resolve_permission_request,
+                permission_id,
+                "cancelled",
+                resolution_source="system",
+            )
+            return mutation.record
+        return await asyncio.to_thread(
+            broker.resolve,
+            permission_id,
+            decision,
+        )
+
+    async def capability_audit_events(
+        self, run_id: str, *, after_seq: int = 0, limit: int = 128
+    ) -> tuple[CapabilityAuditEvent, ...]:
+        return await asyncio.to_thread(
+            self._conversation_store().capability_audit_events,
+            run_id,
+            after_seq=after_seq,
+            limit=limit,
+        )
+
     async def delete_conversation(
         self, conversation_id: str
     ) -> ConversationDeleteResult:
@@ -677,11 +945,21 @@ class RunService:
         # so request cancellation cannot abandon a committed database delete
         # before the corresponding records have been retired.
         async with self._lock:
+            if self.subagent_coordinator is not None:
+                await self.subagent_coordinator.cleanup_conversation(
+                    self, conversation_id
+                )
+            if self.task_manager is not None:
+                await self.task_manager.cancel_conversation(conversation_id)
             result = await asyncio.to_thread(
                 self._conversation_store().delete_conversation,
                 conversation_id,
             )
             if result.deleted:
+                if self.task_store is not None:
+                    await asyncio.to_thread(
+                        self.task_store.delete_conversation, conversation_id
+                    )
                 retired: list[RunRecord] = []
                 for run_id in tuple(self.runs):
                     record = self.runs[run_id]
@@ -695,6 +973,9 @@ class RunService:
                     record.user_message = None
                     record.final_assistant_content = None
                     record.context_plan = None
+                    record.recovery_context_plan = None
+                    record.recovery_history = ()
+                    record.recovery_prompt_sources = None
                     record.open_blocks.clear()
                     record.seen_blocks.clear()
                     record.pending_tools.clear()
@@ -703,11 +984,82 @@ class RunService:
                     record.seen_tools.clear()
                     record.broker_pending_tool_calls.clear()
                     record.broker_tool_results.clear()
+                    record.file_read_receipts.clear()
                     retired.append(record)
                 for record in retired:
                     async with record.condition:
                         record.condition.notify_all()
         return result
+
+    def _task_services(self) -> tuple[BackgroundTaskManager, TaskStore]:
+        if self.task_manager is None or self.task_store is None:
+            raise RuntimeError("background Task service is unavailable")
+        return self.task_manager, self.task_store
+
+    async def submit_background_task(
+        self, run_id: str, arguments: dict[str, str] | None = None
+    ) -> TaskRecord:
+        """Detach one fixed, sandboxed command from an owned parent Run."""
+
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        manager, _store = self._task_services()
+        async with self._lock:
+            identity = await asyncio.to_thread(
+                self._conversation_store().resolve_run_identity, run_id
+            )
+            if identity.agent_id != self.agent_id:
+                raise KeyError("run not found")
+            return await manager.submit(
+                TaskParentIdentity(
+                    agent_id=identity.agent_id,
+                    conversation_id=identity.conversation_id,
+                    turn_id=identity.turn_id,
+                    run_id=identity.run_id,
+                ),
+                arguments,
+            )
+
+    async def list_background_tasks(self) -> tuple[TaskRecord, ...]:
+        _manager, store = self._task_services()
+        return await asyncio.to_thread(store.list)
+
+    async def get_background_task(self, task_id: str) -> TaskRecord:
+        _manager, store = self._task_services()
+        return await asyncio.to_thread(store.get, task_id)
+
+    async def background_task_notifications(
+        self, task_id: str
+    ) -> tuple[TaskNotification, ...]:
+        _manager, store = self._task_services()
+        return await asyncio.to_thread(store.notifications, task_id)
+
+    async def cancel_background_task(self, task_id: str) -> TaskRecord:
+        manager, store = self._task_services()
+        task = await asyncio.to_thread(store.get, task_id)
+        if (
+            task.command_id == "agent-delegate"
+            and self.subagent_coordinator is not None
+        ):
+            await self.subagent_coordinator.cancel_task(task_id)
+            return await asyncio.to_thread(store.get, task_id)
+        return await manager.cancel(task_id)
+
+    async def list_subagent_links(
+        self, conversation_id: str
+    ) -> tuple[tuple[SubagentLink, tuple[MailboxMessage, ...]], ...]:
+        if self.subagent_store is None:
+            raise RuntimeError("subagent store is unavailable")
+        links = await asyncio.to_thread(
+            self.subagent_store.list_for_conversation, conversation_id
+        )
+        records: list[tuple[SubagentLink, tuple[MailboxMessage, ...]]] = []
+        for link in links:
+            mailbox = await asyncio.to_thread(
+                self.subagent_store.mailbox, link.task_id
+            )
+            records.append((link, mailbox))
+        return tuple(records)
 
     async def start(self, command: StartRunCommand) -> RunRecord:
         command.validate()
@@ -791,9 +1143,32 @@ class RunService:
                 ConversationMessage(message.message_id, message.role, message.content)
                 for message in snapshot.committed_history
             )
-            effective_toolset = EffectiveToolSet.resolve(
-                self.tool_catalog, self.tool_policy
-            )
+            try:
+                selector = getattr(self.model_broker, "qualification_for", None)
+                if callable(selector):
+                    model_qualification = selector(command.model_id)
+                elif command.model_id is None and self.model_qualification is not None:
+                    # Narrow compatibility seam for deterministic test brokers;
+                    # the production OllamaBroker always owns a ModelCatalog.
+                    model_qualification = self.model_qualification
+                else:
+                    raise OllamaBrokerError(
+                        "model_rejected", "The model is not catalog-qualified."
+                    )
+            except OllamaBrokerError as exc:
+                raise ValueError("model is not available") from exc
+            if model_qualification.model_profile.supports_tools:
+                effective_toolset = EffectiveToolSet.resolve(
+                    self.tool_catalog, self.tool_policy
+                )
+            else:
+                effective_toolset = EffectiveToolSet.resolve(
+                    self.tool_catalog,
+                    ToolPolicy(
+                        revision="model-no-tools-v1",
+                        allowed_tool_ids=(),
+                    ),
+                )
             prompt_sources = await asyncio.to_thread(
                 collect_prompt_sources, self.capsule
             )
@@ -801,13 +1176,65 @@ class RunService:
                 raise asyncio.CancelledError
             context_plan = self.context_compiler.compile(
                 command.message,
-                model_profile=self.model_qualification.model_profile,
+                model_profile=model_qualification.model_profile,
                 tools=effective_toolset.specs,
                 agent_id=command.agent_id,
                 capsule_generation=self.capsule.generation,
                 history=context_history,
                 prompt_sources=prompt_sources,
+                force_compact=command.compact,
             )
+            if (
+                context_plan.windowing_strategy == "completed-turn-collapse-v2"
+                and context_plan.collapse_projection is not None
+                and getattr(self.model_broker, "semantic_summary_enabled", False)
+                and not request_cancelled.is_set()
+                and not self._closing
+            ):
+                collapsed_count = len(
+                    context_plan.collapse_projection.collapsed_message_ids
+                )
+                try:
+                    semantic_summary = await self.model_broker.summarize(
+                        context_history[:collapsed_count],
+                        model_id=(
+                            model_qualification.model_profile.catalog_model_id
+                            or model_qualification.model
+                        ),
+                        is_cancelled=lambda: (
+                            request_cancelled.is_set() or self._closing
+                        ),
+                    )
+                    context_plan = self.context_compiler.compile(
+                        command.message,
+                        model_profile=model_qualification.model_profile,
+                        tools=effective_toolset.specs,
+                        agent_id=command.agent_id,
+                        capsule_generation=self.capsule.generation,
+                        history=context_history,
+                        prompt_sources=prompt_sources,
+                        semantic_summary=semantic_summary,
+                        force_compact=command.compact,
+                    )
+                except (OllamaBrokerError, ContextPlanError):
+                    # Summary is an optional projection layer.  Its only safe
+                    # fallback is the already-verified deterministic collapse.
+                    LOGGER.info("semantic summary unavailable; using deterministic collapse")
+            recovery_context_plan: ContextPlan | None = None
+            if len(context_history) >= 4:
+                candidate_recovery = self.context_compiler.compile(
+                    command.message,
+                    model_profile=model_qualification.model_profile,
+                    tools=effective_toolset.specs,
+                    agent_id=command.agent_id,
+                    capsule_generation=self.capsule.generation,
+                    history=context_history,
+                    prompt_sources=prompt_sources,
+                    force_compact=True,
+                    collapse_to_recent=True,
+                )
+                if candidate_recovery.reference != context_plan.reference:
+                    recovery_context_plan = candidate_recovery
             runtime_snapshot = TurnRuntimeSnapshot.create(
                 context_plan=context_plan,
                 loop_limits=LoopLimits(
@@ -816,6 +1243,14 @@ class RunService:
                 ),
                 wall_timeout_seconds=RUN_WALL_TIMEOUT_SECONDS,
                 effective_toolset=effective_toolset,
+                projection_reason=(
+                    "manual_compact"
+                    if command.compact and context_plan.semantic_summary is not None
+                    else (
+                        "semantic_summary"
+                        if context_plan.semantic_summary is not None else "admission"
+                    )
+                ),
             )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
@@ -835,6 +1270,11 @@ class RunService:
             conversation_managed=True,
             conversation_revision=snapshot.revision,
             context_plan=context_plan,
+            recovery_context_plan=recovery_context_plan,
+            recovery_history=(context_history if recovery_context_plan is not None else ()),
+            recovery_prompt_sources=(
+                prompt_sources if recovery_context_plan is not None else None
+            ),
             effective_tools=effective_toolset.specs,
             runtime_snapshot=runtime_snapshot,
             deadline_at=(
@@ -932,13 +1372,19 @@ class RunService:
                 "durable",
                 {
                     "prototype": True,
-                    "model": self.model_qualification.model,
+                    "model": context_plan.model_profile.model,
+                    "model_id": (
+                        context_plan.model_profile.catalog_model_id
+                        or context_plan.model_profile.model
+                    ),
+                    "model_profile_digest": context_plan.model_profile.profile_digest,
                     "visible_tools": [
                         spec.tool_id for spec in record.effective_tools
                     ],
                     "protocol_features": [
                         "model-call-boundaries-v1",
                         "sequential-multi-tool-v1",
+                        "one-shot-overflow-recovery-v1",
                     ],
                     "sandbox": SANDBOX_POLICY,
                     "context_plan": context_plan.public_metadata(),
@@ -1028,6 +1474,12 @@ class RunService:
             return
         if record.terminal_kind is not None:
             return
+        # Permission invalidation is durable and precedes signalling the
+        # Worker.  No approval can therefore outlive an accepted cancellation.
+        await asyncio.to_thread(
+            self._conversation_store().cancel_pending_permissions_for_run,
+            run_id,
+        )
         if not record.cancel_requested:
             record.cancel_requested_at = asyncio.get_running_loop().time()
         record.cancel_requested = True
@@ -1219,6 +1671,24 @@ class RunService:
                         )
                     )
                 )
+                or (
+                    spec is not None
+                    and spec.tool_id
+                    in {
+                        "file/stat", "file/read_text", "file/glob", "file/grep",
+                        "file/edit", "file/write",
+                        "agent/delegate",
+                    }
+                    and not (
+                        record.brokered_capability_results.get(str(call_id))
+                        == (str(payload.get("outcome")), str(validated_result))
+                        or (
+                            payload.get("outcome") == "cancelled"
+                            and record.cancel_requested
+                            and validated_result == "cancelled"
+                        )
+                    )
+                )
             ):
                 raise ValueError("invalid tool call finish")
         elif kind == "run.completed":
@@ -1285,12 +1755,24 @@ class RunService:
             tool_id = record.pending_tools.get(call_id)
             if tool_id is None:
                 raise RuntimeError("Tool result lost its pending call")
+            spec = next(
+                (item for item in record.effective_tools if item.tool_id == tool_id),
+                None,
+            )
+            if spec is None:
+                raise RuntimeError("Tool result lost its frozen specification")
+            projection = project_tool_result(spec, call_id, payload["result"])
             record.broker_tool_results.append(
                 OllamaToolResult(
                     call_id=call_id,
                     tool_id=tool_id,
-                    content=str(payload["result"]),
+                    content=projection.content,
                     outcome=str(payload["outcome"]),
+                    original_bytes=projection.original_bytes,
+                    content_digest=projection.content_digest,
+                    truncated=projection.truncated,
+                    truncation_reason=projection.truncation_reason,
+                    projection_digest=projection.projection_digest,
                 )
             )
             record.pending_tools.pop(call_id, None)
@@ -1409,6 +1891,10 @@ class RunService:
         record.live_event_bytes += encoded_size
         if kind in TERMINAL_KINDS:
             record.terminal_kind = kind
+            record.recovery_context_plan = None
+            record.recovery_history = ()
+            record.recovery_prompt_sources = None
+            record.file_read_receipts.clear()
         async with record.condition:
             record.condition.notify_all()
         return envelope
@@ -1514,7 +2000,6 @@ class RunService:
             (kind == "model.request.started" and provider_usage_start is None)
             or (
                 kind == "model.response.finished"
-                and payload.get("usage_complete") is True
                 and provider_usage_complete is None
             )
             or (
@@ -1580,6 +2065,15 @@ class RunService:
                     raise RuntimeError("conversation store is unavailable")
                 if record.conversation_revision is None:
                     raise RuntimeError("conversation revision is unavailable")
+                if record.runtime_snapshot is None:
+                    raise RuntimeError("Turn runtime snapshot is unavailable")
+                context_projection = ContextProjectionBoundary.create(
+                    record.runtime_snapshot,
+                    conversation_id=record.conversation_id,
+                    turn_id=record.turn_id,
+                    run_id=record.run_id,
+                    conversation_revision=record.conversation_revision,
+                )
                 await asyncio.to_thread(
                     self.conversations.begin_turn,
                     record.conversation_id,
@@ -1588,6 +2082,7 @@ class RunService:
                     user_content=record.user_message,
                     expected_revision=record.conversation_revision,
                     started_event=envelope,
+                    context_projection=context_projection,
                 )
             elif record.conversation_managed and provider_usage_start is not None:
                 if self.conversations is None:
@@ -1643,6 +2138,10 @@ class RunService:
             record.durable_event_bytes += encoded_size
         if kind in TERMINAL_KINDS:
             record.terminal_kind = kind
+            record.recovery_context_plan = None
+            record.recovery_history = ()
+            record.recovery_prompt_sources = None
+            record.file_read_receipts.clear()
         async with record.condition:
             record.condition.notify_all()
         return envelope
@@ -1751,6 +2250,403 @@ class RunService:
         stream.write(encoded)
         await stream.drain()
 
+    @staticmethod
+    async def _write_capability_response(
+        stream: asyncio.StreamWriter,
+        *,
+        request_id: str,
+        call_id: str,
+        tool_id: str,
+        outcome: str,
+        content: str,
+    ) -> None:
+        value = {
+            "internal": "capability.response",
+            "version": BROKER_PROTOCOL_VERSION,
+            "request_id": request_id,
+            "type": "result",
+            "call_id": call_id,
+            "tool_id": tool_id,
+            "outcome": outcome,
+            "content": content,
+        }
+        encoded = (
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+        if len(encoded) > MAX_BROKER_FRAME_BYTES:
+            raise RuntimeError("capability response IPC frame exceeded its limit")
+        stream.write(encoded)
+        await stream.drain()
+
+    async def _serve_capability_request(
+        self,
+        *,
+        record: RunRecord,
+        stream: asyncio.StreamWriter,
+        value: dict[str, Any],
+    ) -> None:
+        if set(value) != {
+            "internal", "version", "request_id", "call_id", "tool_id", "arguments"
+        }:
+            raise ValueError("Worker capability request is invalid")
+        request_id = value.get("request_id")
+        call_id = value.get("call_id")
+        tool_id = value.get("tool_id")
+        arguments = value.get("arguments")
+        spec = self._effective_tool(record, tool_id)
+        try:
+            validated = spec.validate_arguments(arguments) if spec is not None else None
+        except ValueError:
+            validated = None
+        if (
+            value.get("internal") != "capability.request"
+            or value.get("version") != BROKER_PROTOCOL_VERSION
+            or not self._worker_id(request_id)
+            or not self._worker_id(call_id)
+            or tool_id not in {
+                "file/stat", "file/read_text", "file/glob", "file/grep",
+                "file/edit", "file/write", "exec/run", "extension/call", "skill/run",
+                "agent/delegate",
+            }
+            or spec is None
+            or validated is None
+            or record.pending_tools.get(str(call_id)) != tool_id
+            or call_id not in record.started_tools
+            or record.pending_tool_arguments.get(str(call_id)) != validated
+            or record.broker_pending_tool_calls.get(str(call_id))
+            != (tool_id, validated)
+            or call_id in record.brokered_capability_calls
+            or self.capability_broker is None
+            or self.file_read_executor is None
+            or self.file_search_executor is None
+            or self.file_mutation_executor is None
+            or self.command_executor is None
+            or self.capsule is None
+        ):
+            raise ValueError("Worker capability request is invalid")
+        assert isinstance(request_id, str)
+        assert isinstance(call_id, str)
+        assert isinstance(tool_id, str)
+        record.brokered_capability_calls.add(call_id)
+        now_milliseconds = int(time.time() * 1000)
+        capability_arguments: object = validated
+        executor = None
+        if tool_id in {"file/edit", "file/write"}:
+            try:
+                capability_arguments, capability_preview = (
+                    self.file_mutation_executor.prepare(
+                        tool_id,
+                        validated,
+                        record.file_read_receipts,
+                    )
+                )
+            except FileWriteError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "File mutation preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="File mutation preparation failed closed.",
+                )
+                return
+            executor = self.file_mutation_executor
+        elif tool_id == "exec/run":
+            try:
+                capability_arguments, capability_preview, executor = (
+                    self.command_executor.prepare(
+                        validated,
+                        self.capsule.runtime_root / "runs" / record.run_id,
+                    )
+                )
+            except CommandExecutionError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "Command preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="Command preparation failed closed.",
+                )
+                return
+        elif tool_id == "extension/call":
+            if self.extension_executor is None:
+                raise RuntimeError("extension executor is unavailable")
+            try:
+                capability_arguments, capability_preview, executor = (
+                    self.extension_executor.prepare(validated)
+                )
+            except ExtensionError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "Extension preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="Extension preparation failed closed.",
+                )
+                return
+        elif tool_id == "skill/run":
+            if self.skill_executor is None:
+                raise RuntimeError("Skill executor is unavailable")
+            try:
+                capability_arguments, capability_preview, executor = (
+                    self.skill_executor.prepare(
+                        validated,
+                        self.capsule.runtime_root / "runs" / record.run_id,
+                    )
+                )
+            except SkillError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "Skill preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="Skill preparation failed closed.",
+                )
+                return
+        elif tool_id == "agent/delegate":
+            if self.subagent_coordinator is None:
+                raise RuntimeError("subagent coordinator is unavailable")
+            try:
+                capability_arguments, capability_preview, executor = (
+                    self.subagent_coordinator.prepare(
+                        self,
+                        TaskParentIdentity(
+                            agent_id=record.agent_id,
+                            conversation_id=record.conversation_id,
+                            turn_id=record.turn_id,
+                            run_id=record.run_id,
+                        ),
+                        validated,
+                    )
+                )
+            except SubagentError:
+                record.brokered_capability_results[call_id] = (
+                    "failed",
+                    "Subagent delegation preparation failed closed.",
+                )
+                await self._write_capability_response(
+                    stream,
+                    request_id=request_id,
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    outcome="failed",
+                    content="Subagent delegation preparation failed closed.",
+                )
+                return
+        else:
+            target_preview = json.dumps(
+                str(validated.get("path", validated.get("pattern", ""))),
+                ensure_ascii=True,
+            )
+            capability_preview = f"Use {tool_id} in workspace target {target_preview}"
+        capability_request = CapabilityRequest.create(
+            agent_id=record.agent_id,
+            capsule_generation=self.capsule.generation,
+            conversation_id=record.conversation_id,
+            run_id=record.run_id,
+            call_id=call_id,
+            capability_id=tool_id,
+            toolset_digest=self.effective_toolset.toolset_digest,
+            policy_digest=self.capability_policy.digest,
+            arguments=capability_arguments,
+            preview=capability_preview,
+            expires_at_milliseconds=now_milliseconds + 30_000,
+            now_milliseconds=now_milliseconds,
+        )
+        try:
+            permission = await asyncio.to_thread(
+                self.capability_broker.request,
+                capability_request,
+                turn_id=record.turn_id,
+                interactive=tool_id in {
+                    "agent/delegate", "file/edit", "file/write", "exec/run", "extension/call", "skill/run"
+                },
+            )
+            while permission.status == "pending":
+                if (
+                    record.cancel_requested
+                    or self._closing
+                    or int(time.time() * 1000)
+                    >= permission.expires_at_milliseconds
+                    or (
+                        record.deadline_at is not None
+                        and asyncio.get_running_loop().time() >= record.deadline_at
+                    )
+                ):
+                    await asyncio.to_thread(
+                        self.conversations.expire_pending_permissions,
+                        int(time.time() * 1000),
+                    )
+                    permission = await asyncio.to_thread(
+                        self.conversations.get_permission_request,
+                        permission.permission_id,
+                    )
+                    break
+                await asyncio.sleep(0.05)
+                permission = await asyncio.to_thread(
+                    self.conversations.get_permission_request,
+                    permission.permission_id,
+                )
+            if executor is None:
+                executor = (
+                    self.file_search_executor
+                    if tool_id in {"file/glob", "file/grep"}
+                    else self.file_read_executor
+                )
+            execution = await asyncio.to_thread(
+                self.capability_broker.execute,
+                permission.permission_id,
+                capability_request,
+                executor,
+                turn_id=record.turn_id,
+                cancelled=lambda: record.cancel_requested,
+            )
+            if execution.status == "succeeded" and execution.result is not None:
+                outcome = "succeeded"
+                content = spec.validate_result(execution.result)
+                if tool_id == "file/read_text":
+                    try:
+                        result_value = json.loads(content)
+                        receipt = FullReadReceipt.from_result(result_value)
+                    except (json.JSONDecodeError, FileWriteError):
+                        pass
+                    else:
+                        record.file_read_receipts[receipt.path] = receipt
+            elif execution.status == "cancelled" or record.cancel_requested:
+                outcome = "cancelled"
+                content = "cancelled"
+            elif execution.status == "outcome_unknown":
+                outcome = "failed"
+                content = "Capability outcome is unknown; it was not replayed."
+            else:
+                outcome = "failed"
+                content = "Capability failed closed."
+        except ConversationConflictError:
+            outcome = "cancelled" if record.cancel_requested else "failed"
+            content = "cancelled" if record.cancel_requested else "Capability failed closed."
+        record.brokered_capability_results[call_id] = (outcome, content)
+        await self._write_capability_response(
+            stream,
+            request_id=request_id,
+            call_id=call_id,
+            tool_id=tool_id,
+            outcome=outcome,
+            content=content,
+        )
+
+    async def _activate_overflow_recovery(
+        self,
+        *,
+        record: RunRecord,
+        session: OllamaRunSession,
+        iteration: int,
+        recovery_id: str,
+        overflow_code: str,
+    ) -> ContextPlan:
+        """Install the sole pre-admitted recovery projection for one Run."""
+
+        current = record.context_plan
+        recovery = record.recovery_context_plan
+        runtime = record.runtime_snapshot
+        if (
+            record.overflow_recovery_count != 0
+            or current is None
+            or recovery is None
+            or runtime is None
+            or overflow_code not in {
+                "model_context_overflow",
+                "model_media_overflow",
+            }
+            or record.cancel_requested
+            or (
+                record.deadline_at is not None
+                and asyncio.get_running_loop().time() >= record.deadline_at
+            )
+        ):
+            raise OllamaBrokerError(
+                "model_recovery_unavailable",
+                "A bounded overflow recovery projection is unavailable.",
+            )
+        effective_toolset = EffectiveToolSet(
+            specs=recovery.tools,
+            catalog_digest=runtime.tool_catalog_digest,
+            policy_digest=runtime.tool_policy_digest,
+            toolset_digest=recovery.reference.toolset_digest,
+        )
+        recovery_runtime = TurnRuntimeSnapshot.create(
+            context_plan=recovery,
+            loop_limits=runtime.loop_limits,
+            wall_timeout_seconds=runtime.wall_timeout_seconds,
+            effective_toolset=effective_toolset,
+            projection_reason=(
+                "semantic_summary"
+                if recovery.semantic_summary is not None
+                else "admission"
+            ),
+        )
+        if self.conversations is None:
+            raise RuntimeError("conversation store is unavailable")
+        previous_boundary = await asyncio.to_thread(
+            self.conversations.read_context_projection_boundary,
+            record.run_id,
+        )
+        if previous_boundary is None:
+            raise RuntimeError("context projection boundary is unavailable")
+        recovery_boundary = ContextProjectionBoundary.create(
+            recovery_runtime,
+            conversation_id=record.conversation_id,
+            turn_id=record.turn_id,
+            run_id=record.run_id,
+            conversation_revision=record.conversation_revision or 0,
+        )
+        session.install_recovery_context(recovery)
+        await asyncio.to_thread(
+            self.conversations.replace_context_projection_boundary,
+            recovery_boundary,
+            expected_boundary_digest=previous_boundary.boundary_digest,
+        )
+        await self._publish(
+            record,
+            "model.recovery.started",
+            "durable",
+            {
+                "recovery_id": recovery_id,
+                "iteration": iteration,
+                "attempt": 1,
+                "overflow_code": overflow_code,
+                "from_context_plan_id": current.reference.plan_id,
+                "from_context_plan_digest": current.reference.digest,
+                "to_context_plan_id": recovery.reference.plan_id,
+                "to_context_plan_digest": recovery.reference.digest,
+                "boundary_digest": recovery_boundary.boundary_digest,
+            },
+        )
+        record.overflow_recovery_count = 1
+        record.model_usage["complete"] = False
+        return recovery
+
     async def _serve_model_request(
         self,
         *,
@@ -1801,242 +2697,287 @@ class RunService:
             b"agent-builder-model-profile-v1\0" + profile_payload
         ).hexdigest()
 
-        request_started = False
-        response_finished = False
+        recovery_id = hashlib.sha256(
+            b"agent-builder-overflow-recovery-v1\0"
+            + record.run_id.encode("ascii")
+            + b"\0"
+            + str(expected_iteration).encode("ascii")
+        ).hexdigest()[:32]
+        active_context_plan = context_plan
 
-        async def observe_request(metadata: OllamaRequestMetadata) -> None:
-            nonlocal request_started
-            if (
-                not isinstance(metadata, OllamaRequestMetadata)
-                or request_started
-                or metadata.iteration != expected_iteration
-                or not 1 <= metadata.message_count <= 256
-                or not 0 <= metadata.tool_count <= len(record.effective_tools)
-                or not 1
-                <= metadata.estimated_input_tokens
-                <= context_plan.policy.hard_input_tokens
-                or not 1
-                <= metadata.request_bytes
-                <= context_plan.model_profile.request_byte_budget
-                or re.fullmatch(r"[a-f0-9]{64}", metadata.request_digest) is None
-                or metadata.tool_count
-                != (
-                    len(context_plan.tools)
-                    if len(trusted_result_call_ids)
-                    < record.runtime_snapshot.loop_limits.max_tool_calls
-                    else 0
-                )
-            ):
-                raise RuntimeError("trusted model request metadata is invalid")
-            await self._publish(
-                record,
-                "model.request.started",
-                "durable",
-                {
-                    "request_id": request_id,
-                    "iteration": expected_iteration,
-                    "context_plan_id": context_plan.reference.plan_id,
-                    "context_plan_digest": context_plan.reference.digest,
-                    "request_digest": metadata.request_digest,
-                    "request_bytes": metadata.request_bytes,
-                    "estimated_input_tokens": metadata.estimated_input_tokens,
-                    "message_count": metadata.message_count,
-                    "tool_count": metadata.tool_count,
-                    "tool_result_call_ids": list(trusted_result_call_ids),
-                },
-                provider_usage_start={
-                    "call_index": expected_iteration,
-                    "provider": context_plan.model_profile.provider,
-                    "model": context_plan.model_profile.model,
-                    "profile_digest": profile_digest,
-                    "context_plan_id": context_plan.reference.plan_id,
-                    "estimated_input_tokens": metadata.estimated_input_tokens,
-                    "hard_input_tokens": context_plan.policy.hard_input_tokens,
-                },
+        for attempt in range(2):
+            request_started = False
+            response_finished = False
+            provider_call_index = record.provider_call_count + 1
+            attempt_request_id = (
+                request_id if attempt == 0 else f"{request_id}-recovery-1"
             )
-            request_started = True
-            record.model_request_count = expected_iteration
-            record.broker_stop_iteration = None
-            record.model_failure = None
-            record.model_usage["complete"] = False
 
-        async def finish_response(
-            outcome: str,
-            *,
-            input_tokens: int,
-            output_tokens: int,
-            usage_complete: bool,
-            error_code: str | None,
-        ) -> None:
-            nonlocal response_finished
-            if not request_started or response_finished:
-                raise RuntimeError("model response boundary is out of sequence")
-            await self._publish(
-                record,
-                "model.response.finished",
-                "durable",
-                {
-                    "request_id": request_id,
-                    "iteration": expected_iteration,
-                    "outcome": outcome,
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "usage_complete": usage_complete,
-                    "error_code": error_code,
-                },
-                provider_usage_complete=(
+            async def observe_request(metadata: OllamaRequestMetadata) -> None:
+                nonlocal request_started
+                runtime_snapshot = record.runtime_snapshot
+                if (
+                    not isinstance(metadata, OllamaRequestMetadata)
+                    or request_started
+                    or runtime_snapshot is None
+                    or metadata.iteration != expected_iteration
+                    or not 1 <= metadata.message_count <= 256
+                    or not 0 <= metadata.tool_count <= len(record.effective_tools)
+                    or not 1
+                    <= metadata.estimated_input_tokens
+                    <= active_context_plan.policy.hard_input_tokens
+                    or not 1
+                    <= metadata.request_bytes
+                    <= active_context_plan.model_profile.request_byte_budget
+                    or re.fullmatch(r"[a-f0-9]{64}", metadata.request_digest) is None
+                    or metadata.tool_count
+                    != (
+                        len(active_context_plan.tools)
+                        if len(trusted_result_call_ids)
+                        < runtime_snapshot.loop_limits.max_tool_calls
+                        else 0
+                    )
+                ):
+                    raise RuntimeError("trusted model request metadata is invalid")
+                await self._publish(
+                    record,
+                    "model.request.started",
+                    "durable",
                     {
-                        "call_index": expected_iteration,
+                        "request_id": attempt_request_id,
+                        "iteration": expected_iteration,
+                        "attempt": attempt,
+                        "recovery_id": recovery_id if attempt else None,
+                        "provider_call_index": provider_call_index,
+                        "context_plan_id": active_context_plan.reference.plan_id,
+                        "context_plan_digest": active_context_plan.reference.digest,
+                        "request_digest": metadata.request_digest,
+                        "request_bytes": metadata.request_bytes,
+                        "estimated_input_tokens": metadata.estimated_input_tokens,
+                        "message_count": metadata.message_count,
+                        "tool_count": metadata.tool_count,
+                        "tool_result_call_ids": list(trusted_result_call_ids),
+                    },
+                    provider_usage_start={
+                        "call_index": provider_call_index,
+                        "provider": active_context_plan.model_profile.provider,
+                        "model": active_context_plan.model_profile.model,
+                        "profile_digest": profile_digest,
+                        "context_plan_id": active_context_plan.reference.plan_id,
+                        "estimated_input_tokens": metadata.estimated_input_tokens,
+                        "hard_input_tokens": active_context_plan.policy.hard_input_tokens,
+                    },
+                )
+                request_started = True
+                record.provider_call_count = provider_call_index
+                record.model_request_count = expected_iteration
+                record.broker_stop_iteration = None
+                record.model_failure = None
+                record.model_usage["complete"] = False
+
+            async def finish_response(
+                outcome: str,
+                *,
+                input_tokens: int,
+                output_tokens: int,
+                usage_complete: bool,
+                error_code: str | None,
+            ) -> None:
+                nonlocal response_finished
+                if not request_started or response_finished:
+                    raise RuntimeError("model response boundary is out of sequence")
+                await self._publish(
+                    record,
+                    "model.response.finished",
+                    "durable",
+                    {
+                        "request_id": attempt_request_id,
+                        "iteration": expected_iteration,
+                        "attempt": attempt,
+                        "recovery_id": recovery_id if attempt else None,
+                        "provider_call_index": provider_call_index,
+                        "outcome": outcome,
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
-                    }
-                    if usage_complete
-                    else None
-                ),
-            )
-            response_finished = True
-            record.model_response_count = expected_iteration
+                        "usage_complete": usage_complete,
+                        "error_code": error_code,
+                    },
+                    provider_usage_complete={
+                        "call_index": provider_call_index,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                )
+                response_finished = True
+                record.model_response_count = expected_iteration
 
-        saw_terminal_frame = False
-        trusted_content: list[str] = []
-        model_frames: AsyncIterator[Any] | None = None
-        try:
-            model_frames = session.stream_turn(
-                user_message,
-                tuple(record.broker_tool_results),
-                lambda: record.cancel_requested,
-                observe_request,
-            )
-            async for frame in model_frames:
-                if frame.kind == "content":
-                    if set(frame.payload) != {"text"}:
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Invalid normalized content frame."
+            saw_terminal_frame = False
+            trusted_content: list[str] = []
+            model_frames: AsyncIterator[Any] | None = None
+            try:
+                model_frames = session.stream_turn(
+                    user_message,
+                    tuple(record.broker_tool_results),
+                    lambda: record.cancel_requested,
+                    observe_request,
+                )
+                async for frame in model_frames:
+                    if frame.kind == "content":
+                        if set(frame.payload) != {"text"}:
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized content frame.",
+                            )
+                        await self._write_model_response(
+                            stream,
+                            request_id,
+                            "content",
+                            text=frame.payload["text"],
                         )
-                    await self._write_model_response(
-                        stream,
-                        request_id,
-                        "content",
-                        text=frame.payload["text"],
-                    )
-                    trusted_content.append(str(frame.payload["text"]))
-                elif frame.kind == "tool.use":
-                    if set(frame.payload) != {
-                        "call_id",
-                        "tool_id",
-                        "arguments",
-                        "usage",
-                    }:
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Invalid normalized Tool frame."
+                        trusted_content.append(str(frame.payload["text"]))
+                    elif frame.kind == "tool.use":
+                        if set(frame.payload) != {
+                            "call_id",
+                            "tool_id",
+                            "arguments",
+                            "usage",
+                        }:
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized Tool frame.",
+                            )
+                        call_id = frame.payload.get("call_id")
+                        tool_id = frame.payload.get("tool_id")
+                        spec = self._effective_tool(record, tool_id)
+                        try:
+                            arguments = (
+                                spec.validate_arguments(frame.payload.get("arguments"))
+                                if spec is not None
+                                else None
+                            )
+                        except ValueError as exc:
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized Tool call.",
+                            ) from exc
+                        if (
+                            not self._worker_id(call_id)
+                            or spec is None
+                            or arguments is None
+                            or call_id in record.seen_tools
+                            or call_id in record.broker_pending_tool_calls
+                            or record.pending_tools
+                        ):
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized Tool call.",
+                            )
+                        prompt_tokens, output_tokens = self._validated_model_usage(
+                            record, frame.payload["usage"]
                         )
-                    call_id = frame.payload.get("call_id")
-                    tool_id = frame.payload.get("tool_id")
-                    spec = self._effective_tool(record, tool_id)
-                    try:
-                        arguments = (
-                            spec.validate_arguments(frame.payload.get("arguments"))
-                            if spec is not None
-                            else None
+                        await finish_response(
+                            "tool_use",
+                            input_tokens=prompt_tokens,
+                            output_tokens=output_tokens,
+                            usage_complete=True,
+                            error_code=None,
                         )
-                    except ValueError as exc:
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Invalid normalized Tool call."
-                        ) from exc
-                    if (
-                        not self._worker_id(call_id)
-                        or spec is None
-                        or arguments is None
-                        or call_id in record.seen_tools
-                        or call_id in record.broker_pending_tool_calls
-                        or record.pending_tools
-                    ):
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Invalid normalized Tool call."
+                        self._apply_validated_model_usage(
+                            record, prompt_tokens, output_tokens
                         )
-                    prompt_tokens, output_tokens = self._validated_model_usage(
-                        record, frame.payload["usage"]
-                    )
-                    await finish_response(
-                        "tool_use",
-                        input_tokens=prompt_tokens,
-                        output_tokens=output_tokens,
-                        usage_complete=True,
-                        error_code=None,
-                    )
-                    self._apply_validated_model_usage(
-                        record, prompt_tokens, output_tokens
-                    )
-                    assert isinstance(call_id, str)
-                    record.broker_pending_tool_calls[call_id] = (
-                        spec.tool_id,
-                        arguments,
-                    )
-                    saw_terminal_frame = True
-                    await self._write_model_response(
-                        stream,
-                        request_id,
-                        "tool.use",
-                        call_id=call_id,
-                        tool_id=spec.tool_id,
-                        arguments=arguments,
-                    )
-                elif frame.kind == "stop":
-                    if set(frame.payload) != {"reason", "usage"}:
-                        raise OllamaBrokerError(
-                            "model_protocol_error", "Invalid normalized stop frame."
+                        assert isinstance(call_id, str)
+                        record.broker_pending_tool_calls[call_id] = (
+                            spec.tool_id,
+                            arguments,
                         )
-                    prompt_tokens, output_tokens = self._validated_model_usage(
-                        record, frame.payload["usage"]
-                    )
-                    await finish_response(
-                        "end_turn",
-                        input_tokens=prompt_tokens,
-                        output_tokens=output_tokens,
-                        usage_complete=True,
-                        error_code=None,
-                    )
-                    self._apply_validated_model_usage(
-                        record, prompt_tokens, output_tokens
-                    )
-                    record.broker_stop_iteration = expected_iteration
-                    record.final_assistant_content = "".join(trusted_content)
-                    saw_terminal_frame = True
-                    await self._write_model_response(
-                        stream,
-                        request_id,
-                        "stop",
-                        reason=frame.payload["reason"],
-                    )
-                else:
+                        saw_terminal_frame = True
+                        await self._write_model_response(
+                            stream,
+                            request_id,
+                            "tool.use",
+                            call_id=call_id,
+                            tool_id=spec.tool_id,
+                            arguments=arguments,
+                        )
+                    elif frame.kind == "stop":
+                        if set(frame.payload) != {"reason", "usage"}:
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized stop frame.",
+                            )
+                        prompt_tokens, output_tokens = self._validated_model_usage(
+                            record, frame.payload["usage"]
+                        )
+                        await finish_response(
+                            "end_turn",
+                            input_tokens=prompt_tokens,
+                            output_tokens=output_tokens,
+                            usage_complete=True,
+                            error_code=None,
+                        )
+                        self._apply_validated_model_usage(
+                            record, prompt_tokens, output_tokens
+                        )
+                        record.broker_stop_iteration = expected_iteration
+                        record.final_assistant_content = "".join(trusted_content)
+                        saw_terminal_frame = True
+                        await self._write_model_response(
+                            stream,
+                            request_id,
+                            "stop",
+                            reason=frame.payload["reason"],
+                        )
+                    else:
+                        raise OllamaBrokerError(
+                            "model_protocol_error",
+                            "Unknown normalized model frame.",
+                        )
+                if not saw_terminal_frame:
                     raise OllamaBrokerError(
-                        "model_protocol_error", "Unknown normalized model frame."
+                        "model_protocol_error", "Model stream had no terminal frame."
                     )
-            if not saw_terminal_frame:
-                raise OllamaBrokerError(
-                    "model_protocol_error", "Model stream had no terminal frame."
+                return
+            except (OllamaCancelledError, OllamaBrokerError) as exc:
+                if request_started and not response_finished:
+                    await finish_response(
+                        "cancelled"
+                        if isinstance(exc, OllamaCancelledError)
+                        else "error",
+                        input_tokens=0,
+                        output_tokens=0,
+                        usage_complete=False,
+                        error_code=exc.code,
+                    )
+                can_recover = (
+                    attempt == 0
+                    and not trusted_content
+                    and exc.code
+                    in {"model_context_overflow", "model_media_overflow"}
                 )
-        except (OllamaCancelledError, OllamaBrokerError) as exc:
-            record.model_failure = (exc.code, exc.retryable)
-            if request_started and not response_finished:
-                await finish_response(
-                    "cancelled"
-                    if isinstance(exc, OllamaCancelledError)
-                    else "error",
-                    input_tokens=0,
-                    output_tokens=0,
-                    usage_complete=False,
-                    error_code=exc.code,
+                if can_recover:
+                    try:
+                        active_context_plan = await self._activate_overflow_recovery(
+                            record=record,
+                            session=session,
+                            iteration=expected_iteration,
+                            recovery_id=recovery_id,
+                            overflow_code=exc.code,
+                        )
+                    except (OllamaBrokerError, RuntimeError):
+                        can_recover = False
+                if can_recover:
+                    continue
+                record.model_failure = (exc.code, exc.retryable)
+                await self._write_model_response(
+                    stream,
+                    request_id,
+                    "error",
+                    code=exc.code,
                 )
-            await self._write_model_response(
-                stream,
-                request_id,
-                "error",
-                code=exc.code,
-            )
-        finally:
-            if model_frames is not None:
-                await model_frames.aclose()
+                return
+            finally:
+                if model_frames is not None:
+                    await model_frames.aclose()
 
     @staticmethod
     def _validated_model_usage(
@@ -2120,7 +3061,7 @@ class RunService:
         record.model_usage["input_tokens"] = input_total
         record.model_usage["output_tokens"] = output_total
         record.model_usage["last_input_tokens"] = prompt_tokens
-        record.model_usage["complete"] = True
+        record.model_usage["complete"] = record.overflow_recovery_count == 0
 
     @classmethod
     def _apply_model_usage(cls, record: RunRecord, value: object) -> None:
@@ -2285,6 +3226,13 @@ class RunService:
                                     user_message=message,
                                     value=raw,
                                     expected_iteration=model_requests,
+                                )
+                                continue
+                            if raw.get("internal") == "capability.request":
+                                await self._serve_capability_request(
+                                    record=record,
+                                    stream=process.stdin,
+                                    value=raw,
                                 )
                                 continue
                             if "internal" in raw:

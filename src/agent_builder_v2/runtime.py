@@ -63,7 +63,7 @@ class TurnRuntimeSnapshot:
             or isinstance(self.wall_timeout_seconds, bool)
             or not 1 <= self.wall_timeout_seconds <= 3_600
             or self.projection_reason not in {
-                "admission", "manual_compact", "semantic_summary"
+                "admission", "manual_compact", "semantic_summary", "overflow_recovery"
             }
         ):
             raise ValueError("invalid Turn runtime snapshot")

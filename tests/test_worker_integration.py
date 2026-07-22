@@ -10,31 +10,44 @@ from pathlib import Path
 import pytest
 
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
-from agent_builder_v2.context import ContextPlan, ModelProfile
+from agent_builder_v2.context import (
+    CONTEXT_RENDERER_VERSION,
+    PROMPT_SECTION_REGISTRY_VERSION,
+    ContextPlan,
+    ModelProfile,
+)
 from agent_builder_v2.contracts import TERMINAL_KINDS, StartRunCommand
 from agent_builder_v2.control import RunService
 from agent_builder_v2.context_projection import ContextProjectionBoundary
 from agent_builder_v2.ollama import (
+    OUTPUT_TRUNCATION_MARKER,
     OllamaBrokerError,
     OllamaCancelledError,
     OllamaFrame,
     OllamaQualification,
     OllamaRequestMetadata,
     OllamaToolResult,
+    OllamaTransportAttempt,
 )
 from agent_builder_v2.query_engine import QueryEngineRegistry, QueryEngineRetiredError
 from agent_builder_v2.sessions import (
     ConversationConflictError,
     ConversationNotFoundError,
 )
+from agent_builder_v2.semantic_summary import SemanticSummaryContent
+from agent_builder_v2.semantic_summary_v2 import SemanticSummaryV2Snapshot
+from agent_builder_v2.tools import toolset_digest
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
 class _FakeModelSession:
-    def __init__(self, context_plan: ContextPlan) -> None:
+    def __init__(
+        self, context_plan: ContextPlan, *, emit_transport_attempts: bool = False
+    ) -> None:
         self.context_plan = context_plan
+        self.emit_transport_attempts = emit_transport_attempts
 
     async def stream_turn(
         self,
@@ -42,6 +55,7 @@ class _FakeModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
         iteration = len(tool_results) + 1
         if on_request is not None:
@@ -51,12 +65,38 @@ class _FakeModelSession:
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=(
                         self.context_plan.estimated_input_tokens
                         + (123 if iteration == 2 else 0)
                     ),
                     request_bytes=512 + 64 * len(tool_results),
                     request_digest=("c" if iteration == 1 else "d") * 64,
+                )
+            )
+        if self.emit_transport_attempts and on_transport_attempt is not None:
+            await on_transport_attempt(  # type: ignore[operator]
+                OllamaTransportAttempt(
+                    attempt=1,
+                    max_attempts=2,
+                    phase="attempt_started",
+                    outcome=None,
+                    elapsed_ms=0,
+                    first_frame_ms=None,
+                )
+            )
+            first_frame_ms = 12 + iteration
+            await on_transport_attempt(  # type: ignore[operator]
+                OllamaTransportAttempt(
+                    attempt=1,
+                    max_attempts=2,
+                    phase="attempt_finished",
+                    outcome="first_frame_received",
+                    elapsed_ms=first_frame_ms,
+                    first_frame_ms=first_frame_ms,
                 )
             )
         if not tool_results:
@@ -121,6 +161,79 @@ class _FakeModelBroker:
         return None
 
 
+class _TransportModelBroker(_FakeModelBroker):
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _FakeModelSession:
+        assert max_tool_calls == 2
+        assert context_plan.model_profile == self.qualification.model_profile
+        self.plans.append(context_plan)
+        return _FakeModelSession(context_plan, emit_transport_attempts=True)
+
+
+class _SummaryV2ModelBroker(_FakeModelBroker):
+    semantic_summary_enabled = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.summary_calls: list[dict[str, object]] = []
+
+    async def summarize_v2(
+        self,
+        source: tuple[object, ...],
+        *,
+        aggregate_source: tuple[object, ...] | None = None,
+        parent: SemanticSummaryV2Snapshot | None = None,
+        model_id: str | None = None,
+        is_cancelled: object = None,
+    ) -> SemanticSummaryV2Snapshot:
+        del model_id, is_cancelled
+        aggregate = aggregate_source or source
+        self.summary_calls.append({
+            "delta": tuple(item.turn_id for item in source),
+            "aggregate": tuple(item.turn_id for item in aggregate),
+            "parent": parent.snapshot_digest if parent is not None else None,
+        })
+        return SemanticSummaryV2Snapshot.create(
+            source_bundles=aggregate,  # type: ignore[arg-type]
+            parent_snapshot_digest=(
+                parent.snapshot_digest if parent is not None else None
+            ),
+            model_profile_digest=self.qualification.model_profile.profile_digest,
+            renderer_version=CONTEXT_RENDERER_VERSION,
+            section_registry_version=PROMPT_SECTION_REGISTRY_VERSION,
+            content=SemanticSummaryContent(
+                facts=("summary-v2-fact",),
+                open_tasks=("continue",),
+            ),
+            provider_request_digest=f"{len(self.summary_calls):064x}",
+            input_tokens=200,
+            output_tokens=20,
+        )
+
+
+class _CancellableSummaryV2ModelBroker(_SummaryV2ModelBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.summary_entered = asyncio.Event()
+
+    async def summarize_v2(
+        self,
+        source: tuple[object, ...],
+        *,
+        aggregate_source: tuple[object, ...] | None = None,
+        parent: SemanticSummaryV2Snapshot | None = None,
+        model_id: str | None = None,
+        is_cancelled: object = None,
+    ) -> SemanticSummaryV2Snapshot:
+        del source, aggregate_source, parent, model_id
+        self.summary_entered.set()
+        assert callable(is_cancelled)
+        while not is_cancelled():
+            await asyncio.sleep(0.005)
+        raise asyncio.CancelledError
+
+
 class _FileReadModelSession:
     def __init__(self, context_plan: ContextPlan) -> None:
         self.context_plan = context_plan
@@ -131,7 +244,9 @@ class _FileReadModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         iteration = len(tool_results) + 1
         if on_request is not None:
             await on_request(  # type: ignore[operator]
@@ -140,6 +255,10 @@ class _FileReadModelSession:
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens + 64 * len(tool_results),
                     request_bytes=768 + 256 * len(tool_results),
                     request_digest=("a" if iteration == 1 else "b") * 64,
@@ -191,15 +310,22 @@ class _SearchReadModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         iteration = len(tool_results) + 1
+        request_tools = self.context_plan.tools if len(tool_results) < 2 else ()
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
                     iteration=iteration,
-                    message_count=len(self.context_plan.provider_messages()) + 2 * len(tool_results),
-                    tool_count=len(self.context_plan.tools) if len(tool_results) < 2 else 0,
-                    estimated_input_tokens=self.context_plan.estimated_input_tokens + 64 * len(tool_results),
+                    message_count=len(self.context_plan.provider_messages())
+                    + 2 * len(tool_results),
+                    tool_count=len(request_tools),
+                    tool_ids=tuple(spec.tool_id for spec in request_tools),
+                    toolset_digest=toolset_digest(request_tools),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens
+                    + 64 * len(tool_results),
                     request_bytes=768 + 256 * len(tool_results),
                     request_digest=("4" if iteration == 1 else "5" if iteration == 2 else "6") * 64,
                 )
@@ -263,13 +389,19 @@ class _BusyModelSession:
         _tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
                     iteration=1,
                     message_count=len(self.context_plan.provider_messages()),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=512,
                     request_digest="c" * 64,
@@ -301,13 +433,19 @@ class _EmptyModelSession:
         _tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
                     iteration=1,
                     message_count=len(self.context_plan.provider_messages()),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=512,
                     request_digest="7" * 64,
@@ -331,6 +469,97 @@ class _EmptyModelBroker(_FakeModelBroker):
         return _EmptyModelSession(context_plan)
 
 
+class _DirectModelSession:
+    def __init__(self, context_plan: ContextPlan) -> None:
+        self.context_plan = context_plan
+
+    async def stream_turn(
+        self,
+        _user_message: str,
+        _tool_results: tuple[OllamaToolResult, ...] = (),
+        _is_cancelled: object = None,
+        on_request: object = None,
+        on_transport_attempt: object = None,
+    ) -> object:
+        del on_transport_attempt
+        if on_request is not None:
+            await on_request(  # type: ignore[operator]
+                OllamaRequestMetadata(
+                    iteration=1,
+                    message_count=len(self.context_plan.provider_messages()),
+                    tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens,
+                    request_bytes=512,
+                    request_digest="8" * 64,
+                )
+            )
+        yield OllamaFrame("content", {"text": "A quiet direct answer."})
+        yield OllamaFrame(
+            "stop",
+            {
+                "reason": "end_turn",
+                "usage": {"prompt_eval_count": 1_472, "eval_count": 33},
+            },
+        )
+
+
+class _DirectModelBroker(_FakeModelBroker):
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _DirectModelSession:
+        assert max_tool_calls == 2
+        return _DirectModelSession(context_plan)
+
+
+class _TruncatedModelSession(_DirectModelSession):
+    async def stream_turn(
+        self,
+        _user_message: str,
+        _tool_results: tuple[OllamaToolResult, ...] = (),
+        _is_cancelled: object = None,
+        on_request: object = None,
+        on_transport_attempt: object = None,
+    ) -> object:
+        del on_transport_attempt
+        if on_request is not None:
+            await on_request(  # type: ignore[operator]
+                OllamaRequestMetadata(
+                    iteration=1,
+                    message_count=len(self.context_plan.provider_messages()),
+                    tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens,
+                    request_bytes=512,
+                    request_digest="9" * 64,
+                )
+            )
+        yield OllamaFrame(
+            "content", {"text": f"bounded prefix{OUTPUT_TRUNCATION_MARKER}"}
+        )
+        yield OllamaFrame(
+            "stop",
+            {
+                "reason": "max_output",
+                "usage": {"prompt_eval_count": 1_472, "eval_count": 2_048},
+            },
+        )
+
+
+class _TruncatedModelBroker(_FakeModelBroker):
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _TruncatedModelSession:
+        assert max_tool_calls == 2
+        return _TruncatedModelSession(context_plan)
+
+
 class _CancellableModelSession:
     def __init__(self, context_plan: ContextPlan, entered: asyncio.Event) -> None:
         self.context_plan = context_plan
@@ -342,13 +571,19 @@ class _CancellableModelSession:
         _tool_results: tuple[OllamaToolResult, ...] = (),
         is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
                     iteration=1,
                     message_count=len(self.context_plan.provider_messages()),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=512,
                     request_digest="e" * 64,
@@ -375,6 +610,26 @@ class _CancellableModelBroker(_FakeModelBroker):
         return _CancellableModelSession(context_plan, self.entered)
 
 
+class _ScriptedModelBroker(_FakeModelBroker):
+    def __init__(self, outcomes: tuple[str, ...]) -> None:
+        super().__init__()
+        self.outcomes = list(outcomes)
+        self.last_cancel_event: asyncio.Event | None = None
+
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> object:
+        assert max_tool_calls == 2
+        outcome = self.outcomes.pop(0)
+        if outcome == "completed":
+            return _FakeModelSession(context_plan)
+        if outcome == "failed":
+            return _BusyModelSession(context_plan)
+        assert outcome == "cancelled"
+        self.last_cancel_event = asyncio.Event()
+        return _CancellableModelSession(context_plan, self.last_cancel_event)
+
+
 class _OverflowModelSession:
     def __init__(
         self,
@@ -383,16 +638,22 @@ class _OverflowModelSession:
         overflow_twice: bool = False,
         partial: bool = False,
         wait_for_cancel: bool = False,
+        tool_after_recovery: bool = False,
+        fail_recovery_install: bool = False,
     ) -> None:
         self.context_plan = context_plan
         self.overflow_twice = overflow_twice
         self.partial = partial
         self.wait_for_cancel = wait_for_cancel
+        self.tool_after_recovery = tool_after_recovery
+        self.fail_recovery_install = fail_recovery_install
         self.entered = asyncio.Event()
         self.attempts = 0
         self.installed: ContextPlan | None = None
 
     def install_recovery_context(self, context_plan: ContextPlan) -> None:
+        if self.fail_recovery_install:
+            raise RuntimeError("simulated recovery session install failure")
         assert self.attempts == 1
         assert context_plan.model_profile == self.context_plan.model_profile
         assert context_plan.tools == self.context_plan.tools
@@ -407,17 +668,26 @@ class _OverflowModelSession:
         _tool_results: tuple[OllamaToolResult, ...] = (),
         is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         self.attempts += 1
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
-                    iteration=1,
+                    iteration=(2 if _tool_results else 1),
                     message_count=len(self.context_plan.provider_messages()),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=512,
-                    request_digest=("e" if self.attempts == 1 else "f") * 64,
+                    request_digest=(
+                        "e" if self.attempts == 1
+                        else "f" if self.attempts == 2 else "9"
+                    ) * 64,
                 )
             )
         self.entered.set()
@@ -430,6 +700,21 @@ class _OverflowModelSession:
             raise OllamaBrokerError(
                 "model_context_overflow", "simulated exact provider overflow"
             )
+        if self.tool_after_recovery and not _tool_results:
+            yield OllamaFrame(
+                "tool.use",
+                {
+                    "call_id": "recovery-tool-call",
+                    "tool_id": "file/glob",
+                    "arguments": {"pattern": "**/*", "max_results": 1},
+                    "usage": {"prompt_eval_count": 12, "eval_count": 2},
+                },
+            )
+            return
+        if self.tool_after_recovery:
+            assert len(_tool_results) == 1
+            assert _tool_results[0].call_id == "recovery-tool-call"
+            assert _tool_results[0].tool_id == "file/glob"
         yield OllamaFrame("content", {"text": "recovered answer"})
         yield OllamaFrame(
             "stop",
@@ -447,11 +732,15 @@ class _OverflowModelBroker(_FakeModelBroker):
         overflow_twice: bool = False,
         partial: bool = False,
         wait_for_cancel: bool = False,
+        tool_after_recovery: bool = False,
+        fail_recovery_install: bool = False,
     ) -> None:
         super().__init__()
         self.overflow_twice = overflow_twice
         self.partial = partial
         self.wait_for_cancel = wait_for_cancel
+        self.tool_after_recovery = tool_after_recovery
+        self.fail_recovery_install = fail_recovery_install
         self.sessions: list[object] = []
 
     def new_run(
@@ -466,6 +755,8 @@ class _OverflowModelBroker(_FakeModelBroker):
                 overflow_twice=self.overflow_twice,
                 partial=self.partial,
                 wait_for_cancel=self.wait_for_cancel,
+                tool_after_recovery=self.tool_after_recovery,
+                fail_recovery_install=self.fail_recovery_install,
             )
         self.sessions.append(session)
         return session
@@ -482,7 +773,9 @@ class _WriteModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         iteration = len(tool_results) + 1
         if on_request is not None:
             await on_request(  # type: ignore[operator]
@@ -491,6 +784,10 @@ class _WriteModelSession:
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=768,
                     request_digest=("7" if iteration == 1 else "8") * 64,
@@ -540,7 +837,9 @@ class _ExecModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         iteration = len(tool_results) + 1
         if on_request is not None:
             await on_request(  # type: ignore[operator]
@@ -549,6 +848,10 @@ class _ExecModelSession:
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
                     tool_count=len(self.context_plan.tools),
+                    tool_ids=tuple(
+                        spec.tool_id for spec in self.context_plan.tools
+                    ),
+                    toolset_digest=toolset_digest(self.context_plan.tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=768,
                     request_digest=("a" if iteration == 1 else "b") * 64,
@@ -597,15 +900,20 @@ class _EditModelSession:
         tool_results: tuple[OllamaToolResult, ...] = (),
         _is_cancelled: object = None,
         on_request: object = None,
+        on_transport_attempt: object = None,
     ) -> object:
+        del on_transport_attempt
         iteration = len(tool_results) + 1
+        request_tools = self.context_plan.tools if len(tool_results) < 2 else ()
         if on_request is not None:
             await on_request(  # type: ignore[operator]
                 OllamaRequestMetadata(
                     iteration=iteration,
                     message_count=len(self.context_plan.provider_messages())
                     + 2 * len(tool_results),
-                    tool_count=(len(self.context_plan.tools) if len(tool_results) < 2 else 0),
+                    tool_count=len(request_tools),
+                    tool_ids=tuple(spec.tool_id for spec in request_tools),
+                    toolset_digest=toolset_digest(request_tools),
                     estimated_input_tokens=self.context_plan.estimated_input_tokens,
                     request_bytes=768,
                     request_digest=f"{iteration}" * 64,
@@ -686,7 +994,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             )
 
             record = await service.start(
-                StartRunCommand(PROTOTYPE_AGENT_ID, "real process integration")
+                StartRunCommand(PROTOTYPE_AGENT_ID, "real process integration test")
             )
             events = [
                 event
@@ -695,7 +1003,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             ]
 
             assert events[0].kind == "run.started"
-            assert events[-1].kind == "run.completed"
+            assert events[-1].kind == "run.completed", events[-1].payload
             assert [event.seq for event in events] == list(
                 range(1, len(events) + 1)
             )
@@ -721,7 +1029,10 @@ def test_control_plane_runs_and_cleans_agent_worker(
                 "model.response.finished",
             ]
             assert model_events[0].payload["tool_result_call_ids"] == []
-            assert model_events[0].payload["tool_count"] == 8
+            assert model_events[0].payload["tool_count"] == 7
+            assert "agent/delegate" not in {
+                item.tool_id for item in record.effective_tools
+            }
             assert model_events[0].payload["request_digest"] == "c" * 64
             assert model_events[1].payload == {
                 "request_id": "model-1",
@@ -738,7 +1049,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             assert model_events[2].payload["tool_result_call_ids"] == [
                 "real-broker-call"
             ]
-            assert model_events[2].payload["tool_count"] == 8
+            assert model_events[2].payload["tool_count"] == 7
             assert model_events[3].payload["outcome"] == "end_turn"
             assert record.process is None
             assert not (
@@ -781,7 +1092,7 @@ def test_control_plane_runs_and_cleans_agent_worker(
             assert boundary.context_plan_digest == record.context_plan.reference.digest
             assert boundary.toolset_digest == record.context_plan.reference.toolset_digest
             assert boundary.reason == "admission"
-            assert "real process integration" not in boundary.to_json()
+            assert "real process integration test" not in boundary.to_json()
             assert record.runtime_snapshot is not None
             replay_boundary = ContextProjectionBoundary.create(
                 record.runtime_snapshot,
@@ -810,6 +1121,123 @@ def test_control_plane_runs_and_cleans_agent_worker(
                 )
         finally:
             await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_transport_observer_events_are_canonical_persisted_and_replayable(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        first = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_TransportModelBroker(),  # type: ignore[arg-type]
+        )
+        await first.initialize()
+        try:
+            record = await first.start(
+                StartRunCommand(PROTOTYPE_AGENT_ID, "observe provider transport test")
+            )
+            live = [
+                event
+                async for event in first.stream(record.run_id)
+                if event is not None
+            ]
+            assert live[-1].kind == "run.completed"
+            attempts = [
+                event for event in live
+                if event.kind == "model.transport.attempt"
+            ]
+            assert len(attempts) == 4
+            assert [event.payload["phase"] for event in attempts] == [
+                "attempt_started",
+                "attempt_finished",
+                "attempt_started",
+                "attempt_finished",
+            ]
+            assert [event.payload["request_id"] for event in attempts] == [
+                "model-1", "model-1", "model-2", "model-2"
+            ]
+            assert [event.payload["provider_call_index"] for event in attempts] == [
+                1, 1, 2, 2
+            ]
+            expected_fields = {
+                "version",
+                "request_id",
+                "iteration",
+                "provider_call_index",
+                "attempt",
+                "max_attempts",
+                "phase",
+                "outcome",
+                "elapsed_ms",
+                "first_frame_ms",
+            }
+            for event in attempts:
+                assert event.durability == "durable"
+                assert event.agent_id == record.agent_id
+                assert event.conversation_id == record.conversation_id
+                assert event.turn_id == record.turn_id
+                assert event.run_id == record.run_id
+                assert set(event.payload) == expected_fields
+                assert len(json.dumps(event.payload).encode("utf-8")) < 512
+                assert "observe provider transport test" not in json.dumps(event.payload)
+            assert attempts[0].payload == {
+                "version": "provider-transport-attempt-v1",
+                "request_id": "model-1",
+                "iteration": 1,
+                "provider_call_index": 1,
+                "attempt": 1,
+                "max_attempts": 2,
+                "phase": "attempt_started",
+                "outcome": None,
+                "elapsed_ms": 0,
+                "first_frame_ms": None,
+            }
+            assert attempts[1].payload["outcome"] == "first_frame_received"
+            assert attempts[1].payload["first_frame_ms"] == 13
+            assert attempts[3].payload["first_frame_ms"] == 14
+            assert first.conversations is not None
+            persisted = first.conversations._connection.execute(
+                """
+                SELECT COUNT(*), MAX(length(CAST(envelope_json AS BLOB)))
+                FROM events WHERE run_id = ? AND kind = 'model.transport.attempt'
+                """,
+                (record.run_id,),
+            ).fetchone()
+            assert persisted is not None
+            assert persisted[0] == 4
+            assert 0 < persisted[1] < 1_024
+            identity = await first.resolve_run_identity(record.run_id)
+            run_id = record.run_id
+        finally:
+            await first.close()
+
+        restored = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_FakeModelBroker(),  # type: ignore[arg-type]
+        )
+        await restored.initialize()
+        try:
+            replay = await restored.replay_run(
+                run_id,
+                after=0,
+                limit=128,
+                expected_identity=identity,
+            )
+            replayed_attempts = [
+                event for event in replay.events
+                if event.kind == "model.transport.attempt"
+            ]
+            assert [event.to_dict() for event in replayed_attempts] == [
+                event.to_dict() for event in attempts
+            ]
+            assert replay.snapshot.complete is True
+            assert replay.has_more is False
+        finally:
+            await restored.close()
 
     asyncio.run(exercise())
 
@@ -893,7 +1321,10 @@ def test_search_then_read_then_answer_stays_in_one_run_and_cleans_up(
             other.write_text("no match\n", encoding="utf-8")
             other.chmod(0o600)
             record = await service.start(
-                StartRunCommand(PROTOTYPE_AGENT_ID, "Find the SEARCH-01 target and read it.")
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "Search the workspace text files for SEARCH-01 and read the matching file.",
+                )
             )
             events = [
                 event
@@ -919,6 +1350,37 @@ def test_search_then_read_then_answer_stays_in_one_run_and_cleans_up(
                 "permission.requested", "permission.resolved", "operation.intent",
                 "operation.dispatched", "operation.outcome",
             ]
+            assert service.conversations is not None
+            usage = service.conversations.provider_usage_for_run(record.run_id)
+            assert len(usage) == 3
+            full_toolset = record.context_plan.tools if record.context_plan else ()
+            assert [item.toolset_digest for item in usage] == [
+                toolset_digest(full_toolset),
+                toolset_digest(full_toolset),
+                toolset_digest(()),
+            ]
+            boundary = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert boundary is not None
+            common_scope = {
+                "profile_digest": boundary.model_profile_digest,
+                "renderer_version": boundary.renderer_version,
+                "policy_digest": boundary.compression_policy_digest,
+            }
+            assert service.conversations.recent_provider_calibration_samples(
+                **common_scope,
+                toolset_digest=toolset_digest(full_toolset),
+            ) == tuple(
+                (item.estimated_input_tokens, item.input_tokens)
+                for item in usage[:2]
+            )
+            assert service.conversations.recent_provider_calibration_samples(
+                **common_scope,
+                toolset_digest=toolset_digest(()),
+            ) == (
+                (usage[2].estimated_input_tokens, usage[2].input_tokens),
+            )
             assert record.process is None
             assert not (service.capsule.runtime_root / "runs" / record.run_id).exists()
         finally:
@@ -1129,7 +1591,7 @@ def test_durable_replay_survives_gateway_restart_without_duplicate_terminal(
         await first.initialize()
         try:
             record = await first.start(
-                StartRunCommand(PROTOTYPE_AGENT_ID, "restart replay integration")
+                StartRunCommand(PROTOTYPE_AGENT_ID, "restart replay integration test")
             )
             live = [
                 event
@@ -1191,6 +1653,212 @@ def test_durable_replay_survives_gateway_restart_without_duplicate_terminal(
     asyncio.run(exercise())
 
 
+def test_soft_calibration_is_identical_after_restart_and_used_for_admission(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        first_broker = _FakeModelBroker()
+        first = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=first_broker,  # type: ignore[arg-type]
+        )
+        try:
+            await first.initialize()
+            seeded = await first.start(
+                StartRunCommand(PROTOTYPE_AGENT_ID, "seed durable calibration test")
+            )
+            events = [
+                event
+                async for event in first.stream(seeded.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.completed"
+            conversation_id = seeded.conversation_id
+            before_restart = await first.next_turn_preview(conversation_id)
+            assert before_restart["availability"] == "available"
+            assert before_restart["projection_mode"] == "conservative_tools"
+            assert before_restart["chat_calibration_available"] is False
+        finally:
+            await first.close()
+
+        restarted_broker = _FakeModelBroker()
+
+        def forbidden_process_local_calibration(_plan: ContextPlan) -> object:
+            raise AssertionError("Broker memory must not control admission")
+
+        restarted_broker.soft_calibration_for = (  # type: ignore[attr-defined]
+            forbidden_process_local_calibration
+        )
+        restarted = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=restarted_broker,  # type: ignore[arg-type]
+        )
+        try:
+            await restarted.initialize()
+            after_restart = await restarted.next_turn_preview(conversation_id)
+            for field in (
+                "availability",
+                "fixed_context_tokens",
+                "fixed_context_error_margin_tokens",
+                "compact_before_user_tokens",
+                "safe_user_tokens",
+                "count_basis",
+                "projection_mode",
+                "chat_calibration_available",
+            ):
+                assert after_restart[field] == before_restart[field]
+
+            admitted = await restarted.start(
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                        "admit from durable calibration test",
+                    conversation_id=conversation_id,
+                )
+            )
+            assert admitted.context_plan is not None
+            estimate = admitted.context_plan.soft_context_estimate
+            assert estimate.availability == "available"
+            assert estimate.basis == "provider-observed-calibration-v1"
+            assert estimate.sample_count == 2
+            admitted_events = [
+                event
+                async for event in restarted.stream(admitted.run_id)
+                if event is not None
+            ]
+            assert admitted_events[-1].kind == "run.completed"
+        finally:
+            await restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_chat_calibration_is_not_promoted_to_conservative_tool_preview(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        service = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_DirectModelBroker(),  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            chat = await service.start(
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "write a poem for around 500 words",
+                )
+            )
+            assert chat.context_plan is not None
+            assert chat.context_plan.tools == ()
+            events = [
+                event
+                async for event in service.stream(chat.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.completed"
+
+            preview = await service.next_turn_preview(chat.conversation_id)
+            assert preview["projection_mode"] == "conservative_tools"
+            assert preview["availability"] == "unavailable"
+            assert preview["stale_reason"] == "toolset_calibration_unavailable"
+            assert preview["chat_calibration_available"] is True
+            assert preview["fixed_context_tokens"] is None
+            assert preview["safe_user_tokens"] is None
+            assert preview["toolset_digest"] != (
+                chat.context_plan.reference.toolset_digest
+            )
+            chat_only = preview["chat_only_projection"]
+            assert isinstance(chat_only, dict)
+            assert chat_only["version"] == "next-turn-chat-only-projection-v1"
+            assert chat_only["availability"] == "available"
+            assert chat_only["projection_mode"] == "chat_only"
+            assert chat_only["fixed_context_tokens"] > 0
+            assert chat_only["fixed_context_error_margin_tokens"] >= 256
+            assert chat_only["safe_user_tokens"] > 0
+            assert chat_only["compact_before_user_tokens"] > 0
+            assert chat_only["operational_context_tokens"] == (
+                chat.context_plan.model_profile.operational_context_tokens
+            )
+            assert chat_only["hard_input_tokens"] == (
+                chat.context_plan.policy.hard_input_tokens
+            )
+            assert chat_only["toolset_digest"] == (
+                chat.context_plan.reference.toolset_digest
+            )
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_output_limit_commits_truncated_turn_with_machine_readable_terminal(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        service = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_TruncatedModelBroker(),  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            record = await service.start(
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "bounded long-answer integration test",
+                )
+            )
+            events = [
+                event
+                async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.completed"
+            assert events[-1].payload == {
+                "reason": "max_output",
+                "model_iterations": 1,
+                "usage": {
+                    "input_tokens": 1_472,
+                    "output_tokens": 2_048,
+                    "last_input_tokens": 1_472,
+                    "complete": True,
+                },
+            }
+            model_finished = next(
+                event for event in events
+                if event.kind == "model.response.finished"
+            )
+            assert model_finished.payload["outcome"] == "end_turn"
+            assert model_finished.payload["usage_complete"] is True
+
+            assert service.conversations is not None
+            conversation = service.conversations.get_conversation(
+                record.conversation_id
+            )
+            assert conversation.turns[-1].status == "completed"
+            assert conversation.turns[-1].assistant_content == (
+                f"bounded prefix{OUTPUT_TRUNCATION_MARKER}"
+            )
+            replayed = service.journal.events_for_run(record.run_id)
+            assert replayed[-1]["payload"]["reason"] == "max_output"
+            identity = await service.resolve_run_identity(record.run_id)
+            replay = await service.replay_run(
+                record.run_id,
+                after=0,
+                limit=128,
+                expected_identity=identity,
+            )
+            assert replay.events[-1].payload["reason"] == "max_output"
+            assert replay.snapshot.complete is True
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
 def test_query_engine_restores_completed_conversation_into_next_isolated_run(
     tmp_path: Path,
 ) -> None:
@@ -1211,7 +1879,7 @@ def test_query_engine_restores_completed_conversation_into_next_isolated_run(
             )
 
             first = await engine.submit_message(
-                "第一轮：记住代号是青竹"
+                "工作区测试第一轮：记住代号是青竹"
             )
             first_events = [
                 event
@@ -1220,8 +1888,23 @@ def test_query_engine_restores_completed_conversation_into_next_isolated_run(
             ]
             assert first_events[-1].kind == "run.completed"
 
+            preview = await service.next_turn_preview(
+                conversation.conversation_id
+            )
+            assert preview["availability"] == "available"
+            assert preview["conversation_revision"] == 2
+            assert preview["fixed_context_tokens"] > 0
+            assert preview["safe_user_tokens"] > 0
+            assert preview["single_message_byte_limit"] == 8_192
+            assert preview["last_run_usage"] == {
+                "input_tokens": 18,
+                "output_tokens": 6,
+                "provider_calls": 2,
+                "complete": True,
+            }
+
             second = await engine.submit_message(
-                "第二轮：刚才的代号是什么？"
+                "工作区测试第二轮：刚才的代号是什么？"
             )
             second_events = [
                 event
@@ -1239,13 +1922,18 @@ def test_query_engine_restores_completed_conversation_into_next_isolated_run(
                 "system",
                 "user",
                 "assistant",
+                "tool",
+                "assistant",
                 "user",
             ]
-            assert second_messages[1]["content"] == "第一轮：记住代号是青竹"
-            assert second_messages[2]["content"] == (
-                "broker result: 第一轮：记住代号是青竹"
+            assert second_messages[1]["content"] == "工作区测试第一轮：记住代号是青竹"
+            assert second_messages[2]["tool_calls"][0]["function"]["name"] == "file_glob"
+            assert second_messages[3]["tool_name"] == "file_glob"
+            assert second_messages[3]["content"]
+            assert second_messages[4]["content"] == (
+                "broker result: 工作区测试第一轮：记住代号是青竹"
             )
-            assert second_messages[-1]["content"] == "第二轮：刚才的代号是什么？"
+            assert second_messages[-1]["content"] == "工作区测试第二轮：刚才的代号是什么？"
 
             restored = await engine.restore()
             assert [turn.status for turn in restored.turns] == [
@@ -1253,8 +1941,8 @@ def test_query_engine_restores_completed_conversation_into_next_isolated_run(
                 "completed",
             ]
             assert [turn.assistant_content for turn in restored.turns] == [
-                "broker result: 第一轮：记住代号是青竹",
-                "broker result: 第二轮：刚才的代号是什么？",
+                "broker result: 工作区测试第一轮：记住代号是青竹",
+                "broker result: 工作区测试第二轮：刚才的代号是什么？",
             ]
 
             deleted = await engine.delete()
@@ -1309,7 +1997,7 @@ def test_query_engine_is_lazily_rebuilt_from_sqlite_after_gateway_restart(
             )
             conversation_id = conversation.conversation_id
             old_engine = await first_registry.for_conversation(conversation_id)
-            first = await old_engine.submit_message("重启前的代号是青竹")
+            first = await old_engine.submit_message("工作区测试：重启前的代号是青竹")
             events = [
                 event
                 async for event in old_engine.stream(first.run_id)
@@ -1343,10 +2031,10 @@ def test_query_engine_is_lazily_rebuilt_from_sqlite_after_gateway_restart(
             assert new_engine is not old_engine
             restored = await new_engine.restore()
             assert restored.turns[0].assistant_content == (
-                "broker result: 重启前的代号是青竹"
+                "broker result: 工作区测试：重启前的代号是青竹"
             )
 
-            second = await new_engine.submit_message("重启后继续这一会话")
+            second = await new_engine.submit_message("继续这个工作区测试会话")
             events = [
                 event
                 async for event in new_engine.stream(second.run_id)
@@ -1358,13 +2046,17 @@ def test_query_engine_is_lazily_rebuilt_from_sqlite_after_gateway_restart(
                 "system",
                 "user",
                 "assistant",
+                "tool",
+                "assistant",
                 "user",
             ]
-            assert projected[1]["content"] == "重启前的代号是青竹"
-            assert projected[2]["content"] == (
-                "broker result: 重启前的代号是青竹"
+            assert projected[1]["content"] == "工作区测试：重启前的代号是青竹"
+            assert projected[2]["tool_calls"][0]["function"]["name"] == "file_glob"
+            assert projected[3]["tool_name"] == "file_glob"
+            assert projected[4]["content"] == (
+                "broker result: 工作区测试：重启前的代号是青竹"
             )
-            assert projected[3]["content"] == "重启后继续这一会话"
+            assert projected[5]["content"] == "继续这个工作区测试会话"
         finally:
             if second_registry is not None:
                 await second_registry.close()
@@ -1373,8 +2065,100 @@ def test_query_engine_is_lazily_rebuilt_from_sqlite_after_gateway_restart(
     asyncio.run(exercise())
 
 
+def test_twenty_turn_mixed_terminal_soak_survives_gateway_restart(
+    tmp_path: Path,
+) -> None:
+    first_half = (
+        "completed", "failed", "completed", "cancelled", "completed",
+        "failed", "completed", "cancelled", "completed", "completed",
+    )
+    second_half = (
+        "completed", "cancelled", "completed", "failed", "completed",
+        "completed", "failed", "completed", "cancelled", "completed",
+    )
+
+    async def run_half(
+        service: RunService,
+        broker: _ScriptedModelBroker,
+        outcomes: tuple[str, ...],
+        conversation_id: str | None,
+    ) -> str:
+        for position, expected in enumerate(outcomes, start=1):
+            if expected == "cancelled":
+                broker.last_cancel_event = None
+            record = await service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID,
+                f"mixed soak test turn {position}: {expected}",
+                conversation_id=conversation_id,
+            ))
+            conversation_id = record.conversation_id
+            if expected == "cancelled":
+                for _index in range(500):
+                    if broker.last_cancel_event is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert broker.last_cancel_event is not None
+                await asyncio.wait_for(broker.last_cancel_event.wait(), timeout=5)
+                await service.cancel(record.run_id)
+            events = [
+                event async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == f"run.{expected}"
+        assert conversation_id is not None
+        return conversation_id
+
+    async def exercise() -> None:
+        first_broker = _ScriptedModelBroker(first_half)
+        first = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=first_broker  # type: ignore[arg-type]
+        )
+        try:
+            await first.initialize()
+            conversation_id = await run_half(
+                first, first_broker, first_half, None
+            )
+        finally:
+            await first.close()
+
+        second_broker = _ScriptedModelBroker(second_half)
+        second = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=second_broker  # type: ignore[arg-type]
+        )
+        try:
+            await second.initialize()
+            conversation_id = await run_half(
+                second, second_broker, second_half, conversation_id
+            )
+            conversation = await second.get_conversation(conversation_id)
+            assert len(conversation.turns) == 20
+            assert [turn.status for turn in conversation.turns].count("completed") == 12
+            assert [turn.status for turn in conversation.turns].count("failed") == 4
+            assert [turn.status for turn in conversation.turns].count("cancelled") == 4
+            assert second.conversations is not None
+            snapshot = second.conversations.snapshot_for_turn(conversation_id)
+            assert len(snapshot.completed_turn_contexts) == 12
+            assert all(
+                bundle.turn_id in {
+                    turn.turn_id for turn in conversation.turns
+                    if turn.status == "completed"
+                }
+                for bundle in snapshot.completed_turn_contexts
+            )
+            preview = await second.next_turn_preview(conversation_id)
+            assert preview["availability"] == "available"
+            assert preview["turn_count"] == 20
+            assert preview["turns_remaining"] == 108
+        finally:
+            await second.close()
+
+    asyncio.run(exercise())
+
+
 async def _prime_overflow_history(service: RunService) -> str:
-    first = await service.start(StartRunCommand(PROTOTYPE_AGENT_ID, "A" * 2_000))
+    first = await service.start(
+        StartRunCommand(PROTOTYPE_AGENT_ID, "test " + "A" * 2_000)
+    )
     first_events = [
         event async for event in service.stream(first.run_id) if event is not None
     ]
@@ -1382,7 +2166,7 @@ async def _prime_overflow_history(service: RunService) -> str:
     second = await service.start(
         StartRunCommand(
             PROTOTYPE_AGENT_ID,
-            "B" * 2_000,
+            "test " + "B" * 2_000,
             conversation_id=first.conversation_id,
         )
     )
@@ -1391,6 +2175,166 @@ async def _prime_overflow_history(service: RunService) -> str:
     ]
     assert second_events[-1].kind == "run.completed"
     return first.conversation_id
+
+
+def test_summary_v2_is_reused_across_turns_and_gateway_restart(
+    tmp_path: Path,
+) -> None:
+    async def run_turn(
+        service: RunService, message: str, conversation_id: str | None = None,
+        *, compact: bool = False,
+    ) -> str:
+        record = await service.start(StartRunCommand(
+            PROTOTYPE_AGENT_ID, message, conversation_id=conversation_id,
+            compact=compact,
+        ))
+        events = [
+            event async for event in service.stream(record.run_id)
+            if event is not None
+        ]
+        assert events[-1].kind == "run.completed"
+        return record.conversation_id
+
+    async def exercise() -> None:
+        broker = _SummaryV2ModelBroker()
+        service = RunService(tmp_path, SOURCE_ROOT, model_broker=broker)  # type: ignore[arg-type]
+        try:
+            await service.initialize()
+            conversation_id = await run_turn(service, "test " + "A" * 5_000)
+            await run_turn(service, "test " + "B" * 5_000, conversation_id, compact=True)
+            assert len(broker.summary_calls) == 1
+            first_call = broker.summary_calls[0]
+            assert service.conversations is not None
+            generated = service.conversations.read_summary_projection(conversation_id)
+            assert generated is not None
+            assert generated.status == "generated"
+            await run_turn(service, "test small follow-up", conversation_id, compact=True)
+            assert len(broker.summary_calls) == 1
+            stored = service.conversations.read_summary_projection(conversation_id)
+            assert stored is not None
+            assert stored.status == "reused"
+            assert stored.snapshot is not None
+            assert first_call["aggregate"] == stored.snapshot.source_turn_ids
+        finally:
+            await service.close()
+
+        restarted_broker = _SummaryV2ModelBroker()
+        restarted = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=restarted_broker  # type: ignore[arg-type]
+        )
+        try:
+            await restarted.initialize()
+            await run_turn(
+                restarted, "test after restart", conversation_id, compact=True
+            )
+            assert restarted_broker.summary_calls == []
+        finally:
+            await restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_cancelling_real_summary_preparation_writes_no_projection_or_run(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        broker = _CancellableSummaryV2ModelBroker()
+        service = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=broker  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            first = await service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID, "test " + "A" * 5_000,
+            ))
+            first_events = [
+                event async for event in service.stream(first.run_id)
+                if event is not None
+            ]
+            assert first_events[-1].kind == "run.completed"
+            before_run_ids = set(service.runs)
+            before = await service.get_conversation(first.conversation_id)
+
+            admission = asyncio.create_task(service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID,
+                "test " + "B" * 5_000,
+                conversation_id=first.conversation_id,
+                compact=True,
+            )))
+            await asyncio.wait_for(broker.summary_entered.wait(), timeout=0.5)
+            status = await service.preparation_status(first.conversation_id)
+            assert status is not None
+            assert status["state"] == "preparing"
+            assert status["stage"] == "summarizing_history"
+            operation_id = status["operation_id"]
+            assert isinstance(operation_id, str)
+
+            result = await service.cancel_preparation(
+                first.conversation_id, operation_id
+            )
+            assert result == {
+                "version": "run-preparation-cancel-v1",
+                "state": "cancellation_requested",
+                "target": "preparation",
+            }
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(admission, timeout=0.5)
+
+            assert await service.preparation_status(first.conversation_id) is None
+            after = await service.get_conversation(first.conversation_id)
+            assert after.turns == before.turns
+            assert set(service.runs) == before_run_ids
+            assert service.conversations is not None
+            assert service.conversations.read_summary_projection(
+                first.conversation_id
+            ) is None
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_summary_v2_updates_only_the_new_complete_turn_delta(
+    tmp_path: Path,
+) -> None:
+    async def run_turn(
+        service: RunService, message: str, conversation_id: str | None = None,
+        *, compact: bool = False,
+    ) -> str:
+        record = await service.start(StartRunCommand(
+            PROTOTYPE_AGENT_ID, message, conversation_id=conversation_id,
+            compact=compact,
+        ))
+        events = [
+            event async for event in service.stream(record.run_id)
+            if event is not None
+        ]
+        assert events[-1].kind == "run.completed"
+        return record.conversation_id
+
+    async def exercise() -> None:
+        broker = _SummaryV2ModelBroker()
+        service = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=broker  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            conversation_id = await run_turn(service, "test " + "A" * 5_000)
+            await run_turn(service, "test " + "B" * 5_000, conversation_id, compact=True)
+            assert len(broker.summary_calls) == 1
+            first = broker.summary_calls[0]
+            await run_turn(service, "test " + "C" * 5_000, conversation_id, compact=True)
+            await run_turn(service, "test " + "D" * 5_000, conversation_id, compact=True)
+            assert len(broker.summary_calls) == 2
+            second = broker.summary_calls[1]
+            assert second["parent"] is not None
+            assert second["aggregate"][: len(first["aggregate"])] == first["aggregate"]
+            assert second["delta"] == second["aggregate"][len(first["aggregate"]):]
+            assert second["delta"]
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
 
 
 def test_control_plane_recovers_one_provider_overflow_with_durable_identity(
@@ -1459,13 +2403,25 @@ def test_control_plane_recovers_one_provider_overflow_with_durable_identity(
             assert boundary.context_plan_digest == model_events[3].payload[
                 "context_plan_digest"
             ]
+            assert recovered.active_context_plan is not None
+            assert boundary.context_plan_digest == recovered.active_context_plan.reference.digest
             assert boundary.context_plan_digest != recovered.context_plan.reference.digest
+            assert recovered.active_runtime_snapshot is not None
+            assert recovered.active_runtime_snapshot.projection_reason == "overflow_recovery"
             restored = await service.get_conversation(conversation_id)
             assert len(restored.turns) == 3
             assert restored.turns[-1].assistant_content == "recovered answer"
             assert recovered.recovery_context_plan is None
             assert recovered.recovery_history == ()
             assert recovered.recovery_prompt_sources is None
+            preview = await service.next_turn_preview(conversation_id)
+            assert preview["availability"] == "available"
+            assert preview["last_run_usage"] == {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "provider_calls": 2,
+                "complete": False,
+            }
         finally:
             await service.close()
 
@@ -1490,8 +2446,73 @@ def test_control_plane_recovers_one_provider_overflow_with_durable_identity(
             assert [item["attempt"] for item in calls] == [0, 1]
             assert [item["provider_call_index"] for item in calls] == [1, 2]
             assert replay.snapshot.complete is True
+            preview = await restarted.next_turn_preview(conversation_id)
+            assert preview["availability"] == "available"
+            assert preview["conversation_revision"] == conversation.revision
         finally:
             await restarted.close()
+
+    asyncio.run(exercise())
+
+
+def test_overflow_recovery_keeps_active_plan_through_tool_and_final(
+    tmp_path: Path,
+) -> None:
+    """The post-recovery Tool loop must never fall back to admission identity."""
+
+    async def exercise() -> None:
+        broker = _OverflowModelBroker(tool_after_recovery=True)
+        service = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=broker  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            conversation_id = await _prime_overflow_history(service)
+            record = await service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID,
+                "recover, list files in the workspace with the bounded Tool, then finish",
+                conversation_id=conversation_id,
+            ))
+            events = [
+                event async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.completed", events[-1].payload
+            recovery = next(
+                event for event in events if event.kind == "model.recovery.started"
+            )
+            recovered_digest = recovery.payload["to_context_plan_digest"]
+            requests = [
+                event for event in events if event.kind == "model.request.started"
+            ]
+            assert len(requests) == 3
+            assert requests[0].payload["attempt"] == 0
+            assert [item.payload["attempt"] for item in requests[1:]] == [1, 0]
+            assert all(
+                item.payload["context_plan_digest"] == recovered_digest
+                for item in requests[1:]
+            )
+            assert any(event.kind == "tool.call.finished" for event in events)
+            assert record.active_context_plan is not None
+            assert record.active_context_plan.reference.digest == recovered_digest
+            assert service.conversations is not None
+            boundary = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert boundary is not None
+            assert boundary.context_plan_digest == recovered_digest
+            bundles = service.conversations.snapshot_for_turn(
+                conversation_id
+            ).completed_turn_contexts
+            latest = bundles[-1]
+            assert [item.kind for item in latest.items] == [
+                "user", "assistant_tool_use", "tool_result_receipt",
+                "assistant_final",
+            ]
+            assert latest.items[1].call_id == "recovery-tool-call"
+            assert latest.items[2].call_id == "recovery-tool-call"
+        finally:
+            await service.close()
 
     asyncio.run(exercise())
 
@@ -1543,6 +2564,103 @@ def test_overflow_recovery_never_loops_or_retries_after_partial_output(
                 assert len(requests) == 2
                 assert requests[-1].payload["attempt"] == 1
             assert len(requests) <= 2
+            preview = await service.next_turn_preview(conversation_id)
+            assert preview["availability"] == "available"
+            assert preview["stale_reason"] is None
+            assert preview["last_run_usage"]["complete"] is True
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_recovery_session_install_failure_keeps_the_admission_boundary(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        broker = _OverflowModelBroker(fail_recovery_install=True)
+        service = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=broker  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            conversation_id = await _prime_overflow_history(service)
+            record = await service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID, "install fault",
+                conversation_id=conversation_id,
+            ))
+            assert service.conversations is not None
+            admission = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert admission is not None
+            events = [
+                event async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.failed"
+            assert not any(
+                event.kind == "model.recovery.started" for event in events
+            )
+            boundary = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert boundary == admission
+            assert record.active_context_plan == record.context_plan
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_recovery_sql_fault_rolls_back_boundary_and_transition_event(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        broker = _OverflowModelBroker()
+        service = RunService(
+            tmp_path, SOURCE_ROOT, model_broker=broker  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            conversation_id = await _prime_overflow_history(service)
+            assert service.conversations is not None
+            service.conversations._connection.execute(
+                """
+                CREATE TEMP TRIGGER fail_recovery_transition
+                BEFORE INSERT ON events
+                WHEN NEW.kind = 'model.recovery.started'
+                BEGIN
+                    SELECT RAISE(ABORT, 'simulated recovery SQL fault');
+                END
+                """
+            )
+            service.conversations._connection.commit()
+            record = await service.start(StartRunCommand(
+                PROTOTYPE_AGENT_ID, "transaction fault",
+                conversation_id=conversation_id,
+            ))
+            admission = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert admission is not None
+            events = [
+                event async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+            assert events[-1].kind == "run.failed"
+            assert not any(
+                event.kind == "model.recovery.started" for event in events
+            )
+            boundary = service.conversations.read_context_projection_boundary(
+                record.run_id
+            )
+            assert boundary == admission
+            assert service.journal is not None
+            durable = service.journal.events_for_run(record.run_id)
+            assert not any(
+                event.get("kind") == "model.recovery.started" for event in durable
+            )
         finally:
             await service.close()
 
@@ -1587,6 +2705,9 @@ def test_cancellation_between_overflow_and_recovery_fails_closed(
             assert sum(
                 event.kind == "model.request.started" for event in events
             ) == 1
+            preview = await service.next_turn_preview(conversation_id)
+            assert preview["availability"] == "available"
+            assert preview["stale_reason"] is None
         finally:
             await service.close()
 
@@ -1607,7 +2728,10 @@ def test_file_write_waits_for_bound_operator_decision(
         try:
             await service.initialize()
             record = await service.start(
-                StartRunCommand(PROTOTYPE_AGENT_ID, "create the approved file")
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "create the approved workspace file created.txt",
+                )
             )
             permission = None
             for _index in range(500):
@@ -1659,7 +2783,10 @@ def test_file_create_race_after_approval_never_clobbers_new_target(
         try:
             await service.initialize()
             record = await service.start(
-                StartRunCommand(PROTOTYPE_AGENT_ID, "create without clobber")
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "create workspace file created.txt without clobbering",
+                )
             )
             permission = None
             for _index in range(500):

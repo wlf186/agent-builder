@@ -96,6 +96,7 @@ _TOOL_SPECS: dict[str, ToolSpec] = {
 _VISIBLE_TOOL_IDS = tuple(spec.tool_id for spec in _CURRENT_RUNTIME_SPECS)
 _TOOLSET_DIGEST = toolset_digest(_CURRENT_RUNTIME_SPECS)
 _OPTIONAL_RUNTIME_TOOL_IDS = (
+    "agent/delegate",
     "document/extract_text",
     "extension/call",
     "skill/run",
@@ -119,6 +120,10 @@ for _policy_specs in (_CURRENT_RUNTIME_SPECS, _LEGACY_RUNTIME_SPECS):
         _RUNTIME_TOOLSET_PROJECTIONS[toolset_digest(_projected_specs)] = tuple(
             spec.tool_id for spec in _projected_specs
         )
+# A qualified text-only model deliberately receives no Tool definitions.  Its
+# manifest is still a fixed, trusted runtime projection rather than an
+# arbitrary digest supplied by a journal row.
+_RUNTIME_TOOLSET_PROJECTIONS[toolset_digest(())] = ()
 _LEGACY_TOOLSET_DIGEST = toolset_digest((PROTOTYPE_ECHO_SPEC_V1,))
 _LEGACY_TOOLSET_DIGEST_V2 = toolset_digest((PROTOTYPE_ECHO_SPEC_V2,))
 _LEGACY_TOOLSET_DIGEST_V3 = toolset_digest((PROTOTYPE_ECHO_SPEC,))
@@ -218,6 +223,7 @@ _DURABLE_KINDS = frozenset(
     {
         "run.started",
         "model.request.started",
+        "model.transport.attempt",
         "model.response.finished",
         "model.recovery.started",
         "assistant.block.started",
@@ -628,7 +634,7 @@ def _bounded_integer(
 
 
 def _validate_context_plan_metadata(value: object) -> dict[str, object]:
-    expected = {
+    legacy_expected = {
         "plan_id",
         "digest",
         "toolset_digest",
@@ -648,8 +654,36 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         "template_reserve_tokens",
         "estimator",
     }
-    if not isinstance(value, dict) or set(value) != expected:
+    count_domain_fields = {
+        "admission_count_version",
+        "admission_basis",
+        "soft_count_version",
+        "soft_count_availability",
+        "soft_estimated_tokens",
+        "soft_error_margin_tokens",
+        "included_turn_bundle_count",
+    }
+    if (
+        not isinstance(value, dict)
+        or frozenset(value) not in {
+            frozenset(legacy_expected),
+            frozenset(legacy_expected | count_domain_fields),
+        }
+    ):
         raise ReplayCorruptionError("invalid run.started context plan")
+    if count_domain_fields <= set(value) and (
+        value.get("admission_count_version") != "admission-upper-bound-v1"
+        or value.get("admission_basis") != TOKEN_ESTIMATOR_ID
+        or value.get("soft_count_version") != "soft-context-estimate-v1"
+        or value.get("soft_count_availability") not in {"available", "unavailable"}
+        or not isinstance(value.get("soft_estimated_tokens"), int)
+        or not isinstance(value.get("soft_error_margin_tokens"), int)
+        or value.get("soft_estimated_tokens", -1) < 0
+        or value.get("soft_error_margin_tokens", -1) < 0
+        or not isinstance(value.get("included_turn_bundle_count"), int)
+        or not 0 <= value.get("included_turn_bundle_count", -1) <= 128
+    ):
+        raise ReplayCorruptionError("invalid run.started context count domains")
 
     plan_id = value.get("plan_id")
     digest = value.get("digest")
@@ -708,27 +742,37 @@ def _validate_context_plan_metadata(value: object) -> dict[str, object]:
         field="omitted history message count",
     )
     strategy = value.get("windowing_strategy")
+    included_bundle_count = (
+        value.get("included_turn_bundle_count", 0)
+        if count_domain_fields <= set(value)
+        else 0
+    )
     if (
         history_count % 2
         or included_count % 2
         or included_count > history_count
         or omitted_count != history_count - included_count
+        or included_bundle_count * 2 not in {0, included_count}
         or strategy not in {
             "full", "completed-turn-tail-v1", "completed-turn-collapse-v2",
-            "semantic-summary-v1",
+            "semantic-summary-v1", "semantic-summary-v2",
         }
         or (strategy == "full" and included_count != history_count)
         or (
             strategy in {
                 "completed-turn-tail-v1", "completed-turn-collapse-v2",
-                "semantic-summary-v1",
+                "semantic-summary-v1", "semantic-summary-v2",
             }
             and included_count >= history_count
         )
             or not (
-                3 + included_count + int(strategy != "full")
+                3
+                + (0 if included_bundle_count else included_count)
+                + int(strategy != "full")
                 <= section_count
-                <= 6 + included_count + int(strategy != "full")
+                <= 6
+                + (0 if included_bundle_count else included_count)
+                + int(strategy != "full")
             )
     ):
         raise ReplayCorruptionError("invalid run.started history metadata")
@@ -956,13 +1000,6 @@ def _validate_model_request_payload(
     )
     if (
         request_id != expected_request_id
-        or (
-            attempt == 0
-            and (
-                payload.get("context_plan_id") != context.get("plan_id")
-                or payload.get("context_plan_digest") != context.get("digest")
-            )
-        )
         or not isinstance(payload.get("context_plan_id"), str)
         or _PLAN_ID.fullmatch(str(payload.get("context_plan_id"))) is None
         or not isinstance(payload.get("context_plan_digest"), str)
@@ -1113,6 +1150,88 @@ def _validate_model_response_payload(
     return payload
 
 
+def _validate_model_transport_payload(payload: object) -> dict[str, object]:
+    expected = {
+        "version",
+        "request_id",
+        "iteration",
+        "provider_call_index",
+        "attempt",
+        "max_attempts",
+        "phase",
+        "outcome",
+        "elapsed_ms",
+        "first_frame_ms",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise ReplayCorruptionError("invalid model.transport.attempt payload")
+    if payload.get("version") != "provider-transport-attempt-v1":
+        raise ReplayCorruptionError("invalid model transport version")
+    _worker_id(payload.get("request_id"), "model transport request_id")
+    _bounded_integer(
+        payload.get("iteration"), minimum=1, maximum=8,
+        field="model transport iteration",
+    )
+    _bounded_integer(
+        payload.get("provider_call_index"), minimum=1, maximum=64,
+        field="model transport provider call index",
+    )
+    attempt = _bounded_integer(
+        payload.get("attempt"), minimum=1, maximum=4,
+        field="model transport attempt",
+    )
+    maximum = _bounded_integer(
+        payload.get("max_attempts"), minimum=1, maximum=4,
+        field="model transport maximum attempts",
+    )
+    elapsed = _bounded_integer(
+        payload.get("elapsed_ms"), minimum=0, maximum=3_600_000,
+        field="model transport elapsed time",
+    )
+    first_frame = payload.get("first_frame_ms")
+    if first_frame is not None:
+        first_frame = _bounded_integer(
+            first_frame, minimum=0, maximum=elapsed,
+            field="model first-frame time",
+        )
+    phase = payload.get("phase")
+    outcome = payload.get("outcome")
+    allowed_outcomes = {
+        "first_frame_received",
+        "first_frame_timeout",
+        "transport_timeout",
+        "turn_deadline",
+        "unavailable",
+        "rejected",
+        "cancelled",
+        "failed_before_first_frame",
+    }
+    if (
+        attempt > maximum
+        or phase not in {"attempt_started", "attempt_finished"}
+        or (
+            phase == "attempt_started"
+            and (outcome is not None or elapsed != 0 or first_frame is not None)
+        )
+        or (
+            phase == "attempt_finished"
+            and (
+                outcome not in allowed_outcomes
+                or (
+                    outcome == "first_frame_received"
+                    and first_frame != elapsed
+                )
+                or (
+                    outcome != "first_frame_received"
+                    and first_frame is not None
+                )
+            )
+        )
+    ):
+        raise ReplayCorruptionError("invalid model transport attempt")
+    return payload
+
+
 def _validate_model_usage_rollup(
     model_calls: Sequence[dict[str, object]], terminal_payload: dict[str, object]
 ) -> None:
@@ -1181,7 +1300,7 @@ def _validate_terminal_payload(
         iterations = payload.get("model_iterations")
         usage = _validate_usage(payload.get("usage"))
         if (
-            payload.get("reason") != "end_turn"
+            payload.get("reason") not in {"end_turn", "max_output"}
             or not isinstance(iterations, int)
             or isinstance(iterations, bool)
             or not 1 <= iterations <= 4
@@ -1704,12 +1823,17 @@ def project_durable_run(
     tools: list[dict[str, object]] = []
     model_calls: list[dict[str, object]] = []
     open_model_call: int | None = None
+    open_transport_attempt: int | None = None
+    completed_transport_attempts = 0
+    transport_max_attempts: int | None = None
     pending_recovery: dict[str, object] | None = None
     recovery_count = 0
     model_boundaries_seen = False
     gaps: list[ReplayGap] = []
     terminal: dict[str, object] | None = None
     started_payload: dict[str, object] | None = None
+    active_context_plan_id: str | None = None
+    active_context_plan_digest: str | None = None
 
     for index, event in enumerate(events):
         if RunIdentity.from_event(event) != identity:
@@ -1743,6 +1867,11 @@ def project_durable_run(
             if index != 0:
                 raise ReplayCorruptionError("durable Run repeats its start")
             started_payload = _validate_started_payload(event.payload)
+            started_context = started_payload.get("context_plan")
+            if not isinstance(started_context, dict):
+                raise ReplayCorruptionError("Run start has no context identity")
+            active_context_plan_id = str(started_context.get("plan_id"))
+            active_context_plan_digest = str(started_context.get("digest"))
         elif event.kind == "model.request.started":
             if started_payload is None:
                 raise ReplayCorruptionError("model request precedes Run start")
@@ -1774,6 +1903,9 @@ def project_durable_run(
                 or pending_tool is not None
                 or iteration != expected_iteration
                 or payload.get("tool_result_call_ids") != expected_results
+                or payload.get("context_plan_id") != active_context_plan_id
+                or payload.get("context_plan_digest")
+                != active_context_plan_digest
                 or (not model_calls and (blocks or tools))
                 or (
                     is_recovery
@@ -1817,11 +1949,51 @@ def project_durable_run(
                 }
             )
             open_model_call = len(model_calls) - 1
+            open_transport_attempt = None
+            completed_transport_attempts = 0
+            transport_max_attempts = None
+        elif event.kind == "model.transport.attempt":
+            if open_model_call is None:
+                raise ReplayCorruptionError("model transport attempt has no request")
+            payload = _validate_model_transport_payload(event.payload)
+            request = model_calls[open_model_call]
+            if (
+                payload.get("request_id") != request.get("request_id")
+                or payload.get("iteration") != request.get("iteration")
+                or payload.get("provider_call_index")
+                != request.get("provider_call_index")
+                or (
+                    transport_max_attempts is not None
+                    and payload.get("max_attempts") != transport_max_attempts
+                )
+            ):
+                raise ReplayCorruptionError(
+                    "model transport attempt does not match its request"
+                )
+            raw_attempt = payload.get("attempt")
+            assert isinstance(raw_attempt, int)
+            if payload.get("phase") == "attempt_started":
+                if (
+                    open_transport_attempt is not None
+                    or raw_attempt != completed_transport_attempts + 1
+                ):
+                    raise ReplayCorruptionError(
+                        "model transport attempt start is out of sequence"
+                    )
+                open_transport_attempt = raw_attempt
+                transport_max_attempts = int(payload["max_attempts"])
+            else:
+                if open_transport_attempt != raw_attempt:
+                    raise ReplayCorruptionError(
+                        "model transport attempt finish is out of sequence"
+                    )
+                open_transport_attempt = None
+                completed_transport_attempts = raw_attempt
         elif event.kind == "model.response.finished":
             if started_payload is None:
                 raise ReplayCorruptionError("model response precedes Run start")
             payload = _validate_model_response_payload(event.payload, started_payload)
-            if open_model_call is None:
+            if open_model_call is None or open_transport_attempt is not None:
                 raise ReplayCorruptionError("model response has no request")
             request = model_calls[open_model_call]
             if (
@@ -1848,6 +2020,8 @@ def project_durable_run(
                 "error_code": payload["error_code"],
             }
             open_model_call = None
+            completed_transport_attempts = 0
+            transport_max_attempts = None
         elif event.kind == "model.recovery.started":
             if (
                 started_payload is None
@@ -1891,6 +2065,10 @@ def project_durable_run(
                 != payload.get("from_context_plan_id")
                 or latest.get("context_plan_digest")
                 != payload.get("from_context_plan_digest")
+                or payload.get("from_context_plan_id")
+                != active_context_plan_id
+                or payload.get("from_context_plan_digest")
+                != active_context_plan_digest
                 or any(
                     not isinstance(payload.get(field), str)
                     or _PLAN_ID.fullmatch(str(payload[field])) is None
@@ -1910,6 +2088,8 @@ def project_durable_run(
             ):
                 raise ReplayCorruptionError("model recovery boundary is invalid")
             pending_recovery = payload
+            active_context_plan_id = str(payload["to_context_plan_id"])
+            active_context_plan_digest = str(payload["to_context_plan_digest"])
             recovery_count = 1
         elif event.kind == "assistant.block.started":
             payload = _exact_payload(event, {"block_id", "block_type"})

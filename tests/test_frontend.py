@@ -27,7 +27,7 @@ def test_session_ui_exposes_create_restore_delete_and_multiturn_surfaces() -> No
 
     assert required_ids <= html_ids
     assert 'api(agentApiPath("/sessions")' in SCRIPT
-    assert "agentApiPath(`/sessions/${encodeURIComponent(sessionId)}`)" in SCRIPT
+    assert "`/sessions/${encodeURIComponent(sessionId)}`" in SCRIPT
     assert "`/sessions/${encodeURIComponent(sessionId)}/runs`" in SCRIPT
     assert 'method: "DELETE"' in SCRIPT
     assert "preserveTimeline: true" in SCRIPT
@@ -63,6 +63,77 @@ def test_conversation_first_workspace_keeps_operations_available_on_demand() -> 
     assert "@media (max-width: 860px)" in STYLES
 
 
+def test_responsive_shell_has_safe_viewport_and_readable_status_colors() -> None:
+    assert "viewport-fit=cover" in INDEX
+    assert "interactive-widget=resizes-content" in INDEX
+    assert "100dvh" in STYLES
+    assert "env(safe-area-inset-top, 0px)" in STYLES
+    assert "env(safe-area-inset-bottom)" in STYLES
+    assert 'aria-label="上下文窗口占用"' in INDEX
+    assert (
+        'aria-describedby="context-usage-value context-usage-detail"' in INDEX
+    )
+    assert 'id="status-text" role="status" aria-live="polite"' in INDEX
+    assert 'id="conversation-messages"' in INDEX
+    assert 'role="log"' in INDEX
+    assert 'aria-live="off"' in INDEX
+    for live_id in (
+        "interaction-live-status",
+        "preparation-live-status",
+        "run-live-status",
+        "failure-live-status",
+    ):
+        assert f'id="{live_id}"' in INDEX
+    assert "transition: none !important" in STYLES
+    assert "animation: none !important" in STYLES
+    assert re.search(
+        r"\.session-menu-trigger\s*\{[^}]*min-width:\s*2\.75rem;"
+        r"[^}]*min-height:\s*2\.75rem;",
+        STYLES,
+        re.DOTALL,
+    )
+    assert "font-size: 0.9rem" in STYLES
+
+    def css_color(variable: str) -> str:
+        match = re.search(rf"--{re.escape(variable)}:\s*(#[0-9a-fA-F]{{6}})", STYLES)
+        assert match is not None
+        return match.group(1)
+
+    def luminance(color: str) -> float:
+        channels = [int(color[offset : offset + 2], 16) / 255 for offset in (1, 3, 5)]
+        linear = [
+            value / 12.92
+            if value <= 0.04045
+            else ((value + 0.055) / 1.055) ** 2.4
+            for value in channels
+        ]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    def contrast(foreground: str, background: str) -> float:
+        values = sorted((luminance(foreground), luminance(background)), reverse=True)
+        return (values[0] + 0.05) / (values[1] + 0.05)
+
+    muted = css_color("muted")
+    accent = css_color("accent")
+    accent_soft = css_color("accent-soft")
+    panel_raised = css_color("panel-raised")
+    lane_background = "#f6f8f4"
+    lane_header_rule = _css_rule(".sequence-lane-header")
+    sequence_node_rule = _css_rule(".sequence-node,\n.event-entry")
+    assert "background: #f6f8f4" in lane_header_rule
+    assert "background: #ffffff" in sequence_node_rule
+    assert contrast(muted, "#ffffff") >= 4.5
+    assert contrast(muted, accent_soft) >= 4.5
+    assert contrast(accent, "#ffffff") >= 4.5
+    assert contrast(accent, accent_soft) >= 4.5
+    for lane in ("user", "harness", "llm", "tool"):
+        assert contrast(css_color(lane), lane_background) >= 4.5
+    assert contrast(css_color("tool"), accent_soft) >= 4.5
+    assert contrast(css_color("tool"), panel_raised) >= 4.5
+    assert contrast(css_color("text"), "#ffffff") >= 4.5
+    assert contrast(muted, "#ffffff") >= 4.5
+
+
 def test_conversation_follows_latest_and_projects_trusted_context_usage() -> None:
     required_ids = {
         "conversation-latest-button",
@@ -74,6 +145,8 @@ def test_conversation_follows_latest_and_projects_trusted_context_usage() -> Non
         "context-usage-detail",
         "turn-token-usage-label",
         "turn-token-usage-value",
+        "message-byte-usage",
+        "continue-session-button",
     }
     html_ids = set(re.findall(r'\bid="([a-z0-9-]+)"', INDEX))
 
@@ -85,34 +158,69 @@ def test_conversation_follows_latest_and_projects_trusted_context_usage() -> Non
     assert "elements.conversationMessages.scrollTop =" in SCRIPT
     assert "elements.conversationMessages.scrollHeight" in SCRIPT
     assert "scroll-behavior: auto" in STYLES
-    assert "function captureSessionContextUsage" in SCRIPT
+    assert "function refreshNextTurnPreview" in SCRIPT
+    assert "/context-preview" in SCRIPT
+    assert "function validNextTurnPreview" in SCRIPT
+    assert "function validChatOnlyProjection" in SCRIPT
+    assert "CHAT_ONLY_PROJECTION_FIELDS" in SCRIPT
+    assert 'value.version === "next-turn-chat-only-projection-v1"' in SCRIPT
+    assert "contextProjectionForDisplay" in SCRIPT
     assert "function captureSessionTurnUsage" in SCRIPT
-    assert 'envelope?.kind !== "run.started"' in SCRIPT
-    assert "plan.estimated_input_tokens" in SCRIPT
-    assert "plan.operational_context_tokens" in SCRIPT
-    assert "plan.compact_at_tokens" in SCRIPT
+    assert "plan.fixed_context_tokens" in SCRIPT
+    assert "plan.safe_user_tokens" in SCRIPT
+    assert "plan.compact_before_user_tokens" in SCRIPT
+    assert "plan.fixed_context_error_margin_tokens" in SCRIPT
+    assert "toolset_calibration_unavailable" in SCRIPT
+    assert "纯对话实测不能安全推算工具场景" in SCRIPT
+    assert 'plan.projection_mode === "conservative_tools"' in SCRIPT
+    assert 'typeof value.chat_calibration_available === "boolean"' in SCRIPT
+    assert "不使用浏览器估算 token" in SCRIPT
     assert 'envelope.kind === "model.response.finished"' in SCRIPT
     assert "payload.input_tokens" in SCRIPT
     assert "payload.output_tokens" in SCRIPT
     assert "aggregate.last_input_tokens" in SCRIPT
-    assert "usage.firstInputTokens + usage.finalOutputTokens" in SCRIPT
-    assert 'usage.terminalKind === "run.completed"' in SCRIPT
-    assert "首次完整请求" in SCRIPT
-    assert "最终回答" in SCRIPT
+    assert "usage.firstInputTokens + usage.finalOutputTokens" not in SCRIPT
+    assert "占用约" in SCRIPT
+    assert "剩余约" in SCRIPT
+    assert "下一条消息安全可写约" in SCRIPT
+    assert "占用数与剩余比例暂不可用" in SCRIPT
+    assert "纯对话实测基线；若下一条启用工具，将在提交前重算" in SCRIPT
     assert "usage.providerResponseCount === 0" in SCRIPT
     assert "aggregate.input_tokens === aggregate.last_input_tokens" in SCRIPT
     assert "lastInputTokens" not in SCRIPT
     assert "lastOutputTokens" not in SCRIPT
-    assert "触发压缩前约可写" in SCRIPT
-    assert "Provider 实测推导占用约" in SCRIPT
+    assert "自动整理前还可增加约" in SCRIPT
+    assert "Provider 实测推导占用约" not in SCRIPT
     assert "aggregate.complete" in SCRIPT
     assert ".context-usage-meter" in STYLES
     assert ".context-usage-detail" in STYLES
     assert ".turn-token-usage" in STYLES
+    assert "function enforceMessageInputLimit" in SCRIPT
+    assert 'maxlength="8192"' in INDEX
+    assert "new TextEncoder().encode(message).length > MESSAGE_MAX_BYTES" in SCRIPT
+    assert "messageBytes > 8192" in SCRIPT
+    assert "/continue" in SCRIPT
+
+
+def test_session_action_menu_escapes_scroll_clipping() -> None:
+    assert 'menuBody.setAttribute("popover", "auto")' in SCRIPT
+    assert 'menuTrigger.setAttribute("popovertarget", popoverId)' in SCRIPT
+    assert "positionSessionMenuPopover(menuTrigger, menuBody)" in SCRIPT
+    assert ".session-menu-popover[popover]:popover-open" in STYLES
+    popover_rule = _css_rule(".session-menu-popover")
+    assert "position: fixed" in popover_rule
+    assert "max-height: calc(100dvh - 1rem)" in popover_rule
 
 
 def test_model_timeout_stages_have_operator_visible_status() -> None:
+    api_client = _function_body("api")
     assert "const MODEL_ERROR_LABELS" in SCRIPT
+    assert "const API_ERROR_LABELS" in SCRIPT
+    assert "const HTTP_ERROR_LABELS" in SCRIPT
+    assert "function modelErrorLabel" in SCRIPT
+    assert "无法连接本地服务，请检查服务状态后重试" in api_client
+    assert "detailObject?.message" not in api_client
+    assert 'typeof body.detail === "string"' not in api_client
     assert "model_first_frame_timeout" in SCRIPT
     assert "model_stream_idle_timeout" in SCRIPT
     assert "model_turn_deadline" in SCRIPT
@@ -145,7 +253,7 @@ def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     deletion = _function_body("deleteAgent")
 
     assert required_ids <= html_ids
-    assert "系统 Agent 是正式默认运行时" in INDEX
+    assert "系统智能体是正式默认运行时" in INDEX
     assert 'const SYSTEM_AGENT_ID = "00000000-0000-4000-8000-000000000001"' in SCRIPT
     assert 'api("/api/agents")' in SCRIPT
     assert "function agentApiPath" in SCRIPT
@@ -153,8 +261,10 @@ def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     assert "运行环境 v${agent.generation}" in renderer
     assert "switchAgent(agent.agent_id)" in renderer
     assert "clearSelectedSession()" in _function_body("loadAgentSurface")
-    assert "await refreshCommands()" in _function_body("loadAgentSurface")
-    assert "await refreshSessions(null)" in _function_body("loadAgentSurface")
+    assert "await refreshCommands(agentId, agentEpoch)" in _function_body("loadAgentSurface")
+    assert "await refreshSessions(null, agentId, agentEpoch)" in _function_body(
+        "loadAgentSurface"
+    )
     assert 'method: "POST"' in creator
     assert 'method: "PATCH"' in renamer
     assert "renamed.generation !== agent.generation" in renamer
@@ -168,12 +278,14 @@ def test_agent_drawer_exposes_safe_scoped_lifecycle_management() -> None:
     assert "agent.agent_id === SYSTEM_AGENT_ID" in renamer
     assert "agent.agent_id === SYSTEM_AGENT_ID" in upgrader
     assert "agent.agent_id === SYSTEM_AGENT_ID" in deletion
-    assert "其会话、Skill、Task、环境和沙箱数据都会清除" in deletion
+    assert "其会话、已安装能力、后台任务、环境和沙箱数据都会清除" in deletion
     assert "PDF / DOCX 依赖可跨会话复用" in INDEX
     assert "重命名不会重建环境" in INDEX
     assert ".agent-advanced" in STYLES
     assert 'agentApiPath("/research-environment")' in SCRIPT
-    assert "await refreshResearchEnvironment()" in _function_body("loadAgentSurface")
+    assert "await refreshResearchEnvironment(agentId, agentEpoch)" in _function_body(
+        "loadAgentSurface"
+    )
     assert '.innerHTML' not in renderer
 
 
@@ -345,7 +457,8 @@ def test_each_run_keeps_an_independent_timeline_view_during_live_switching() -> 
     assert "state.timelineEntriesByRun.get(envelope.run_id)" in event_adder
     assert "state.timelineEntriesByRun.set(envelope.run_id, entries)" in event_adder
     assert "envelope.run_id === state.selectedTimelineRunId" in event_adder
-    assert "state.timelineEntriesByRun.clear()" in session_selector
+    assert "pruneInactiveTimelineCaches()" in session_selector
+    assert "state.timelineEntriesByRun.clear()" not in session_selector
 
 
 def test_timeline_run_switch_ignores_stale_replay_responses() -> None:
@@ -418,6 +531,8 @@ def test_context_inspector_rejects_stale_or_unexpected_responses() -> None:
     assert "contextLoadIsCurrent" in inspector
     assert "error.message" not in inspector
     assert "CONTEXT_RESPONSE_FIELDS" in validator
+    assert "LEGACY_CONTEXT_PLAN_FIELDS" in validator
+    assert "planFields" in validator
     assert "CONTEXT_SECTION_FIELDS" in validator
     assert 'value.availability === "exact"' in validator
     assert 'value.availability === "summary_only"' in validator
@@ -603,6 +718,9 @@ def test_event_cards_summarize_model_iterations_without_body_or_full_digest() ->
     assert "payload.input_tokens" in summary
     assert "payload.output_tokens" in summary
     assert 'envelope.kind === "run.started"' in summary
+    assert 'envelope.kind === "run.completed"' in summary
+    assert '"max_output"' in summary
+    assert "已保留" in summary
     assert "context.included_history_message_count" in summary
     assert "context.history_message_count" in summary
     assert 'envelope.kind.startsWith("tool.call.")' in summary
@@ -642,8 +760,11 @@ def test_terminal_event_keeps_the_owning_run_locked_until_reconciliation() -> No
     assert "runContext.terminalSeen = true" in renderer
     assert "state.activeRun = null" not in renderer
     assert "state.settling = false" not in renderer
-    assert "state.activeRun = null" in completer
-    assert "state.settling = false" in completer
+    assert "state.activeRuns.delete(runContext.sessionId)" in completer
+    assert "state.backgroundCompletions.set(runContext.sessionId" in completer
+    assert "const foreground = state.sessionId === runContext.sessionId" in completer
+    assert 'runContext.terminalPayload?.reason === "max_output"' in completer
+    assert "已保留此前内容" in completer
 
 
 def test_sse_reconnect_is_bounded_and_resumes_from_the_last_sequence() -> None:
@@ -690,8 +811,8 @@ def test_mutations_lock_controls_and_conflicts_refresh_server_state() -> None:
     deletion = _function_body("deleteSession")
 
     assert "state.mutationPending" in controls
-    assert "state.mutationPending = true" in deletion
-    assert "state.mutationPending = false" in deletion
+    assert "const mutationScope = beginMutation()" in deletion
+    assert "finishMutation(mutationScope)" in deletion
     assert "error.status === 409" in deletion
     assert "await refreshSessions(state.sessionId)" in deletion
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -38,6 +39,7 @@ from agent_builder_v2.web import (
     MAX_JSON_BODY_BYTES,
     SESSION_COOKIE,
     LoginLimiter,
+    _rename_runtime_conversation,
     create_app,
 )
 from agent_builder_v2.sessions import (
@@ -45,10 +47,13 @@ from agent_builder_v2.sessions import (
     ConversationConflictError,
     ConversationDeleteResult,
     ConversationNotFoundError,
+    ConversationPage,
     ConversationStoreUnavailableError,
+    ConversationTurnCapacityError,
     ConversationSummary,
     ConversationTurn,
     PermissionRecord,
+    TurnTerminalSummary,
 )
 from agent_builder_v2.skills import SkillRecord
 from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
@@ -276,6 +281,10 @@ class _RunService:
         self.permissions: dict[str, PermissionRecord] = {}
         self.tasks: dict[str, _TaskRecord] = {}
         self.skills: dict[str, SkillRecord] = {}
+        self.preparations: dict[str, dict[str, object]] = {}
+        self.preparation_cancellations: list[str] = []
+        self.get_conversation_calls = 0
+        self.get_conversation_page_calls = 0
 
     async def create_conversation(self, title: str) -> Conversation:
         conversation = Conversation(
@@ -311,10 +320,82 @@ class _RunService:
         )
 
     async def get_conversation(self, conversation_id: str) -> Conversation:
+        self.get_conversation_calls += 1
         try:
             return self.conversations[conversation_id]
         except KeyError as exc:
             raise ConversationNotFoundError("conversation not found") from exc
+
+    async def get_conversation_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        before_position: int | None = None,
+        expected_revision: int | None = None,
+    ) -> ConversationPage:
+        self.get_conversation_page_calls += 1
+        try:
+            current = self.conversations[conversation_id]
+        except KeyError as exc:
+            raise ConversationNotFoundError("conversation not found") from exc
+        if expected_revision is not None and current.revision != expected_revision:
+            raise ConversationConflictError("stale page revision")
+        if before_position is not None and (
+            not any(turn.position == before_position for turn in current.turns)
+            or not any(turn.position < before_position for turn in current.turns)
+        ):
+            raise ConversationConflictError("stale page boundary")
+        eligible = tuple(
+            turn
+            for turn in current.turns
+            if before_position is None or turn.position < before_position
+        )
+        summary = ConversationSummary(
+            conversation_id=current.conversation_id,
+            agent_id=current.agent_id,
+            title=current.title,
+            created_at=current.created_at,
+            updated_at=current.updated_at,
+            revision=current.revision,
+            active_run_id=current.active_run_id,
+            turn_count=len(current.turns),
+            completed_turn_count=sum(
+                turn.status == "completed" for turn in current.turns
+            ),
+            last_run_id=current.turns[-1].run_id if current.turns else None,
+        )
+        return ConversationPage(
+            summary=summary,
+            turns=eligible[-limit:],
+            limit=limit,
+            eligible_turn_count=len(eligible),
+            before_position=before_position,
+        )
+
+    async def rename_conversation(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        expected_revision: int,
+    ) -> Conversation:
+        try:
+            current = self.conversations[conversation_id]
+        except KeyError as exc:
+            raise ConversationNotFoundError("conversation not found") from exc
+        if not title.strip() or len(title.encode("utf-8")) > 256:
+            raise ValueError("invalid title")
+        if current.revision != expected_revision:
+            raise ConversationConflictError("stale rename")
+        renamed = replace(
+            current,
+            title=title,
+            revision=current.revision + (title != current.title),
+            updated_at="2026-07-21T00:00:02.000Z",
+        )
+        self.conversations[conversation_id] = renamed
+        return renamed
 
     async def delete_conversation(
         self, conversation_id: str
@@ -325,6 +406,76 @@ class _RunService:
             deleted_turns=len(value.turns) if value is not None else 0,
             deleted_events=0,
         )
+
+    async def create_conversation_continuation(
+        self, source_conversation_id: str, *, title: str = "续接会话"
+    ) -> tuple[Conversation, int, int]:
+        if source_conversation_id not in self.conversations:
+            raise ConversationNotFoundError("conversation not found")
+        conversation = Conversation(
+            conversation_id="6" * 32,
+            agent_id=self.agent_id,
+            title=title,
+            created_at="2026-07-21T00:00:00.000Z",
+            updated_at="2026-07-21T00:00:00.000Z",
+            revision=0,
+            active_run_id=None,
+            turns=(),
+        )
+        self.conversations[conversation.conversation_id] = conversation
+        return conversation, 2, 3
+
+    async def next_turn_preview(
+        self, conversation_id: str, *, model_id: str | None = None
+    ) -> dict[str, object]:
+        if conversation_id not in self.conversations:
+            raise ConversationNotFoundError("conversation not found")
+        return {
+            "version": "next-turn-preview-v1",
+            "agent_id": self.agent_id,
+            "conversation_id": conversation_id,
+            "conversation_revision": self.conversations[conversation_id].revision,
+            "model_id": model_id or "qwen3.5:2b",
+            "availability": "available",
+            "basis": "provider-calibrated-context-v1",
+            "fixed_context_tokens": 1_024,
+            "fixed_context_error_margin_tokens": 64,
+            "safe_user_tokens": 20_000,
+            "single_message_byte_limit": 8_192,
+        }
+
+    async def preparation_status(
+        self, conversation_id: str
+    ) -> dict[str, object] | None:
+        if conversation_id not in self.conversations:
+            raise ConversationNotFoundError("conversation not found")
+        return self.preparations.get(conversation_id)
+
+    async def cancel_preparation(
+        self, conversation_id: str, operation_id: str
+    ) -> dict[str, object]:
+        if conversation_id not in self.conversations:
+            raise ConversationNotFoundError("conversation not found")
+        preparation = self.preparations.get(conversation_id)
+        if preparation is None:
+            return {
+                "version": "run-preparation-cancel-v1",
+                "state": "idle",
+                "target": None,
+            }
+        if preparation.get("operation_id") != operation_id:
+            return {
+                "version": "run-preparation-cancel-v1",
+                "state": "stale",
+                "target": None,
+            }
+        self.preparation_cancellations.append(conversation_id)
+        preparation["state"] = "cancelling"
+        return {
+            "version": "run-preparation-cancel-v1",
+            "state": "cancellation_requested",
+            "target": "preparation",
+        }
 
     async def start(self, command: StartRunCommand) -> _RunRecord:
         command.validate()
@@ -1141,6 +1292,18 @@ def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
     )
     assert created.status_code == 201
     session_id = created.json()["session_id"]
+    renamed_session = client.patch(
+        f"/api/agents/{agent_id}/sessions/{session_id}",
+        json={"title": "Scoped renamed", "revision": created.json()["revision"]},
+        headers=mutation,
+    )
+    assert renamed_session.status_code == 200
+    assert renamed_session.json()["title"] == "Scoped renamed"
+    scoped_detail = client.get(
+        f"/api/agents/{agent_id}/sessions/{session_id}?limit=1"
+    )
+    assert scoped_detail.status_code == 200
+    assert scoped_detail.json()["page"]["limit"] == 1
     started = client.post(
         f"/api/agents/{agent_id}/sessions/{session_id}/runs",
         json={"message": "isolated", "model_id": "qwen3.5:2b", "compact": True},
@@ -1167,6 +1330,11 @@ def test_agent_scoped_session_run_stream_and_context_do_not_cross_agents(
     assert client.post(
         f"/api/agents/{agent_id}/sessions/{session_id}/runs",
         json={"message": "invalid", "compact": "yes"},
+        headers=mutation,
+    ).status_code == 400
+    assert client.post(
+        f"/api/agents/{agent_id}/sessions/{session_id}/runs",
+        json={"message": "invalid", "semantic_summary": True},
         headers=mutation,
     ).status_code == 400
 
@@ -1349,6 +1517,7 @@ def test_authenticated_conversation_create_restore_multiturn_and_delete_api(
             "created_at": "2026-07-18T00:00:00.100Z",
             "turn_id": "5" * 32,
             "run_id": RUN_ID,
+            "turn_position": 1,
             "turn_status": "running",
         }
     ]
@@ -1395,6 +1564,557 @@ def test_authenticated_conversation_create_restore_multiturn_and_delete_api(
     )
     assert deleted.status_code == 204
     assert client.get(f"/api/sessions/{conversation_id}").status_code == 404
+
+
+def test_preview_is_authenticated_no_store_and_continuation_is_explicit(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    assert client.get(
+        f"/api/sessions/{'4' * 32}/context-preview"
+    ).status_code == 401
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    csrf_token = login.json()["csrf_token"]
+    mutation_headers = {**SAME_ORIGIN, "x-csrf-token": csrf_token}
+    created = client.post(
+        "/api/sessions", json={"title": "source"}, headers=mutation_headers
+    )
+    source_id = created.json()["session_id"]
+
+    preview = client.get(
+        f"/api/sessions/{source_id}/context-preview?model_id=qwen3.5%3A2b"
+    )
+    assert preview.status_code == 200
+    assert preview.headers["cache-control"] == "no-store"
+    assert preview.json()["conversation_id"] == source_id
+    assert preview.json()["single_message_byte_limit"] == 8_192
+    assert "prompt" not in preview.text.lower()
+    assert client.get(
+        f"/api/sessions/{source_id}/context-preview?unexpected=1"
+    ).status_code == 400
+
+    assert client.post(
+        f"/api/sessions/{source_id}/continue", json={"title": "next"},
+        headers=SAME_ORIGIN,
+    ).status_code == 403
+    continued = client.post(
+        f"/api/sessions/{source_id}/continue", json={"title": "next"},
+        headers=mutation_headers,
+    )
+    assert continued.status_code == 201
+    assert continued.json()["session_id"] == "6" * 32
+    assert continued.json()["continuation"] == {
+        "source_session_id": source_id,
+        "included_completed_turns": 2,
+        "omitted_completed_turns": 3,
+        "authority": "untrusted_conversation_data",
+    }
+    assert continued.json()["relationship"] == {
+        "version": "conversation-relationship-v1",
+        "type": "continue",
+        "source_session_id": source_id,
+        "source_preserved": True,
+        "branch_point": "completed_head",
+        "context_transfer": {
+            "type": "bounded_completed_turn_projection",
+            "included_completed_turns": 2,
+            "omitted_completed_turns": 3,
+            "authority": "untrusted_conversation_data",
+        },
+    }
+    branched = client.post(
+        f"/api/sessions/{source_id}/continue",
+        json={"mode": "branch"},
+        headers=mutation_headers,
+    )
+    assert branched.status_code == 201
+    assert branched.json()["title"] == "分支会话"
+    assert branched.json()["relationship"]["type"] == "branch"
+    invalid_mode = client.post(
+        f"/api/sessions/{source_id}/continue",
+        json={"mode": "copy"},
+        headers=mutation_headers,
+    )
+    assert invalid_mode.status_code == 400
+    assert invalid_mode.json()["detail"]["code"] == (
+        "invalid_session_relationship"
+    )
+    assert client.get(f"/api/sessions/{source_id}").status_code == 200
+
+
+def test_preparation_progress_is_authenticated_bounded_and_agent_scoped(
+    web_client: tuple[TestClient, _Commands],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _commands = web_client
+    conversation_id = "4" * 32
+    assert client.get(
+        f"/api/sessions/{conversation_id}/preparation"
+    ).status_code == 401
+
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    assert login.status_code == 200
+    mutation_headers = {
+        **SAME_ORIGIN,
+        "x-csrf-token": login.json()["csrf_token"],
+    }
+    service = client.app.state.run_service
+    created = client.post(
+        "/api/sessions",
+        json={"title": "preparation"},
+        headers=mutation_headers,
+    )
+    assert created.status_code == 201
+    conversation_id = created.json()["session_id"]
+
+    idle = client.get(f"/api/sessions/{conversation_id}/preparation")
+    assert idle.status_code == 200
+    assert idle.headers["cache-control"] == "no-store"
+    assert idle.json() == {
+        "version": "run-preparation-v1",
+        "state": "idle",
+        "operation_id": None,
+        "stage": None,
+        "elapsed_ms": 0,
+    }
+
+    operation_id = "7" * 32
+    service.preparations[conversation_id] = {
+        "version": "run-preparation-v1",
+        "state": "preparing",
+        "operation_id": operation_id,
+        "stage": "summarizing_history",
+        "elapsed_ms": 1_234,
+    }
+    preparing = client.get(f"/api/sessions/{conversation_id}/preparation")
+    assert preparing.status_code == 200
+    assert preparing.json() == service.preparations[conversation_id]
+    assert "prompt" not in preparing.text.lower()
+    assert "message" not in preparing.text.lower()
+    cancel_path = f"/api/sessions/{conversation_id}/preparation/cancel"
+    assert client.post(
+        cancel_path, json={"operation_id": operation_id}
+    ).status_code == 403
+    cancelled = client.post(
+        cancel_path,
+        json={"operation_id": operation_id},
+        headers=mutation_headers,
+    )
+    assert cancelled.status_code == 202
+    assert cancelled.headers["cache-control"] == "no-store"
+    assert cancelled.json() == {
+        "version": "run-preparation-cancel-v1",
+        "state": "cancellation_requested",
+        "target": "preparation",
+    }
+    assert service.preparation_cancellations == [conversation_id]
+    stale = client.post(
+        cancel_path,
+        json={"operation_id": "6" * 32},
+        headers=mutation_headers,
+    )
+    assert stale.status_code == 202
+    assert stale.json() == {
+        "version": "run-preparation-cancel-v1",
+        "state": "stale",
+        "target": None,
+    }
+    assert client.post(
+        cancel_path, json={"unexpected": True}, headers=mutation_headers
+    ).status_code == 400
+    assert client.post(
+        f"{cancel_path}?unexpected=1",
+        json={"operation_id": operation_id},
+        headers=mutation_headers,
+    ).status_code == 404
+    service.preparations.pop(conversation_id)
+    idle_cancel = client.post(
+        cancel_path,
+        json={"operation_id": operation_id},
+        headers=mutation_headers,
+    )
+    assert idle_cancel.status_code == 202
+    assert idle_cancel.json() == {
+        "version": "run-preparation-cancel-v1",
+        "state": "idle",
+        "target": None,
+    }
+    assert client.post(
+        f"/api/sessions/{'f' * 32}/preparation/cancel",
+        json={"operation_id": operation_id},
+        headers=mutation_headers,
+    ).status_code == 404
+    assert client.get(
+        f"/api/sessions/{conversation_id}/preparation?unexpected=1"
+    ).status_code == 404
+    assert client.get(
+        f"/api/sessions/{'f' * 32}/preparation"
+    ).status_code == 404
+
+    agent_id = "b" * 32
+    agent_service = _RunService(agent_id)
+    engines = QueryEngineRegistry(agent_service, agent_id)  # type: ignore[arg-type]
+    commands = _Commands(engines)
+    client.app.state.runtime_manager.register(agent_id, agent_service, engines, commands)
+    agent_created = client.post(
+        f"/api/agents/{agent_id}/sessions",
+        json={"title": "agent preparation"},
+        headers=mutation_headers,
+    )
+    agent_conversation_id = agent_created.json()["session_id"]
+    agent_operation_id = "8" * 32
+    agent_service.preparations[agent_conversation_id] = {
+        "version": "run-preparation-v1",
+        "state": "preparing",
+        "operation_id": agent_operation_id,
+        "stage": "admitting_run",
+        "elapsed_ms": 17,
+    }
+    scoped = client.get(
+        f"/api/agents/{agent_id}/sessions/{agent_conversation_id}/preparation"
+    )
+    assert scoped.status_code == 200
+    assert scoped.json()["stage"] == "admitting_run"
+    agent_cancelled = client.post(
+        f"/api/agents/{agent_id}/sessions/{agent_conversation_id}/preparation/cancel",
+        json={"operation_id": agent_operation_id},
+        headers=mutation_headers,
+    )
+    assert agent_cancelled.status_code == 202
+    assert agent_cancelled.json()["target"] == "preparation"
+    assert agent_service.preparation_cancellations == [agent_conversation_id]
+    assert client.post(
+        f"/api/agents/{'c' * 32}/sessions/"
+        f"{agent_conversation_id}/preparation/cancel",
+        json={"operation_id": agent_operation_id},
+        headers=mutation_headers,
+    ).status_code == 404
+    service.preparations[agent_conversation_id] = {
+        "version": "run-preparation-v1",
+        "state": "preparing",
+        "operation_id": operation_id,
+        "stage": "summarizing_history",
+        "elapsed_ms": 1_234,
+    }
+    root_scoped = client.get(
+        f"/api/agents/{PROTOTYPE_AGENT_ID}/sessions/"
+        f"{agent_conversation_id}/preparation"
+    )
+    assert root_scoped.status_code == 200
+    assert root_scoped.json()["stage"] == "summarizing_history"
+
+    async def unavailable(
+        _conversation_id: str, _operation_id: str
+    ) -> dict[str, object]:
+        raise ConversationStoreUnavailableError("injected unavailable store")
+
+    monkeypatch.setattr(agent_service, "cancel_preparation", unavailable)
+    unavailable_response = client.post(
+        f"/api/agents/{agent_id}/sessions/"
+        f"{agent_conversation_id}/preparation/cancel",
+        json={"operation_id": agent_operation_id},
+        headers=mutation_headers,
+    )
+    assert unavailable_response.status_code == 503
+    assert unavailable_response.json() == {
+        "detail": "preparation cancellation is unavailable"
+    }
+
+
+def test_session_rename_is_csrf_bound_typed_and_persistent_in_detail(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    mutation = {**SAME_ORIGIN, "x-csrf-token": login.json()["csrf_token"]}
+    created = client.post(
+        "/api/sessions", json={"title": "before"}, headers=mutation
+    )
+    conversation_id = created.json()["session_id"]
+
+    assert client.patch(
+        f"/api/sessions/{conversation_id}",
+        json={"title": "after", "revision": created.json()["revision"]},
+        headers=SAME_ORIGIN,
+    ).status_code == 403
+    renamed = client.patch(
+        f"/api/sessions/{conversation_id}",
+        json={"title": "研究会话", "revision": created.json()["revision"]},
+        headers=mutation,
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "研究会话"
+    assert renamed.json()["revision"] == created.json()["revision"] + 1
+    assert client.get(
+        f"/api/sessions/{conversation_id}"
+    ).json()["session"]["title"] == "研究会话"
+
+    missing_revision = client.patch(
+        f"/api/sessions/{conversation_id}",
+        json={"title": "missing CAS"},
+        headers=mutation,
+    )
+    assert missing_revision.status_code == 400
+    assert missing_revision.json()["detail"]["code"] == "invalid_session_rename"
+    stale = client.patch(
+        f"/api/sessions/{conversation_id}",
+        json={"title": "stale", "revision": created.json()["revision"]},
+        headers=mutation,
+    )
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "session_rename_conflict"
+
+    invalid = client.patch(
+        f"/api/sessions/{conversation_id}",
+        json={"title": "  ", "revision": renamed.json()["revision"]},
+        headers=mutation,
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == {
+        "code": "invalid_session_title",
+        "message": "title must be a non-empty string within the limit",
+    }
+    missing = client.patch(
+        f"/api/sessions/{'f' * 32}",
+        json={"title": "hidden", "revision": 0},
+        headers=mutation,
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "session_not_found"
+
+
+def test_web_rename_helper_never_penetrates_runtime_store(tmp_path: Path) -> None:
+    from agent_builder_v2.sessions import ConversationStore
+
+    data_root = tmp_path / PROTOTYPE_AGENT_ID
+    data_root.mkdir(mode=0o700)
+    store = ConversationStore(data_root / "state.sqlite", PROTOTYPE_AGENT_ID)
+    conversation = store.create_conversation("store title")
+
+    class RuntimeBoundary:
+        def __init__(self) -> None:
+            self.conversations = store
+            self.calls: list[tuple[str, str, int]] = []
+
+        async def rename_conversation(
+            self,
+            conversation_id: str,
+            title: str,
+            *,
+            expected_revision: int,
+        ) -> Conversation:
+            self.calls.append((conversation_id, title, expected_revision))
+            return replace(
+                conversation,
+                title="service title",
+                revision=expected_revision + 1,
+            )
+
+    runtime = RuntimeBoundary()
+    try:
+        renamed = asyncio.run(
+            _rename_runtime_conversation(
+                runtime,
+                conversation.conversation_id,
+                "requested title",
+                expected_revision=conversation.revision,
+            )
+        )
+        assert renamed.title == "service title"
+        assert runtime.calls == [
+            (
+                conversation.conversation_id,
+                "requested title",
+                conversation.revision,
+            )
+        ]
+        assert store.get_conversation(conversation.conversation_id).title == (
+            "store title"
+        )
+    finally:
+        store.close()
+
+
+def test_session_detail_uses_stable_latest_turn_pagination_and_safe_terminal(
+    web_client: tuple[TestClient, _Commands],
+) -> None:
+    client, _commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    mutation = {**SAME_ORIGIN, "x-csrf-token": login.json()["csrf_token"]}
+    created = client.post(
+        "/api/sessions", json={"title": "long"}, headers=mutation
+    )
+    conversation_id = created.json()["session_id"]
+    service = client.app.state.run_service
+
+    turns = tuple(
+        ConversationTurn(
+            turn_id=f"{1_000 + position:032x}",
+            conversation_id=conversation_id,
+            run_id=f"{2_000 + position:032x}",
+            position=position,
+            status="failed" if position == 40 else "completed",
+            user_content=f"user-{position}",
+            assistant_content=(None if position == 40 else f"assistant-{position}"),
+            created_at=f"2026-07-21T00:{position // 60:02d}:{position % 60:02d}.000Z",
+            updated_at=f"2026-07-21T00:{position // 60:02d}:{position % 60:02d}.500Z",
+            terminal=(
+                TurnTerminalSummary(
+                    "model_first_frame_timeout", "model", True, 120_000
+                )
+                if position == 40
+                else None
+            ),
+        )
+        for position in range(1, 71)
+    )
+    service.conversations[conversation_id] = replace(
+        service.conversations[conversation_id],
+        revision=140,
+        turns=turns,
+    )
+
+    latest = client.get(f"/api/sessions/{conversation_id}")
+    assert latest.status_code == 200
+    assert service.get_conversation_page_calls == 1
+    assert service.get_conversation_calls == 0
+    page = latest.json()["page"]
+    assert page == {
+        "version": "turn-page-v2",
+        "limit": 32,
+        "before_cursor": None,
+        "returned_turns": 32,
+        "total_turns": 70,
+        "oldest_position": 39,
+        "newest_position": 70,
+        "has_older": True,
+        "has_newer": False,
+        "next_before_cursor": page["next_before_cursor"],
+    }
+    cursor = page["next_before_cursor"]
+    assert isinstance(cursor, str)
+    assert cursor != "39"
+    assert 64 < len(cursor) <= 256
+    assert latest.json()["messages"][0]["content"] == "user-39"
+    failed = next(
+        item for item in latest.json()["messages"]
+        if item["turn_status"] == "failed"
+    )
+    assert failed["terminal"] == {
+        "version": "turn-terminal-v1",
+        "code": "model_first_frame_timeout",
+        "stage": "model",
+        "retryable": True,
+        "duration_ms": 120_000,
+    }
+    assert "message" not in failed["terminal"]
+
+    older_url = f"/api/sessions/{conversation_id}?limit=10&before={cursor}"
+    older = client.get(older_url)
+    assert [
+        item["content"] for item in older.json()["messages"] if item["role"] == "user"
+    ] == [f"user-{position}" for position in range(29, 39)]
+    assert older.json()["page"]["before_cursor"] == cursor
+    assert isinstance(older.json()["page"]["next_before_cursor"], str)
+
+    tampered = cursor[:-1] + ("A" if cursor[-1] != "A" else "B")
+    for invalid_cursor in (tampered, "39"):
+        invalid = client.get(
+            f"/api/sessions/{conversation_id}?before={invalid_cursor}"
+        )
+        assert invalid.status_code == 400
+        assert invalid.json()["detail"]["code"] == "invalid_session_cursor"
+
+    other_id = "5" * 32
+    service.conversations[other_id] = replace(
+        service.conversations[conversation_id],
+        conversation_id=other_id,
+        turns=tuple(replace(turn, conversation_id=other_id) for turn in turns),
+    )
+    cross_conversation = client.get(
+        f"/api/sessions/{other_id}?before={cursor}"
+    )
+    assert cross_conversation.status_code == 400
+    assert cross_conversation.json()["detail"]["code"] == (
+        "invalid_session_cursor"
+    )
+
+    service.conversations[conversation_id] = replace(
+        service.conversations[conversation_id],
+        revision=141,
+        turns=(*turns, replace(turns[-1], position=71, turn_id="a" * 32)),
+    )
+    revision_drift = client.get(older_url)
+    assert revision_drift.status_code == 400
+    assert revision_drift.json()["detail"]["code"] == "invalid_session_cursor"
+
+    service.conversations[conversation_id] = replace(
+        service.conversations[conversation_id], revision=140, turns=turns
+    )
+    delete_cursor = client.get(
+        f"/api/sessions/{conversation_id}"
+    ).json()["page"]["next_before_cursor"]
+    deleted = service.conversations.pop(conversation_id)
+    deletion_drift = client.get(
+        f"/api/sessions/{conversation_id}?before={delete_cursor}"
+    )
+    assert deletion_drift.status_code == 400
+    assert deletion_drift.json()["detail"]["code"] == "invalid_session_cursor"
+
+    service.conversations[conversation_id] = deleted
+    restart_cursor = client.get(
+        f"/api/sessions/{conversation_id}"
+    ).json()["page"]["next_before_cursor"]
+    client.app.state.session_cursor_key = b"r" * 32
+    restart_drift = client.get(
+        f"/api/sessions/{conversation_id}?before={restart_cursor}"
+    )
+    assert restart_drift.status_code == 400
+    assert restart_drift.json()["detail"]["code"] == "invalid_session_cursor"
+
+    invalid = client.get(f"/api/sessions/{conversation_id}?limit=65")
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"]["code"] == "invalid_session_page"
+
+
+def test_turn_capacity_has_a_stable_api_error_before_run_creation(
+    web_client: tuple[TestClient, _Commands], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, commands = web_client
+    login = client.post(
+        "/api/auth/login", json={"token": PROJECT_TOKEN}, headers=SAME_ORIGIN
+    )
+    headers = {**SAME_ORIGIN, "x-csrf-token": login.json()["csrf_token"]}
+    created = client.post(
+        "/api/sessions", json={"title": "full"}, headers=headers
+    )
+    conversation_id = created.json()["session_id"]
+
+    async def reject(_command: StartRunCommand) -> object:
+        raise ConversationTurnCapacityError("turn capacity is exhausted")
+
+    monkeypatch.setattr(commands, "start", reject)
+    response = client.post(
+        f"/api/sessions/{conversation_id}/runs",
+        json={"message": "must not run"},
+        headers=headers,
+    )
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "conversation_turn_capacity_exhausted",
+            "message": "conversation turn capacity is exhausted",
+            "turn_limit": 128,
+        }
+    }
 
 
 def test_authenticated_sse_and_cancel_use_query_engine_ownership(
@@ -1500,10 +2220,10 @@ def test_authenticated_retained_context_is_exact_no_store_and_withheld(
     assert payload["content_exposure"] == "withheld"
     assert payload["provider_message_count"] == 2
     assert "provider_messages" not in payload
-    assert payload["renderer"]["version"] == "ordered-sections-v5"
+    assert payload["renderer"]["version"] == "ordered-sections-v7"
     assert (
         payload["renderer"]["section_registry_version"]
-            == "prompt-section-registry-v4"
+            == "prompt-section-registry-v6"
     )
     assert payload["renderer"]["leading_system_sections_merged"] is True
     assert payload["renderer"]["leading_system_section_count"] == 2

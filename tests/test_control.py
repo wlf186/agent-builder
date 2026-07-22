@@ -10,6 +10,7 @@ import stat
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,16 +38,20 @@ from agent_builder_v2.control import (
     _atomic_worker_pid_record,
     _measure_run_tree,
     _marker_from_proc_stat,
+    _summary_negative_is_reusable,
+    _turn_needs_tools,
 )
 from agent_builder_v2.ollama import OllamaBrokerError, OllamaQualification
 from agent_builder_v2.runtime import TurnRuntimeSnapshot
 from agent_builder_v2.sessions import (
+    ConversationConflictError,
     ConversationNotFoundError,
     ConversationStore,
     ConversationStoreUnavailableError,
+    SummaryProjectionRecord,
 )
 from agent_builder_v2.state import EventJournal, JournalCorruptionError
-from agent_builder_v2.tools import prototype_tool_specs
+from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
 
 
 SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -59,6 +64,356 @@ TEST_PROFILE = ModelProfile(
     max_output_tokens=2_048,
     profile_source="test",
 )
+
+
+def test_summary_negative_cache_expires_only_transient_statuses() -> None:
+    now = datetime(2026, 7, 21, 12, 1, 0, tzinfo=timezone.utc)
+
+    def record(status: str, updated_at: str) -> SummaryProjectionRecord:
+        return SummaryProjectionRecord(
+            "1" * 32, status, "a" * 64, None, updated_at
+        )
+
+    assert _summary_negative_is_reusable(
+        record("source_limit", "2020-01-01T00:00:00.000Z"), now=now
+    )
+    assert _summary_negative_is_reusable(
+        record("timeout", "2026-07-21T12:00:30.000Z"), now=now
+    )
+    assert not _summary_negative_is_reusable(
+        record("timeout", "2026-07-21T11:59:59.000Z"), now=now
+    )
+    assert not _summary_negative_is_reusable(
+        record("invalid", "not-a-timestamp"), now=now
+    )
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        ("write a poem for around 500 words", False),
+        ("请写一首大约500字的诗", False),
+        ("What marker did I ask you to remember?", False),
+        ("What is an API and why do agents use tools?", False),
+        ("Explain database indexing with a short example", False),
+        ("请解释智能体和工具调用的原理", False),
+        ("read README.md from the workspace", True),
+        ("list the files in this workspace", True),
+        ("研究这个 PDF 文档", True),
+        ("fix the frontend bug", True),
+        ("Could you implement this fix?", True),
+        ("search the web for the current specification", True),
+        ("read README.md without using tools", False),
+        ("读取 README.md，不要使用工具", False),
+    ],
+)
+def test_turn_tool_router_is_bounded_and_explicit(
+    message: str, expected: bool
+) -> None:
+    assert _turn_needs_tools(message) is expected
+
+
+def test_turn_toolset_hides_tools_for_chat_and_delegate_without_target(
+    tmp_path: Path,
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        chat = await service._turn_effective_toolset(
+            "write a poem for around 500 words", supports_tools=True
+        )
+        workspace = await service._turn_effective_toolset(
+            "read file README.md", supports_tools=True
+        )
+        unsupported = await service._turn_effective_toolset(
+            "read file README.md", supports_tools=False
+        )
+        assert chat.specs == ()
+        assert unsupported.specs == ()
+        assert "file/read_text" in {item.tool_id for item in workspace.specs}
+        assert "agent/delegate" not in {item.tool_id for item in workspace.specs}
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_preparation_progress_is_bounded_observable_and_single_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        conversation = await service.create_conversation("preparation progress")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_prepare(
+            command: StartRunCommand,
+            request_cancelled: asyncio.Event,
+            *,
+            preparation: object | None = None,
+        ) -> RunRecord:
+            del command, request_cancelled
+            service._set_preparation_stage(  # type: ignore[arg-type]
+                preparation, "summarizing_history"
+            )
+            entered.set()
+            await release.wait()
+            raise ValueError("injected preparation stop")
+
+        monkeypatch.setattr(service, "_prepare_run", blocked_prepare)
+        command = StartRunCommand(
+            agent_id=PROTOTYPE_AGENT_ID,
+            conversation_id=conversation.conversation_id,
+            message="prepare this turn",
+        )
+        task = asyncio.create_task(service.start(command))
+        await entered.wait()
+        assert service.conversations is not None
+        original_exists = service.conversations.conversation_exists
+
+        def forbidden_database_lookup(_conversation_id: str) -> bool:
+            raise AssertionError("active preparation status touched SQLite")
+
+        monkeypatch.setattr(
+            service.conversations,
+            "conversation_exists",
+            forbidden_database_lookup,
+        )
+        status = await service.preparation_status(conversation.conversation_id)
+        assert status is not None
+        assert status["version"] == "run-preparation-v1"
+        assert status["state"] == "preparing"
+        assert isinstance(status["operation_id"], str)
+        assert len(status["operation_id"]) == 32
+        assert status["stage"] == "summarizing_history"
+        assert isinstance(status["elapsed_ms"], int)
+        assert 0 <= status["elapsed_ms"] <= 300_000
+        assert "message" not in status
+        assert "model" not in status
+
+        with pytest.raises(
+            ConversationConflictError, match="already has a preparing Run"
+        ):
+            await service.start(command)
+        with pytest.raises(
+            ConversationConflictError, match="preparing Run"
+        ):
+            await service.delete_conversation(conversation.conversation_id)
+        monkeypatch.setattr(
+            service.conversations,
+            "conversation_exists",
+            original_exists,
+        )
+        release.set()
+        with pytest.raises(ValueError, match="injected preparation stop"):
+            await task
+        assert await service.preparation_status(conversation.conversation_id) is None
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_idle_preparation_status_uses_only_agent_scoped_existence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        conversation = await service.create_conversation("fixed-cost status")
+        assert service.conversations is not None
+        original_exists = service.conversations.conversation_exists
+        calls: list[str] = []
+
+        def observed_exists(conversation_id: str) -> bool:
+            calls.append(conversation_id)
+            return original_exists(conversation_id)
+
+        def forbidden_body_loader(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("preparation status loaded Turn content")
+
+        monkeypatch.setattr(
+            service.conversations, "conversation_exists", observed_exists
+        )
+        monkeypatch.setattr(
+            service.conversations, "get_conversation", forbidden_body_loader
+        )
+        monkeypatch.setattr(
+            service.conversations,
+            "_conversation_turns_locked",
+            forbidden_body_loader,
+        )
+        assert await service.preparation_status(conversation.conversation_id) is None
+        missing_id = "f" * 32
+        with pytest.raises(ConversationNotFoundError):
+            await service.preparation_status(missing_id)
+        assert calls == [conversation.conversation_id, missing_id]
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_preparation_cancel_is_prompt_and_converges_without_admitting_a_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        conversation = await service.create_conversation("cancel preparation")
+        entered = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_prepare(
+            command: StartRunCommand,
+            request_cancelled: asyncio.Event,
+            *,
+            preparation: object | None = None,
+        ) -> RunRecord:
+            del command
+            service._set_preparation_stage(  # type: ignore[arg-type]
+                preparation, "summarizing_history"
+            )
+            entered.set()
+            await request_cancelled.wait()
+            cancellation_seen.set()
+            await release.wait()
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(service, "_prepare_run", blocked_prepare)
+        task = asyncio.create_task(
+            service.start(
+                StartRunCommand(
+                    agent_id=PROTOTYPE_AGENT_ID,
+                    conversation_id=conversation.conversation_id,
+                    message="cancel this summary",
+                )
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=0.25)
+        preparing = await service.preparation_status(conversation.conversation_id)
+        assert preparing is not None
+        operation_id = preparing["operation_id"]
+        assert isinstance(operation_id, str)
+
+        stale = await service.cancel_preparation(
+            conversation.conversation_id, "f" * 32
+        )
+        assert stale == {
+            "version": "run-preparation-cancel-v1",
+            "state": "stale",
+            "target": None,
+        }
+        assert not cancellation_seen.is_set()
+
+        result = await asyncio.wait_for(
+            service.cancel_preparation(
+                conversation.conversation_id, operation_id
+            ),
+            timeout=0.05,
+        )
+        assert result == {
+            "version": "run-preparation-cancel-v1",
+            "state": "cancellation_requested",
+            "target": "preparation",
+        }
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=0.25)
+        status = await service.preparation_status(conversation.conversation_id)
+        assert status is not None
+        assert status["state"] == "cancelling"
+        assert status["operation_id"] == operation_id
+        assert status["stage"] == "summarizing_history"
+        assert service.runs == {}
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await service.preparation_status(conversation.conversation_id) is None
+        restored = await service.get_conversation(conversation.conversation_id)
+        assert restored.turns == ()
+        assert service.runs == {}
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_preparation_cancel_covers_the_handoff_to_one_active_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        conversation = await service.create_conversation("handoff cancellation")
+        record = _record("9" * 32)
+        record.conversation_id = conversation.conversation_id
+        record.preparation_operation_id = "8" * 32
+        service.runs[record.run_id] = record
+        cancelled: list[str] = []
+        status = await service.preparation_status(conversation.conversation_id)
+        assert status is not None
+        assert status["state"] == "preparing"
+        assert status["operation_id"] == record.preparation_operation_id
+        assert status["stage"] == "admitting_run"
+
+        async def observed_cancel(run_id: str) -> None:
+            cancelled.append(run_id)
+            record.cancel_requested = True
+            record.cancel_requested_at = asyncio.get_running_loop().time()
+
+        monkeypatch.setattr(service, "cancel", observed_cancel)
+        result = await service.cancel_preparation(
+            conversation.conversation_id, record.preparation_operation_id
+        )
+        assert result == {
+            "version": "run-preparation-cancel-v1",
+            "state": "cancellation_requested",
+            "target": "run",
+        }
+        assert cancelled == [record.run_id]
+        cancelling = await service.preparation_status(conversation.conversation_id)
+        assert cancelling is not None
+        assert cancelling["state"] == "cancelling"
+        assert cancelling["operation_id"] == record.preparation_operation_id
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_run_service_exposes_conversation_rename_boundary(tmp_path: Path) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def exercise() -> None:
+        created = await service.create_conversation("before")
+        renamed = await service.rename_conversation(
+            created.conversation_id,
+            "长期研究",
+            expected_revision=created.revision,
+        )
+        assert renamed.title == "长期研究"
+        assert renamed.revision == created.revision + 1
+        restored = await service.get_conversation(created.conversation_id)
+        assert restored.title == "长期研究"
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
 
 
 class _MemoryJournal:
@@ -255,10 +610,11 @@ def test_atomic_provider_response_failure_does_not_advance_live_sequence(
             provider_usage_start={
                 "call_index": 1,
                 "provider": plan.model_profile.provider,
-                "model": plan.model_profile.model,
-                "profile_digest": "c" * 64,
-                "context_plan_id": plan.reference.plan_id,
-                "estimated_input_tokens": plan.estimated_input_tokens,
+                    "model": plan.model_profile.model,
+                    "profile_digest": "c" * 64,
+                    "context_plan_id": plan.reference.plan_id,
+                    "toolset_digest": toolset_digest(plan.tools),
+                    "estimated_input_tokens": plan.estimated_input_tokens,
                 "hard_input_tokens": plan.policy.hard_input_tokens,
             },
         )
@@ -380,6 +736,106 @@ def test_start_rejects_message_that_exceeds_utf8_command_budget(
 
     assert service.runs == {}
     assert journal.events == []
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "a" * 8_192,
+        "界" * 2_730 + "ab",
+        "😀" * 2_048,
+        ('"\\\n\t' * 2_048),
+    ],
+    ids=("ascii", "chinese", "emoji", "json-escapes"),
+)
+def test_command_accepts_exactly_8192_utf8_bytes(message: str) -> None:
+    assert len(message.encode("utf-8")) == 8_192
+
+    StartRunCommand(agent_id=PROTOTYPE_AGENT_ID, message=message).validate()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "a" * 8_193,
+        "界" * 2_730 + "abc",
+        "😀" * 2_048 + "a",
+        ('"\\\n\t' * 2_048) + "a",
+    ],
+    ids=("ascii", "chinese", "emoji", "json-escapes"),
+)
+def test_command_rejects_8193_utf8_bytes(message: str) -> None:
+    assert len(message.encode("utf-8")) == 8_193
+
+    with pytest.raises(ValueError, match="8192 UTF-8 bytes"):
+        StartRunCommand(agent_id=PROTOTYPE_AGENT_ID, message=message).validate()
+
+
+def test_manual_compact_keeps_manual_boundary_reason_without_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _journal = _service(tmp_path)
+
+    async def finish(record: RunRecord, _message: str) -> None:
+        await service._publish_failure(record, "test_finished")
+
+    monkeypatch.setattr(service, "_run_worker", finish)
+
+    async def exercise() -> RunRecord:
+        record = await service.start(
+            StartRunCommand(
+                agent_id=PROTOTYPE_AGENT_ID,
+                message="compact deterministically",
+                compact=True,
+            )
+        )
+        assert record.task is not None
+        await record.task
+        return record
+
+    try:
+        record = asyncio.run(exercise())
+        assert record.runtime_snapshot is not None
+        assert record.runtime_snapshot.projection_reason == "manual_compact"
+        assert record.context_plan is not None
+        assert record.context_plan.semantic_summary is None
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
+
+
+def test_continuation_rejection_has_no_run_model_worker_or_durable_side_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, journal = _service(tmp_path)
+
+    def reject(*_args: object, **_kwargs: object) -> object:
+        from agent_builder_v2.context import ContextPlanError
+
+        raise ContextPlanError("context continuation unavailable")
+
+    monkeypatch.setattr(
+        service.context_compiler,
+        "require_completed_turn_continuation",
+        reject,
+    )
+
+    try:
+        with pytest.raises(ValueError, match="context continuation unavailable"):
+            asyncio.run(
+                service.start(
+                    StartRunCommand(
+                        agent_id=PROTOTYPE_AGENT_ID,
+                        message="must reject before execution",
+                    )
+                )
+            )
+        assert service.runs == {}
+        assert journal.events == []
+        assert asyncio.run(service.list_conversations()) == ()
+    finally:
+        assert service.conversations is not None
+        service.conversations.close()
 
 
 def test_close_drains_and_rolls_back_inflight_conversation_create(
@@ -1441,6 +1897,7 @@ printf '%s\n' '{"kind":"tool.call.requested","durability":"durable","payload":{"
             model="qwen3.5:2b",
             profile_digest="a" * 64,
             context_plan_id="degraded-test-plan",
+            toolset_digest="0" * 64,
             estimated_input_tokens=32,
             hard_input_tokens=1024,
         )

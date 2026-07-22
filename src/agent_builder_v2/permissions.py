@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 import time
-from typing import Callable, Literal, Protocol
+from typing import Callable, Collection, Literal, Protocol
 
 from .contracts import new_id
 from .sessions import (
@@ -235,13 +235,23 @@ class CapabilityBroker:
         store: ConversationStore,
         *,
         generation_provider: Callable[[], int],
-        toolset_digest_provider: Callable[[], str],
+        toolset_digest_provider: Callable[[], str | Collection[str]],
         policy: CapabilityPolicy,
     ) -> None:
         self._store = store
         self._generation_provider = generation_provider
         self._toolset_digest_provider = toolset_digest_provider
         self._policy = policy
+
+    def _toolset_is_current(self, digest: str) -> bool:
+        current = self._toolset_digest_provider()
+        if isinstance(current, str):
+            return digest == current
+        if not isinstance(current, Collection) or any(
+            not isinstance(item, str) for item in current
+        ):
+            return False
+        return digest in current
 
     @property
     def policy(self) -> CapabilityPolicy:
@@ -257,7 +267,7 @@ class CapabilityBroker:
         context = request.context
         if (
             context.capsule_generation != self._generation_provider()
-            or context.toolset_digest != self._toolset_digest_provider()
+            or not self._toolset_is_current(context.toolset_digest)
             or context.policy_digest != self._policy.digest
         ):
             raise ConversationConflictError("capability binding is stale")
@@ -290,7 +300,7 @@ class CapabilityBroker:
         existing = self._store.get_permission_request(permission_id)
         if (
             existing.capsule_generation != self._generation_provider()
-            or existing.toolset_digest != self._toolset_digest_provider()
+            or not self._toolset_is_current(existing.toolset_digest)
             or existing.policy_digest != self._policy.digest
         ):
             return self._store.resolve_permission_request(
@@ -356,7 +366,7 @@ class CapabilityBroker:
         if (
             now_value >= permission.expires_at_milliseconds
             or context.capsule_generation != self._generation_provider()
-            or context.toolset_digest != self._toolset_digest_provider()
+            or not self._toolset_is_current(context.toolset_digest)
             or context.policy_digest != self._policy.digest
             or cancelled()
         ):

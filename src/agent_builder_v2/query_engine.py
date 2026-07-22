@@ -229,6 +229,7 @@ class QueryEngine:
         self._conversation_id = conversation_id
         self._on_retired = on_retired
         self._operation_lock = asyncio.Lock()
+        self._submitting = False
         self._retired = False
         self._retiring = False
         self._delete_task: asyncio.Task[ConversationDeleteResult] | None = None
@@ -248,6 +249,12 @@ class QueryEngine:
     def _ensure_live(self) -> None:
         if self._retired or self._retiring:
             raise QueryEngineRetiredError("query engine is retired")
+
+    def _ensure_not_submitting(self) -> None:
+        if self._submitting:
+            raise ConversationConflictError(
+                "conversation admission is already in progress"
+            )
 
     def _retire(self) -> None:
         self._retired = True
@@ -426,6 +433,13 @@ class QueryEngine:
 
         async with self._operation_lock:
             self._ensure_live()
+            self._ensure_not_submitting()
+            # Context preparation can include a model-backed summary. Publish
+            # ownership under the short lock, then release it before awaiting
+            # the runtime so another submission fails immediately rather than
+            # queuing invisibly behind a long admission.
+            self._submitting = True
+        try:
             record = await self._runtime.start(
                 StartRunCommand(
                     agent_id=self._agent_id,
@@ -442,6 +456,9 @@ class QueryEngine:
                 # running after this boundary rejects the returned handle.
                 await self._runtime.cancel(record.run_id)
                 raise
+        finally:
+            async with self._operation_lock:
+                self._submitting = False
 
     def get_run(self, run_id: str) -> QueryRunHandle:
         self._ensure_live()
@@ -594,6 +611,7 @@ class QueryEngine:
                 operation = self._delete_task
             else:
                 self._ensure_live()
+                self._ensure_not_submitting()
                 self._retiring = True
                 operation = asyncio.create_task(
                     self._delete_owned(),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -15,22 +16,51 @@ import time
 import pytest
 
 import agent_builder_v2.sessions as sessions_module
-from agent_builder_v2.contracts import RUN_CURSOR_RESERVED_THROUGH, EventEnvelope
-from agent_builder_v2.replay import PROJECTION_VERSION
+from agent_builder_v2.contracts import (
+    RUN_CURSOR_RESERVED_THROUGH,
+    EventEnvelope,
+    LoopLimits,
+)
+from agent_builder_v2.completed_context import CompletedContextItem, CompletedTurnContext
+from agent_builder_v2.context import (
+    CONTEXT_RENDERER_VERSION,
+    PROMPT_SECTION_REGISTRY_VERSION,
+    ContextCompiler,
+    ModelProfile,
+)
+from agent_builder_v2.context_projection import ContextProjectionBoundary
+from agent_builder_v2.replay import (
+    MODEL_BOUNDARY_FEATURE,
+    MULTI_TOOL_LOOP_FEATURE,
+    OVERFLOW_RECOVERY_FEATURE,
+    PROJECTION_VERSION,
+)
+from agent_builder_v2.semantic_summary import SemanticSummaryContent
+from agent_builder_v2.semantic_summary_v2 import (
+    SemanticSummaryV2Snapshot,
+    summary_v2_source_digest,
+)
 from agent_builder_v2.sessions import (
     DATABASE_NAME,
     MAX_ASSISTANT_CONTENT_BYTES,
     MAX_LIST_LIMIT,
     MAX_TITLE_BYTES,
+    MAX_TURNS_PER_CONVERSATION,
     MAX_USER_CONTENT_BYTES,
     ConversationConflictError,
     ConversationNotFoundError,
     ConversationStore,
     ConversationStoreUnavailableError,
+    ConversationTurnCapacityError,
     conversation_message_id,
 )
+from agent_builder_v2.runtime import TurnRuntimeSnapshot
 from agent_builder_v2.state import EventJournal
-from agent_builder_v2.tools import prototype_tool_specs, toolset_digest
+from agent_builder_v2.tools import (
+    prototype_effective_toolset,
+    prototype_tool_specs,
+    toolset_digest,
+)
 
 
 AGENT_ID = "00000000-0000-4000-8000-000000000001"
@@ -46,6 +76,80 @@ def _database(tmp_path: Path) -> Path:
     root = tmp_path / "data" / "agents" / AGENT_ID
     root.mkdir(parents=True, mode=0o700)
     return root / DATABASE_NAME
+
+
+def _summary_bundle() -> CompletedTurnContext:
+    return CompletedTurnContext(
+        agent_id=AGENT_ID,
+        conversation_id=_id(950),
+        turn_id=_id(951),
+        run_id=_id(952),
+        position=1,
+        model_profile_digest="b" * 64,
+        context_plan_digest="c" * 64,
+        items=(
+            CompletedContextItem.plain(0, "user", "remember FACT-17"),
+            CompletedContextItem.plain(1, "assistant_final", "remembered"),
+        ),
+    )
+
+
+def _calibration_boundary(
+    conversation_id: str, turn_id: str, run_id: str
+) -> ContextProjectionBoundary:
+    profile = ModelProfile(
+        provider="ollama",
+        model="qwen3.5:2b",
+        model_digest="9" * 64,
+        native_context_tokens=262_144,
+        operational_context_tokens=32_768,
+        max_output_tokens=4_096,
+        profile_source="test",
+    )
+    effective = prototype_effective_toolset()
+    plan = ContextCompiler().compile(
+        "calibration turn",
+        model_profile=profile,
+        tools=effective.specs,
+        agent_id=AGENT_ID,
+        capsule_generation=1,
+    )
+    runtime = TurnRuntimeSnapshot.create(
+        context_plan=plan,
+        effective_toolset=effective,
+        loop_limits=LoopLimits(max_model_iterations=4, max_tool_calls=2),
+        wall_timeout_seconds=120,
+    )
+    return ContextProjectionBoundary.create(
+        runtime,
+        conversation_id=conversation_id,
+        turn_id=turn_id,
+        run_id=run_id,
+        conversation_revision=0,
+    )
+
+
+def _transport_payload(
+    *,
+    attempt: int = 1,
+    maximum: int = 2,
+    phase: str = "attempt_started",
+    outcome: str | None = None,
+    elapsed_ms: int = 0,
+    first_frame_ms: int | None = None,
+) -> dict[str, object]:
+    return {
+        "version": "provider-transport-attempt-v1",
+        "request_id": "model-1",
+        "iteration": 1,
+        "provider_call_index": 1,
+        "attempt": attempt,
+        "max_attempts": maximum,
+        "phase": phase,
+        "outcome": outcome,
+        "elapsed_ms": elapsed_ms,
+        "first_frame_ms": first_frame_ms,
+    }
 
 
 def _started_payload() -> dict[str, object]:
@@ -561,6 +665,7 @@ def test_late_tombstone_fault_rolls_back_every_degraded_run_mutation(
             model="qualified-model",
             profile_digest="d" * 64,
             context_plan_id="degraded-plan",
+            toolset_digest="0" * 64,
             estimated_input_tokens=8,
             hard_input_tokens=128,
         )
@@ -723,6 +828,7 @@ def test_operation_and_provider_ledgers_are_idempotent_and_recover_unknown(
             model="qualified-model",
             profile_digest="e" * 64,
             context_plan_id="context-plan-1",
+            toolset_digest="0" * 64,
             estimated_input_tokens=6,
             hard_input_tokens=100,
         )
@@ -742,6 +848,7 @@ def test_operation_and_provider_ledgers_are_idempotent_and_recover_unknown(
             model="qualified-model",
             profile_digest="e" * 64,
             context_plan_id="context-plan-1",
+            toolset_digest="0" * 64,
             estimated_input_tokens=10,
             hard_input_tokens=100,
         )
@@ -837,6 +944,7 @@ def test_recovery_closes_an_inflight_model_boundary_before_terminal(
             model="qwen3.5:2b",
             profile_digest="d" * 64,
             context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest="0" * 64,
             estimated_input_tokens=1_024,
             hard_input_tokens=30_720,
         )
@@ -867,6 +975,203 @@ def test_recovery_closes_an_inflight_model_boundary_before_terminal(
         assert model_calls[0]["state"] == "finished"
         assert model_calls[0]["outcome"] == "error"
         assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+    finally:
+        journal.close()
+        store.close()
+
+
+def test_recovery_closes_an_open_provider_transport_attempt_before_terminal(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    conversation_id, turn_id, run_id = _id(304), _id(305), _id(306)
+    started_payload = {
+        **_started_payload(),
+        "protocol_features": [
+            MODEL_BOUNDARY_FEATURE,
+            MULTI_TOOL_LOOP_FEATURE,
+            OVERFLOW_RECOVERY_FEATURE,
+        ],
+    }
+    request_payload = {
+        **_model_request_payload(),
+        "attempt": 0,
+        "recovery_id": None,
+        "provider_call_index": 1,
+    }
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="recover provider transport",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=started_payload,
+            ),
+        )
+        journal.append(
+            _event(
+                kind="model.request.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=request_payload,
+            )
+        )
+        journal.append(
+            _event(
+                kind="model.transport.attempt",
+                seq=3,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_transport_payload(),
+            )
+        )
+        store.start_provider_usage(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest="0" * 64,
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+        )
+
+        assert [turn.status for turn in store.recover_running_as_interrupted()] == [
+            "interrupted"
+        ]
+        events = journal.events_for_run(run_id)
+        assert [event["kind"] for event in events] == [
+            "run.started",
+            "model.request.started",
+            "model.transport.attempt",
+            "model.transport.attempt",
+            "model.response.finished",
+            "run.failed",
+        ]
+        assert events[-3]["payload"] == {
+            **_transport_payload(
+                phase="attempt_finished",
+                outcome="failed_before_first_frame",
+            )
+        }
+        assert store.provider_usage_for_run(run_id)[0].status == "incomplete"
+    finally:
+        journal.close()
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "transport_case",
+    ("outside_request", "attempt_out_of_order", "finish_without_start", "response_while_open"),
+)
+def test_recovery_rejects_invalid_provider_transport_sequence(
+    tmp_path: Path, transport_case: str
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    journal = EventJournal(database)
+    conversation_id, turn_id, run_id = _id(307), _id(308), _id(309)
+    started_payload = {
+        **_started_payload(),
+        "protocol_features": [
+            MODEL_BOUNDARY_FEATURE,
+            MULTI_TOOL_LOOP_FEATURE,
+            OVERFLOW_RECOVERY_FEATURE,
+        ],
+    }
+    request_payload = {
+        **_model_request_payload(),
+        "attempt": 0,
+        "recovery_id": None,
+        "provider_call_index": 1,
+    }
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="reject invalid provider transport",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=started_payload,
+            ),
+        )
+        next_seq = 2
+        if transport_case != "outside_request":
+            journal.append(
+                _event(
+                    kind="model.request.started",
+                    seq=next_seq,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    payload=request_payload,
+                )
+            )
+            next_seq += 1
+        payload = (
+            _transport_payload(attempt=2)
+            if transport_case == "attempt_out_of_order"
+            else _transport_payload(
+                phase="attempt_finished",
+                outcome="first_frame_timeout",
+                elapsed_ms=60_000,
+            )
+            if transport_case == "finish_without_start"
+            else _transport_payload()
+        )
+        journal.append(
+            _event(
+                kind="model.transport.attempt",
+                seq=next_seq,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=payload,
+            )
+        )
+        if transport_case == "response_while_open":
+            journal.append(
+                _event(
+                    kind="model.response.finished",
+                    seq=next_seq + 1,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    payload={
+                        **_model_response_payload(),
+                        "attempt": 0,
+                        "recovery_id": None,
+                        "provider_call_index": 1,
+                    },
+                )
+            )
+
+        with pytest.raises(
+            ConversationConflictError, match="model transport|model response"
+        ):
+            store.recover_running_as_interrupted()
+        assert store.get_conversation(conversation_id).turns[0].status == "running"
     finally:
         journal.close()
         store.close()
@@ -923,6 +1228,7 @@ def test_provider_usage_boundaries_roll_back_as_one_transaction(
                 model="qwen3.5:2b",
                 profile_digest="d" * 64,
                 context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+                toolset_digest="0" * 64,
                 estimated_input_tokens=1_024,
                 hard_input_tokens=30_720,
                 boundary_event=request_event,
@@ -943,6 +1249,7 @@ def test_provider_usage_boundaries_roll_back_as_one_transaction(
             model="qwen3.5:2b",
             profile_digest="d" * 64,
             context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest="0" * 64,
             estimated_input_tokens=1_024,
             hard_input_tokens=30_720,
             boundary_event=request_event,
@@ -1054,6 +1361,7 @@ def test_terminal_usage_must_match_provider_aggregate_and_rolls_back(
             model="qualified-model",
             profile_digest="5" * 64,
             context_plan_id="context-plan-usage",
+            toolset_digest="0" * 64,
             estimated_input_tokens=6,
             hard_input_tokens=100,
         )
@@ -1084,6 +1392,10 @@ def test_terminal_usage_must_match_provider_aggregate_and_rolls_back(
         assert store._connection.execute(
             "SELECT COUNT(*) FROM events WHERE run_id = ?", (run_id,)
         ).fetchone() == (1,)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM completed_turn_contexts WHERE run_id = ?",
+            (run_id,),
+        ).fetchone() == (0,)
 
         usage = {
             "input_tokens": 7,
@@ -1134,6 +1446,7 @@ def test_terminal_marks_started_provider_usage_incomplete_atomically(
             model="qualified-model",
             profile_digest="6" * 64,
             context_plan_id="context-plan-failed",
+            toolset_digest="0" * 64,
             estimated_input_tokens=6,
             hard_input_tokens=100,
         )
@@ -1507,6 +1820,7 @@ def test_sigkill_cannot_commit_complete_usage_without_response_boundary(
             model="qwen3.5:2b",
             profile_digest="d" * 64,
             context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest="0" * 64,
             estimated_input_tokens=1_024,
             hard_input_tokens=30_720,
             boundary_event=_event(
@@ -1658,6 +1972,7 @@ def test_sigkill_after_complete_response_commit_recovers_exact_usage(
             model="qwen3.5:2b",
             profile_digest="d" * 64,
             context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest="0" * 64,
             estimated_input_tokens=1_024,
             hard_input_tokens=30_720,
             boundary_event=_event(
@@ -1806,6 +2121,7 @@ def test_sigkill_boundaries_recover_once_without_reusing_side_effects(
             model="qualified-model",
             profile_digest="7" * 64,
             context_plan_id="sigkill-plan",
+            toolset_digest="0" * 64,
             estimated_input_tokens=8,
             hard_input_tokens=128,
         )
@@ -2063,6 +2379,7 @@ def test_recovery_rejects_inconsistent_running_journal_metadata_atomically(
             model="qualified-model",
             profile_digest="2" * 64,
             context_plan_id="metadata-plan",
+            toolset_digest="0" * 64,
             estimated_input_tokens=8,
             hard_input_tokens=128,
         )
@@ -3034,6 +3351,9 @@ def test_delete_removes_rows_without_vacuum_or_per_conversation_files(
             assert connection.execute(
                 "SELECT COUNT(*) FROM conversation_turns"
             ).fetchone() == (0,)
+            assert connection.execute(
+                "SELECT COUNT(*) FROM completed_turn_contexts"
+            ).fetchone() == (0,)
         finally:
             connection.close()
         assert {path.name for path in database.parent.iterdir()} <= {
@@ -3041,5 +3361,760 @@ def test_delete_removes_rows_without_vacuum_or_per_conversation_files(
             f"{DATABASE_NAME}-wal",
             f"{DATABASE_NAME}-shm",
         }
+    finally:
+        store.close()
+
+
+def test_turn_capacity_is_rejected_by_snapshot_and_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sessions_module, "MAX_TURNS_PER_CONVERSATION", 1)
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id = _id(900)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=_id(901),
+            run_id=_id(902),
+            user_content="first",
+            expected_revision=0,
+            started_event=_started(conversation_id, _id(901), _id(902)),
+        )
+        store.finalize_noncompleted(_id(902), "failed")
+
+        with pytest.raises(
+            ConversationTurnCapacityError,
+            match="turn capacity is exhausted",
+        ):
+            store.snapshot_for_turn(conversation_id)
+        with pytest.raises(ConversationTurnCapacityError):
+            store.begin_turn(
+                conversation_id,
+                turn_id=_id(903),
+                run_id=_id(904),
+                user_content="must not start",
+                expected_revision=2,
+                started_event=_started(conversation_id, _id(903), _id(904)),
+            )
+        assert store.get_conversation(conversation_id).turns[0].status == "failed"
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?", (_id(904),)
+        ).fetchone() == (0,)
+    finally:
+        store.close()
+
+
+def test_two_connections_competing_for_last_turn_only_commit_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sessions_module, "MAX_TURNS_PER_CONVERSATION", 1)
+    database = _database(tmp_path)
+    first = ConversationStore(database, AGENT_ID)
+    second = ConversationStore(database, AGENT_ID)
+    conversation_id = _id(910)
+    try:
+        first.create_conversation(conversation_id=conversation_id)
+        assert first.snapshot_for_turn(conversation_id).turns_remaining == 1
+        assert second.snapshot_for_turn(conversation_id).turns_remaining == 1
+        first.begin_turn(
+            conversation_id,
+            turn_id=_id(911),
+            run_id=_id(912),
+            user_content="winner",
+            expected_revision=0,
+            started_event=_started(conversation_id, _id(911), _id(912)),
+        )
+        with pytest.raises(ConversationConflictError):
+            second.begin_turn(
+                conversation_id,
+                turn_id=_id(913),
+                run_id=_id(914),
+                user_content="loser",
+                expected_revision=0,
+                started_event=_started(conversation_id, _id(913), _id(914)),
+            )
+        assert len(first.get_conversation(conversation_id).turns) == 1
+    finally:
+        if first._turn_for_run(_id(912)) is not None:
+            first.finalize_noncompleted(_id(912), "interrupted")
+        first.close()
+        second.close()
+
+
+def test_summary_projection_is_single_row_restart_safe_and_delete_cascades(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    bundle = _summary_bundle()
+    snapshot = SemanticSummaryV2Snapshot.create(
+        source_bundles=(bundle,),
+        model_profile_digest="d" * 64,
+        renderer_version=CONTEXT_RENDERER_VERSION,
+        section_registry_version=PROMPT_SECTION_REGISTRY_VERSION,
+        content=SemanticSummaryContent(facts=("FACT-17",)),
+        provider_request_digest="e" * 64,
+        input_tokens=100,
+        output_tokens=10,
+    )
+    source_digest = summary_v2_source_digest((bundle,))
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=bundle.conversation_id)
+        generated = store.write_summary_projection(
+            bundle.conversation_id,
+            status="generated",
+            source_digest=source_digest,
+            snapshot=snapshot,
+        )
+        assert generated.snapshot == snapshot
+        store.write_summary_projection(
+            bundle.conversation_id,
+            status="reused",
+            source_digest=source_digest,
+            snapshot=snapshot,
+        )
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM conversation_summary_projections"
+        ).fetchone() == (1,)
+    finally:
+        store.close()
+
+    reopened = ConversationStore(database, AGENT_ID)
+    try:
+        restored = reopened.read_summary_projection(bundle.conversation_id)
+        assert restored is not None
+        assert restored.status == "reused"
+        assert restored.snapshot == snapshot
+        reopened.delete_conversation(bundle.conversation_id)
+        assert reopened._connection.execute(
+            "SELECT COUNT(*) FROM conversation_summary_projections"
+        ).fetchone() == (0,)
+    finally:
+        reopened.close()
+
+
+def test_explicit_continuation_preserves_source_and_carries_bounded_projection(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    source_id = _id(970)
+    try:
+        store.create_conversation("source", conversation_id=source_id)
+        store.begin_turn(
+            source_id,
+            turn_id=_id(971),
+            run_id=_id(972),
+            user_content="remember CONT-17",
+            expected_revision=0,
+            started_event=_started(source_id, _id(971), _id(972)),
+        )
+        store.finalize_completed(
+            _id(972), "CONT-17 remembered", _completed(source_id, _id(971), _id(972))
+        )
+
+        continued, included, omitted = store.create_continuation(
+            source_id, title="continued", conversation_id=_id(973)
+        )
+        assert (included, omitted) == (1, 0)
+        snapshot = store.snapshot_for_turn(continued.conversation_id)
+        assert snapshot.turn_count == 0
+        assert snapshot.continuation_context is not None
+        value = json.loads(snapshot.continuation_context)
+        assert value["semantic_boundary"] == "untrusted_continuation_projection"
+        assert value["completed_turns"][0]["items"][-1]["content"] == (
+            "CONT-17 remembered"
+        )
+
+        store.delete_conversation(source_id)
+        assert store.get_conversation(continued.conversation_id).title == "continued"
+        assert store.snapshot_for_turn(continued.conversation_id).continuation_context
+        store.delete_conversation(continued.conversation_id)
+        assert store._connection.execute(
+            "SELECT COUNT(*) FROM conversation_continuations"
+        ).fetchone() == (0,)
+    finally:
+        store.close()
+
+
+def test_failed_turn_terminal_summary_is_bounded_and_survives_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = _database(tmp_path)
+    timestamps = iter(
+        (
+            "2026-07-22T00:00:00.000Z",
+            "2026-07-22T00:00:01.000Z",
+            "2026-07-22T00:00:04.000Z",
+        )
+    )
+    monkeypatch.setattr(sessions_module, "utc_now", lambda: next(timestamps))
+    conversation_id, turn_id, run_id = _id(980), _id(981), _id(982)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="write a poem",
+            expected_revision=0,
+            started_event=replace(
+                _started(conversation_id, turn_id, run_id),
+                occurred_at="2026-07-22T00:00:01.000Z",
+            ),
+        )
+        store.finalize_noncompleted(
+            run_id,
+            "failed",
+            replace(
+                _event(
+                    kind="run.failed",
+                    seq=2,
+                    conversation_id=conversation_id,
+                    turn_id=turn_id,
+                    run_id=run_id,
+                    payload={
+                        "code": "model_first_frame_timeout",
+                        "message": "provider detail must remain private",
+                        "retryable": True,
+                        "usage": _usage(complete=False),
+                    },
+                ),
+                occurred_at="2026-07-22T00:00:04.000Z",
+            ),
+        )
+        terminal = store.get_conversation(conversation_id).turns[0].terminal
+        assert terminal is not None
+        assert terminal.to_dict() == {
+            "version": "turn-terminal-v1",
+            "code": "model_first_frame_timeout",
+            "stage": "model",
+            "retryable": True,
+            "duration_ms": 3_000,
+        }
+        assert "provider detail" not in json.dumps(terminal.to_dict())
+    finally:
+        store.close()
+
+    reopened = ConversationStore(database, AGENT_ID)
+    try:
+        terminal = reopened.get_conversation(conversation_id).turns[0].terminal
+        assert terminal is not None
+        assert terminal.code == "model_first_frame_timeout"
+        assert terminal.duration_ms == 3_000
+    finally:
+        reopened.close()
+
+
+def test_first_turn_auto_title_and_explicit_rename_are_deterministic(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    store = ConversationStore(database, AGENT_ID)
+    conversation_id, turn_id, run_id = _id(983), _id(984), _id(985)
+    explicit_id = _id(986)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="  研究   2026 年的\nAgent UX  ",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        automatic = store.get_conversation(conversation_id)
+        assert automatic.title == "研究 2026 年的 Agent UX"
+        assert automatic.revision == 1
+
+        renamed = store.rename_conversation(
+            conversation_id,
+            "长期体验研究",
+            expected_revision=automatic.revision,
+        )
+        assert renamed.title == "长期体验研究"
+        assert renamed.revision == 2
+        assert renamed.active_run_id == run_id
+
+        unchanged = store.rename_conversation(
+            conversation_id,
+            "长期体验研究",
+            expected_revision=renamed.revision,
+        )
+        assert unchanged.revision == renamed.revision
+        assert unchanged.updated_at == renamed.updated_at
+
+        with pytest.raises(ConversationConflictError):
+            store.rename_conversation(
+                conversation_id,
+                "陈旧覆盖",
+                expected_revision=automatic.revision,
+            )
+
+        store.create_conversation("用户标题", conversation_id=explicit_id)
+        store.begin_turn(
+            explicit_id,
+            turn_id=_id(987),
+            run_id=_id(988),
+            user_content="this must not replace the title",
+            expected_revision=0,
+            started_event=_started(explicit_id, _id(987), _id(988)),
+        )
+        assert store.get_conversation(explicit_id).title == "用户标题"
+    finally:
+        store.finalize_noncompleted(run_id, "interrupted")
+        store.finalize_noncompleted(_id(988), "interrupted")
+        store.close()
+
+    reopened = ConversationStore(database, AGENT_ID)
+    try:
+        restored = reopened.get_conversation(conversation_id)
+        assert restored.title == "长期体验研究"
+        assert restored.revision == 3
+    finally:
+        reopened.close()
+
+
+def test_automatic_title_derivation_failure_does_not_block_turn_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(1_050), _id(1_051), _id(1_052)
+
+    def fail_derivation(_user_content: str) -> str:
+        raise RuntimeError("injected title derivation failure")
+
+    monkeypatch.setattr(
+        "agent_builder_v2.sessions._automatic_title", fail_derivation
+    )
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        accepted = store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="这条消息仍须成功准入",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        restored = store.get_conversation(conversation_id)
+        assert accepted.turn.status == "running"
+        assert restored.active_run_id == run_id
+        assert restored.revision == 1
+        assert restored.title == "New conversation"
+    finally:
+        store.finalize_noncompleted(run_id, "interrupted")
+        store.close()
+
+
+def test_automatic_title_persistence_failure_does_not_rollback_admitted_turn(
+    tmp_path: Path,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(1_053), _id(1_054), _id(1_055)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store._connection.execute(  # noqa: SLF001 - deliberate SQLite fault injection
+            """
+            CREATE TRIGGER reject_automatic_title
+            BEFORE UPDATE OF title ON conversations
+            BEGIN
+                SELECT RAISE(ABORT, 'injected automatic title failure');
+            END
+            """
+        )
+        accepted = store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="标题写入失败也不能丢失这轮消息",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+        )
+        restored = store.get_conversation(conversation_id)
+        assert accepted.turn.status == "running"
+        assert restored.active_run_id == run_id
+        assert restored.revision == 1
+        assert restored.title == "New conversation"
+        assert restored.turns == (accepted.turn,)
+    finally:
+        store.finalize_noncompleted(run_id, "interrupted")
+        store.close()
+
+
+def test_recent_provider_calibration_samples_are_scope_bound_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    conversation_id, turn_id, run_id = _id(989), _id(990), _id(991)
+    boundary = _calibration_boundary(conversation_id, turn_id, run_id)
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="calibration turn",
+            expected_revision=0,
+            started_event=_started(conversation_id, turn_id, run_id),
+            context_projection=boundary,
+        )
+        for call_index, estimated, actual in (
+            (1, 1_000, 250),
+            (2, 1_200, 300),
+        ):
+            store.start_provider_usage(
+                run_id,
+                call_index,
+                provider="ollama",
+                model="qwen3.5:2b",
+                profile_digest=boundary.model_profile_digest,
+                context_plan_id=boundary.context_plan_id,
+                toolset_digest=boundary.toolset_digest,
+                estimated_input_tokens=estimated,
+                hard_input_tokens=28_672,
+            )
+            store.complete_provider_usage(
+                run_id, call_index, input_tokens=actual, output_tokens=10
+            )
+        store.start_provider_usage(
+            run_id,
+            3,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest=boundary.model_profile_digest,
+            context_plan_id="context-" + "f" * 24,
+            toolset_digest=boundary.toolset_digest,
+            estimated_input_tokens=1_500,
+            hard_input_tokens=28_672,
+        )
+        store.complete_provider_usage(
+            run_id, 3, input_tokens=400, output_tokens=10
+        )
+        scope = {
+            "profile_digest": boundary.model_profile_digest,
+            "renderer_version": boundary.renderer_version,
+            "toolset_digest": boundary.toolset_digest,
+            "policy_digest": boundary.compression_policy_digest,
+        }
+        assert store.recent_provider_calibration_samples(**scope) == (
+            (1_000, 250),
+            (1_200, 300),
+        )
+        assert store.recent_provider_calibration_samples(
+            **{**scope, "toolset_digest": "0" * 64}
+        ) == ()
+        with pytest.raises(ValueError, match="between 1 and 16"):
+            store.recent_provider_calibration_samples(**scope, limit=17)
+    finally:
+        store.finalize_noncompleted(run_id, "interrupted")
+        store.close()
+
+    reopened = ConversationStore(database, AGENT_ID)
+    try:
+        assert reopened.recent_provider_calibration_samples(**scope, limit=1) == (
+            (1_200, 300),
+        )
+    finally:
+        reopened.close()
+
+
+def test_provider_calibration_exact_sql_scope_is_not_starved_by_older_rows(
+    tmp_path: Path,
+) -> None:
+    """More than 64 newer calls in another ToolSet cannot hide one match."""
+
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    first_ids = (_id(1_100), _id(1_101), _id(1_102))
+    second_ids = (_id(1_103), _id(1_104), _id(1_105))
+    target_boundary = _calibration_boundary(*first_ids)
+    other_boundary = _calibration_boundary(*second_ids)
+    other_toolset = "0" * 64
+    scope = {
+        "profile_digest": target_boundary.model_profile_digest,
+        "renderer_version": target_boundary.renderer_version,
+        "toolset_digest": target_boundary.toolset_digest,
+        "policy_digest": target_boundary.compression_policy_digest,
+    }
+    try:
+        store.create_conversation(conversation_id=first_ids[0])
+        store.begin_turn(
+            first_ids[0],
+            turn_id=first_ids[1],
+            run_id=first_ids[2],
+            user_content="old exact calibration sample",
+            expected_revision=0,
+            started_event=_started(*first_ids),
+            context_projection=target_boundary,
+        )
+        for call_index in range(1, 65):
+            is_target = call_index == 1
+            store.start_provider_usage(
+                first_ids[2],
+                call_index,
+                provider="ollama",
+                model="qwen3.5:2b",
+                profile_digest=target_boundary.model_profile_digest,
+                context_plan_id=target_boundary.context_plan_id,
+                toolset_digest=(
+                    target_boundary.toolset_digest if is_target else other_toolset
+                ),
+                estimated_input_tokens=1_000 + call_index,
+                hard_input_tokens=28_672,
+            )
+            store.complete_provider_usage(
+                first_ids[2],
+                call_index,
+                input_tokens=200 + call_index,
+                output_tokens=5,
+            )
+        store.finalize_noncompleted(first_ids[2], "interrupted")
+
+        store.create_conversation(conversation_id=second_ids[0])
+        store.begin_turn(
+            second_ids[0],
+            turn_id=second_ids[1],
+            run_id=second_ids[2],
+            user_content="newer foreign-scope samples",
+            expected_revision=0,
+            started_event=_started(*second_ids),
+            context_projection=other_boundary,
+        )
+        for call_index in (1, 2):
+            store.start_provider_usage(
+                second_ids[2],
+                call_index,
+                provider="ollama",
+                model="qwen3.5:2b",
+                profile_digest=other_boundary.model_profile_digest,
+                context_plan_id=other_boundary.context_plan_id,
+                toolset_digest=other_toolset,
+                estimated_input_tokens=2_000 + call_index,
+                hard_input_tokens=28_672,
+            )
+            store.complete_provider_usage(
+                second_ids[2],
+                call_index,
+                input_tokens=400 + call_index,
+                output_tokens=5,
+            )
+
+        assert store.recent_provider_calibration_samples(**scope) == (
+            (1_001, 201),
+        )
+    finally:
+        store.finalize_noncompleted(second_ids[2], "interrupted")
+        store.close()
+
+
+def test_provider_usage_scope_migration_is_fail_closed_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    database = _database(tmp_path)
+    old_ids = (_id(1_110), _id(1_111), _id(1_112))
+    old_boundary = _calibration_boundary(*old_ids)
+    old_scope = {
+        "profile_digest": old_boundary.model_profile_digest,
+        "renderer_version": old_boundary.renderer_version,
+        "toolset_digest": old_boundary.toolset_digest,
+        "policy_digest": old_boundary.compression_policy_digest,
+    }
+    store = ConversationStore(database, AGENT_ID)
+    try:
+        store.create_conversation(conversation_id=old_ids[0])
+        store.begin_turn(
+            old_ids[0],
+            turn_id=old_ids[1],
+            run_id=old_ids[2],
+            user_content="legacy provider usage",
+            expected_revision=0,
+            started_event=_started(*old_ids),
+            context_projection=old_boundary,
+        )
+        store.start_provider_usage(
+            old_ids[2],
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest=old_boundary.model_profile_digest,
+            context_plan_id=old_boundary.context_plan_id,
+            toolset_digest=old_boundary.toolset_digest,
+            estimated_input_tokens=900,
+            hard_input_tokens=28_672,
+        )
+        store.complete_provider_usage(
+            old_ids[2], 1, input_tokens=300, output_tokens=5
+        )
+        store.finalize_noncompleted(old_ids[2], "interrupted")
+    finally:
+        store.close()
+
+    legacy = sqlite3.connect(database)
+    try:
+        legacy.execute("PRAGMA foreign_keys = OFF")
+        legacy.execute("DROP INDEX provider_usage_calibration_scope")
+        for column in (
+            "count_scope_digest",
+            "policy_digest",
+            "toolset_digest",
+            "renderer_version",
+        ):
+            legacy.execute(f"ALTER TABLE provider_usage DROP COLUMN {column}")
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    migrated = ConversationStore(database, AGENT_ID)
+    new_ids = (_id(1_113), _id(1_114), _id(1_115))
+    new_boundary = _calibration_boundary(*new_ids)
+    try:
+        columns = {
+            row[1]
+            for row in migrated._connection.execute(  # noqa: SLF001
+                "PRAGMA table_info(provider_usage)"
+            )
+        }
+        assert {
+            "renderer_version",
+            "toolset_digest",
+            "policy_digest",
+            "count_scope_digest",
+        } <= columns
+        assert migrated.recent_provider_calibration_samples(**old_scope) == ()
+
+        migrated.create_conversation(conversation_id=new_ids[0])
+        migrated.begin_turn(
+            new_ids[0],
+            turn_id=new_ids[1],
+            run_id=new_ids[2],
+            user_content="post-migration provider usage",
+            expected_revision=0,
+            started_event=_started(*new_ids),
+            context_projection=new_boundary,
+        )
+        migrated.start_provider_usage(
+            new_ids[2],
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest=new_boundary.model_profile_digest,
+            context_plan_id=new_boundary.context_plan_id,
+            toolset_digest=new_boundary.toolset_digest,
+            estimated_input_tokens=1_200,
+            hard_input_tokens=28_672,
+        )
+        migrated.complete_provider_usage(
+            new_ids[2], 1, input_tokens=400, output_tokens=5
+        )
+        assert migrated.recent_provider_calibration_samples(**old_scope) == (
+            (1_200, 400),
+        )
+        migrated.finalize_noncompleted(new_ids[2], "interrupted")
+    finally:
+        migrated.close()
+
+    reopened = ConversationStore(database, AGENT_ID)
+    try:
+        assert reopened.recent_provider_calibration_samples(**old_scope) == (
+            (1_200, 400),
+        )
+    finally:
+        reopened.close()
+
+
+def test_conversation_page_never_loads_out_of_page_turn_bodies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id = _id(1_120)
+    try:
+        created = store.create_conversation(conversation_id=conversation_id)
+        rows = []
+        for position in range(1, MAX_TURNS_PER_CONVERSATION + 1):
+            rows.append(
+                (
+                    _id(2_000 + position),
+                    conversation_id,
+                    _id(3_000 + position),
+                    position,
+                    "completed",
+                    f"user-{position}-" + "u" * 7_900,
+                    f"assistant-{position}-" + "a" * 20_000,
+                    created.created_at,
+                    created.created_at,
+                )
+            )
+        store._connection.execute("BEGIN IMMEDIATE")  # noqa: SLF001
+        store._connection.executemany(  # noqa: SLF001
+            """
+            INSERT INTO conversation_turns(
+                turn_id, conversation_id, run_id, position, status,
+                user_content, assistant_content, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        # A selected full-history loader would choke on these deliberately
+        # non-text legacy values; the latest page must never materialize them.
+        store._connection.execute(  # noqa: SLF001
+            """
+            UPDATE conversation_turns
+            SET user_content = X'FF', assistant_content = X'FE'
+            WHERE conversation_id = ? AND position = 1
+            """,
+            (conversation_id,),
+        )
+        store._connection.execute(  # noqa: SLF001
+            """
+            UPDATE conversations
+            SET revision = ?, updated_at = ?
+            WHERE conversation_id = ?
+            """,
+            (
+                MAX_TURNS_PER_CONVERSATION,
+                created.created_at,
+                conversation_id,
+            ),
+        )
+        store._connection.commit()  # noqa: SLF001
+
+        def forbidden_full_loader(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("full conversation body loader was called")
+
+        monkeypatch.setattr(store, "_conversation_turns_locked", forbidden_full_loader)
+        monkeypatch.setattr(store, "_turn_rows", forbidden_full_loader)
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)  # noqa: SLF001
+        page = store.get_conversation_page(
+            conversation_id,
+            limit=4,
+            expected_revision=MAX_TURNS_PER_CONVERSATION,
+        )
+        store._connection.set_trace_callback(None)  # noqa: SLF001
+
+        assert [turn.position for turn in page.turns] == [125, 126, 127, 128]
+        assert page.summary.turn_count == MAX_TURNS_PER_CONVERSATION
+        assert page.eligible_turn_count == MAX_TURNS_PER_CONVERSATION
+        assert all("user-1-" not in turn.user_content for turn in page.turns)
+        assert any(
+            "ORDER BY position DESC LIMIT 4" in statement
+            for statement in statements
+        )
+
+        older = store.get_conversation_page(
+            conversation_id,
+            limit=4,
+            before_position=125,
+            expected_revision=MAX_TURNS_PER_CONVERSATION,
+        )
+        assert [turn.position for turn in older.turns] == [121, 122, 123, 124]
+        with pytest.raises(ConversationConflictError, match="revision changed"):
+            store.get_conversation_page(
+                conversation_id,
+                limit=4,
+                expected_revision=MAX_TURNS_PER_CONVERSATION - 1,
+            )
     finally:
         store.close()

@@ -198,6 +198,7 @@ class HarnessKernel:
                 self.state.model_iterations += 1
                 self.state.phase = "streaming_model"
                 saw_stop = False
+                stop_reason: str | None = None
                 saw_tool = False
                 for block in self.model.stream(
                     model_context,
@@ -212,15 +213,21 @@ class HarnessKernel:
                         self.state.phase = "executing_tools"
                     if block.kind == "stop":
                         saw_stop = True
+                        reason = block.payload.get("reason")
+                        if reason not in {"end_turn", "max_output"}:
+                            raise RuntimeError("model returned an invalid stop reason")
+                        stop_reason = str(reason)
                     yield from self._handle_model_block(block)
                 if self.cancellation.is_cancelled():
                     yield from self._cancel_events()
                     return
                 if saw_stop:
+                    if stop_reason is None:
+                        raise RuntimeError("model stop reason is missing")
                     yield self._event(
                         "run.completed",
                         {
-                            "reason": "end_turn",
+                            "reason": stop_reason,
                             "model_iterations": self.state.model_iterations,
                         },
                     )

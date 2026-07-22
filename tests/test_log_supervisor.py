@@ -47,6 +47,20 @@ def test_capture_wait_timeout_blocks_when_idle() -> None:
     ) == 0.0
 
 
+def test_clean_environment_preserves_only_the_operator_summary_gate() -> None:
+    source = {
+        "PATH": "/bin",
+        "HARNESS_V2_SEMANTIC_SUMMARY_V2": "1",
+        "AGENT_BUILDER_API_TOKEN": "must-not-cross",
+        "UNRELATED_SECRET": "must-not-cross",
+    }
+
+    assert log_supervisor._sanitised_environment(source) == {
+        "PATH": "/bin",
+        "HARNESS_V2_SEMANTIC_SUMMARY_V2": "1",
+    }
+
+
 def test_supervisor_publishes_complete_private_identity_before_child_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

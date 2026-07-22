@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -52,8 +53,11 @@ from .sessions import (
     Conversation,
     ConversationConflictError,
     ConversationNotFoundError,
+    ConversationPage,
     ConversationStoreUnavailableError,
     ConversationSummary,
+    ConversationTurnCapacityError,
+    MAX_TURNS_PER_CONVERSATION,
     PermissionRecord,
     TurnNotFoundError,
 )
@@ -65,6 +69,11 @@ from .workspace_context import WorkspaceContextError
 SESSION_COOKIE = "abv2_session"
 CSRF_COOKIE = "abv2_csrf_seed"
 MAX_JSON_BODY_BYTES = 16_384
+DEFAULT_SESSION_TURN_PAGE = 32
+MAX_SESSION_TURN_PAGE = 64
+SESSION_CURSOR_VERSION = 1
+MAX_SESSION_CURSOR_CHARACTERS = 256
+SESSION_CURSOR_MAC_BYTES = hashlib.sha256().digest_size
 SESSION_SECONDS = 8 * 60 * 60
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -99,6 +108,17 @@ _CONTEXT_METADATA_FIELDS = frozenset(
         "output_reserve_tokens",
         "template_reserve_tokens",
         "estimator",
+    }
+)
+_CONTEXT_COUNT_METADATA_FIELDS = frozenset(
+    {
+        "admission_count_version",
+        "admission_basis",
+        "soft_count_version",
+        "soft_count_availability",
+        "soft_estimated_tokens",
+        "soft_error_margin_tokens",
+        "included_turn_bundle_count",
     }
 )
 
@@ -354,30 +374,48 @@ def _summary_response(
     else:
         turn_count = value.turn_count
         completed_turn_count = value.completed_turn_count
+    turns_remaining = max(0, MAX_TURNS_PER_CONVERSATION - turn_count)
     return {
         "session_id": value.conversation_id,
         "title": value.title,
+        "revision": value.revision,
         "created_at": value.created_at,
         "updated_at": value.updated_at,
         "message_count": turn_count + completed_turn_count,
         "state": _conversation_state(value.active_run_id),
+        "turn_count": turn_count,
+        "turn_limit": MAX_TURNS_PER_CONVERSATION,
+        "turns_remaining": turns_remaining,
+        "submission_blocker": (
+            "conversation_turn_capacity_exhausted"
+            if turns_remaining == 0 else None
+        ),
     }
 
 
-def _conversation_response(value: Conversation) -> dict[str, object]:
+def _conversation_response(
+    value: ConversationPage,
+    *,
+    cursor_key: bytes,
+) -> dict[str, object]:
+    summary = value.summary
+    page_turns = value.turns
+    before = value.before_position
     messages: list[dict[str, object]] = []
-    for turn in value.turns:
-        messages.append(
-            {
-                "message_id": turn.user_message_id,
-                "role": "user",
-                "content": turn.user_content,
-                "created_at": turn.created_at,
-                "turn_id": turn.turn_id,
-                "run_id": turn.run_id,
-                "turn_status": turn.status,
-            }
-        )
+    for turn in page_turns:
+        user_message: dict[str, object] = {
+            "message_id": turn.user_message_id,
+            "role": "user",
+            "content": turn.user_content,
+            "created_at": turn.created_at,
+            "turn_id": turn.turn_id,
+            "run_id": turn.run_id,
+            "turn_position": turn.position,
+            "turn_status": turn.status,
+        }
+        if turn.terminal is not None:
+            user_message["terminal"] = turn.terminal.to_dict()
+        messages.append(user_message)
         if turn.assistant_content is not None:
             messages.append(
                 {
@@ -387,10 +425,263 @@ def _conversation_response(value: Conversation) -> dict[str, object]:
                     "created_at": turn.updated_at,
                     "turn_id": turn.turn_id,
                     "run_id": turn.run_id,
+                    "turn_position": turn.position,
                     "turn_status": turn.status,
                 }
             )
-    return {"session": _summary_response(value), "messages": messages}
+    oldest_position = page_turns[0].position if page_turns else None
+    newest_position = page_turns[-1].position if page_turns else None
+    has_older = value.eligible_turn_count > len(page_turns)
+    has_newer = before is not None
+    return {
+        "session": _summary_response(summary),
+        "messages": messages,
+        "page": {
+            "version": "turn-page-v2",
+            "limit": value.limit,
+            "before_cursor": (
+                _encode_session_cursor(
+                    cursor_key,
+                    agent_id=summary.agent_id,
+                    conversation_id=summary.conversation_id,
+                    revision=summary.revision,
+                    before=before,
+                )
+                if before is not None
+                else None
+            ),
+            "returned_turns": len(page_turns),
+            "total_turns": summary.turn_count,
+            "oldest_position": oldest_position,
+            "newest_position": newest_position,
+            "has_older": has_older,
+            "has_newer": has_newer,
+            "next_before_cursor": (
+                _encode_session_cursor(
+                    cursor_key,
+                    agent_id=summary.agent_id,
+                    conversation_id=summary.conversation_id,
+                    revision=summary.revision,
+                    before=oldest_position,
+                )
+                if has_older and oldest_position is not None
+                else None
+            ),
+        },
+    }
+
+
+def _invalid_session_cursor() -> HTTPException:
+    return HTTPException(
+        400,
+        {
+            "code": "invalid_session_cursor",
+            "message": "session page cursor is invalid or stale",
+        },
+    )
+
+
+def _session_cursor_key(request: Request) -> bytes:
+    key = getattr(request.app.state, "session_cursor_key", None)
+    if not isinstance(key, bytes) or len(key) != 32:
+        raise HTTPException(
+            503,
+            {
+                "code": "session_state_unavailable",
+                "message": "session pagination is temporarily unavailable",
+            },
+        )
+    return key
+
+
+def _encode_session_cursor(
+    key: bytes,
+    *,
+    agent_id: str,
+    conversation_id: str,
+    revision: int,
+    before: int,
+) -> str:
+    payload = json.dumps(
+        [SESSION_CURSOR_VERSION, agent_id, conversation_id, revision, before],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    sealed = payload + hmac.new(key, payload, hashlib.sha256).digest()
+    encoded = base64.urlsafe_b64encode(sealed).rstrip(b"=").decode("ascii")
+    if len(encoded) > MAX_SESSION_CURSOR_CHARACTERS:
+        raise RuntimeError("session cursor exceeds its fixed bound")
+    return encoded
+
+
+def _decode_session_cursor(
+    key: bytes,
+    encoded: str,
+    *,
+    expected_agent_id: str,
+    expected_conversation_id: str,
+) -> tuple[int, int]:
+    try:
+        if (
+            not encoded
+            or len(encoded) > MAX_SESSION_CURSOR_CHARACTERS
+            or not encoded.isascii()
+            or any(
+                character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                for character in encoded
+            )
+        ):
+            raise ValueError("invalid cursor encoding")
+        padding = b"=" * (-len(encoded) % 4)
+        sealed = base64.b64decode(
+            encoded.encode("ascii") + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        if (
+            len(sealed) <= SESSION_CURSOR_MAC_BYTES
+            or len(sealed) > MAX_SESSION_CURSOR_CHARACTERS
+            or base64.urlsafe_b64encode(sealed).rstrip(b"=").decode("ascii")
+            != encoded
+        ):
+            raise ValueError("invalid cursor envelope")
+        payload = sealed[:-SESSION_CURSOR_MAC_BYTES]
+        supplied_mac = sealed[-SESSION_CURSOR_MAC_BYTES:]
+        expected_mac = hmac.new(key, payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(supplied_mac, expected_mac):
+            raise ValueError("invalid cursor authentication")
+        fields = json.loads(payload.decode("ascii"))
+        if not isinstance(fields, list) or len(fields) != 5:
+            raise ValueError("invalid cursor payload")
+        version, agent_id, conversation_id, revision, before = fields
+        if (
+            version != SESSION_CURSOR_VERSION
+            or agent_id != expected_agent_id
+            or conversation_id != expected_conversation_id
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision < 2**63
+            or not isinstance(before, int)
+            or isinstance(before, bool)
+            or not 1 <= before <= MAX_TURNS_PER_CONVERSATION
+        ):
+            raise ValueError("cursor no longer matches the conversation boundary")
+        return revision, before
+    except (UnicodeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
+        raise _invalid_session_cursor() from exc
+
+
+def _session_page_query(request: Request) -> tuple[int, str | None]:
+    if set(request.query_params) - {"limit", "before"}:
+        raise HTTPException(
+            400,
+            {
+                "code": "invalid_session_page",
+                "message": "unsupported session page query parameter",
+            },
+        )
+
+    def page_limit() -> int:
+        values = request.query_params.getlist("limit")
+        if not values:
+            return DEFAULT_SESSION_TURN_PAGE
+        raw = values[0]
+        if (
+            len(values) != 1
+            or not raw
+            or len(raw) > len(str(MAX_SESSION_TURN_PAGE))
+            or not raw.isascii()
+            or not raw.isdigit()
+        ):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_page",
+                    "message": "limit is not a valid page size",
+                },
+            )
+        value = int(raw)
+        if not 1 <= value <= MAX_SESSION_TURN_PAGE:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_page",
+                    "message": "limit is outside the supported range",
+                },
+            )
+        return value
+
+    before_values = request.query_params.getlist("before")
+    if not before_values:
+        before = None
+    elif (
+        len(before_values) != 1
+        or not before_values[0]
+        or len(before_values[0]) > MAX_SESSION_CURSOR_CHARACTERS
+    ):
+        raise _invalid_session_cursor()
+    else:
+        before = before_values[0]
+    return page_limit(), before
+
+
+async def _rename_runtime_conversation(
+    run_service: object,
+    conversation_id: str,
+    title: str,
+    *,
+    expected_revision: int,
+) -> Conversation:
+    method = getattr(run_service, "rename_conversation", None)
+    if method is None:
+        raise ConversationStoreUnavailableError(
+            "conversation rename service is unavailable"
+        )
+    value = method(
+        conversation_id,
+        title,
+        expected_revision=expected_revision,
+    )
+    if asyncio.iscoroutine(value):
+        value = await value
+    if not isinstance(value, Conversation):
+        raise ConversationStoreUnavailableError(
+            "conversation rename service returned an invalid value"
+        )
+    return value
+
+
+def _continuation_response(
+    created: Conversation,
+    *,
+    source_conversation_id: str,
+    mode: str,
+    included: int,
+    omitted: int,
+) -> dict[str, object]:
+    legacy = {
+        "source_session_id": source_conversation_id,
+        "included_completed_turns": included,
+        "omitted_completed_turns": omitted,
+        "authority": "untrusted_conversation_data",
+    }
+    return {
+        **_summary_response(created),
+        "continuation": legacy,
+        "relationship": {
+            "version": "conversation-relationship-v1",
+            "type": mode,
+            "source_session_id": source_conversation_id,
+            "source_preserved": True,
+            "branch_point": "completed_head",
+            "context_transfer": {
+                "type": "bounded_completed_turn_projection",
+                "included_completed_turns": included,
+                "omitted_completed_turns": omitted,
+                "authority": "untrusted_conversation_data",
+            },
+        },
+    }
 
 
 async def _runtime_for_agent(request: Request, agent_id: str) -> AgentRuntime:
@@ -488,7 +779,10 @@ def _summary_context_response(value: DurableReplay) -> dict[str, object]:
     )
     if (
         not isinstance(context_plan, dict)
-        or set(context_plan) != _CONTEXT_METADATA_FIELDS
+        or frozenset(context_plan) not in {
+            _CONTEXT_METADATA_FIELDS,
+            _CONTEXT_METADATA_FIELDS | _CONTEXT_COUNT_METADATA_FIELDS,
+        }
         or any(
             not isinstance(key, str)
             or not isinstance(item, (str, int))
@@ -657,6 +951,11 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         openapi_url=None,
         lifespan=lifespan,
     )
+    # Opaque conversation cursors intentionally expire across a Gateway
+    # process generation.  A restarted browser begins from the latest page;
+    # stale pre-restart cursors fail with the same bounded cursor error as any
+    # other revision or identity drift.
+    app.state.session_cursor_key = os.urandom(32)
 
     @app.middleware("http")
     async def protect_boundary(request: Request, call_next: Any) -> Response:
@@ -1198,6 +1497,167 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return _summary_response(conversation)
 
+    @app.post(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/continue",
+        status_code=201,
+    )
+    async def continue_agent_conversation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            )
+        body = await _read_json_object(request)
+        mode = body.get("mode", "continue")
+        if mode not in {"continue", "branch"}:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_relationship",
+                    "message": "mode must be continue or branch",
+                },
+            )
+        default_title = "续接会话" if mode == "continue" else "分支会话"
+        if (
+            set(body) - {"title", "mode"}
+            or not isinstance(body.get("title", default_title), str)
+        ):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a string",
+                },
+            )
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            created, included, omitted = (
+                await runtime.run_service.create_conversation_continuation(
+                    conversation_id, title=body.get("title", default_title)
+                )
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            ) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": "session_relationship_conflict",
+                    "message": "session cannot be continued while it is active",
+                },
+            ) from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            ) from exc
+        return _continuation_response(
+            created,
+            source_conversation_id=conversation_id,
+            mode=mode,
+            included=included,
+            omitted=omitted,
+        )
+
+    @app.patch("/api/agents/{agent_id}/sessions/{conversation_id}")
+    async def rename_agent_conversation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            )
+        body = await _read_json_object(request)
+        if set(body) != {"title", "revision"}:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_rename",
+                    "message": "title and revision are required",
+                },
+            )
+        if not isinstance(body.get("title"), str):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a non-empty string within the limit",
+                },
+            )
+        revision = body.get("revision")
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision < 2**63 - 1
+        ):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_revision",
+                    "message": "revision must be a non-negative integer",
+                },
+            )
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            conversation = await _rename_runtime_conversation(
+                runtime.run_service,
+                conversation_id,
+                body["title"],
+                expected_revision=revision,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a non-empty string within the limit",
+                },
+            ) from exc
+        except ConversationNotFoundError as exc:
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            ) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": "session_rename_conflict",
+                    "message": "session changed while it was being renamed",
+                },
+            ) from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            ) from exc
+        if (
+            conversation.agent_id != agent_id
+            or conversation.conversation_id != conversation_id
+        ):
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            )
+        return _summary_response(conversation)
+
     @app.post("/api/agents/{agent_id}/sessions/{conversation_id}/commands")
     async def execute_agent_slash_command(
         agent_id: str, conversation_id: str, request: Request
@@ -1228,16 +1688,119 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         _require_session(request)
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
+        limit, before_cursor = _session_page_query(request)
+        cursor_key = _session_cursor_key(request)
+        expected_revision: int | None = None
+        before: int | None = None
+        if before_cursor is not None:
+            expected_revision, before = _decode_session_cursor(
+                cursor_key,
+                before_cursor,
+                expected_agent_id=agent_id,
+                expected_conversation_id=conversation_id,
+            )
         runtime = await _runtime_for_agent(request, agent_id)
         try:
-            conversation = await runtime.query_engines.get_conversation(
-                conversation_id
+            page = await runtime.run_service.get_conversation_page(
+                conversation_id,
+                limit=limit,
+                before_position=before,
+                expected_revision=expected_revision,
+            )
+        except (ConversationNotFoundError, ConversationConflictError) as exc:
+            if before_cursor is not None:
+                raise _invalid_session_cursor() from exc
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _conversation_response(
+            page,
+            cursor_key=cursor_key,
+        )
+
+    @app.get(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/context-preview"
+    )
+    async def get_agent_next_turn_preview(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> Response:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        if set(request.query_params) - {"model_id"}:
+            raise HTTPException(400, "unsupported preview query parameter")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            value = await runtime.run_service.next_turn_preview(
+                conversation_id,
+                model_id=request.query_params.get("model_id"),
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation state changed") from exc
+        except ModelCatalogError as exc:
+            raise HTTPException(400, "model is not available") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "context preview is unavailable") from exc
+        return JSONResponse(value, headers={"Cache-Control": "no-store"})
+
+    @app.get(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/preparation"
+    )
+    async def get_agent_run_preparation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> Response:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id) or request.query_params:
+            raise HTTPException(404, "conversation not found")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            value = await runtime.run_service.preparation_status(conversation_id)
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "preparation status is unavailable") from exc
+        return JSONResponse(
+            value or {
+                "version": "run-preparation-v1",
+                "state": "idle",
+                "operation_id": None,
+                "stage": None,
+                "elapsed_ms": 0,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post(
+        "/api/agents/{agent_id}/sessions/{conversation_id}/preparation/cancel",
+        status_code=202,
+    )
+    async def cancel_agent_run_preparation(
+        agent_id: str, conversation_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id) or request.query_params:
+            raise HTTPException(404, "conversation not found")
+        body = await _read_json_object(request)
+        if set(body) != {"operation_id"} or not isinstance(
+            body.get("operation_id"), str
+        ) or RUN_ID.fullmatch(body["operation_id"]) is None:
+            raise HTTPException(400, "valid operation_id is required")
+        runtime = await _runtime_for_agent(request, agent_id)
+        try:
+            value = await runtime.run_service.cancel_preparation(
+                conversation_id, body["operation_id"]
             )
         except ConversationNotFoundError as exc:
             raise HTTPException(404, "conversation not found") from exc
         except ConversationStoreUnavailableError as exc:
-            raise HTTPException(503, "conversation state is unavailable") from exc
-        return _conversation_response(conversation)
+            raise HTTPException(503, "preparation cancellation is unavailable") from exc
+        return JSONResponse(
+            value,
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.get(
         "/api/agents/{agent_id}/sessions/{conversation_id}/subagents"
@@ -1352,6 +1915,15 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             )
         except ConversationNotFoundError as exc:
             raise HTTPException(404, "conversation not found") from exc
+        except ConversationTurnCapacityError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": exc.code,
+                    "message": "conversation turn capacity is exhausted",
+                    "turn_limit": MAX_TURNS_PER_CONVERSATION,
+                },
+            ) from exc
         except ConversationConflictError as exc:
             raise HTTPException(409, "conversation has an active Run") from exc
         except ConversationStoreUnavailableError as exc:
@@ -1703,6 +2275,162 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             raise HTTPException(503, "conversation state is unavailable") from exc
         return _summary_response(conversation)
 
+    @app.post("/api/sessions/{conversation_id}/continue", status_code=201)
+    async def continue_conversation(
+        conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            )
+        body = await _read_json_object(request)
+        mode = body.get("mode", "continue")
+        if mode not in {"continue", "branch"}:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_relationship",
+                    "message": "mode must be continue or branch",
+                },
+            )
+        default_title = "续接会话" if mode == "continue" else "分支会话"
+        if (
+            set(body) - {"title", "mode"}
+            or not isinstance(body.get("title", default_title), str)
+        ):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a string",
+                },
+            )
+        try:
+            created, included, omitted = (
+                await request.app.state.run_service.create_conversation_continuation(
+                    conversation_id, title=body.get("title", default_title)
+                )
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            ) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": "session_relationship_conflict",
+                    "message": "session cannot be continued while it is active",
+                },
+            ) from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            ) from exc
+        return _continuation_response(
+            created,
+            source_conversation_id=conversation_id,
+            mode=mode,
+            included=included,
+            omitted=omitted,
+        )
+
+    @app.patch("/api/sessions/{conversation_id}")
+    async def rename_conversation(
+        conversation_id: str, request: Request
+    ) -> dict[str, object]:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            )
+        body = await _read_json_object(request)
+        if set(body) != {"title", "revision"}:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_rename",
+                    "message": "title and revision are required",
+                },
+            )
+        if not isinstance(body.get("title"), str):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a non-empty string within the limit",
+                },
+            )
+        revision = body.get("revision")
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or not 0 <= revision < 2**63 - 1
+        ):
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_revision",
+                    "message": "revision must be a non-negative integer",
+                },
+            )
+        try:
+            conversation = await _rename_runtime_conversation(
+                request.app.state.run_service,
+                conversation_id,
+                body["title"],
+                expected_revision=revision,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                400,
+                {
+                    "code": "invalid_session_title",
+                    "message": "title must be a non-empty string within the limit",
+                },
+            ) from exc
+        except ConversationNotFoundError as exc:
+            raise HTTPException(
+                404,
+                {"code": "session_not_found", "message": "session not found"},
+            ) from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": "session_rename_conflict",
+                    "message": "session changed while it was being renamed",
+                },
+            ) from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            ) from exc
+        if (
+            conversation.agent_id != PROTOTYPE_AGENT_ID
+            or conversation.conversation_id != conversation_id
+        ):
+            raise HTTPException(
+                503,
+                {
+                    "code": "session_state_unavailable",
+                    "message": "session state is temporarily unavailable",
+                },
+            )
+        return _summary_response(conversation)
+
     @app.post("/api/sessions/{conversation_id}/commands")
     async def execute_slash_command(
         conversation_id: str, request: Request
@@ -1732,15 +2460,113 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
         _require_session(request)
         if not RUN_ID.fullmatch(conversation_id):
             raise HTTPException(404, "conversation not found")
+        limit, before_cursor = _session_page_query(request)
+        cursor_key = _session_cursor_key(request)
+        expected_revision: int | None = None
+        before: int | None = None
+        if before_cursor is not None:
+            expected_revision, before = _decode_session_cursor(
+                cursor_key,
+                before_cursor,
+                expected_agent_id=PROTOTYPE_AGENT_ID,
+                expected_conversation_id=conversation_id,
+            )
         try:
-            conversation = await request.app.state.query_engines.get_conversation(
+            page = await request.app.state.run_service.get_conversation_page(
+                conversation_id,
+                limit=limit,
+                before_position=before,
+                expected_revision=expected_revision,
+            )
+        except (ConversationNotFoundError, ConversationConflictError) as exc:
+            if before_cursor is not None:
+                raise _invalid_session_cursor() from exc
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "conversation state is unavailable") from exc
+        return _conversation_response(
+            page,
+            cursor_key=cursor_key,
+        )
+
+    @app.get("/api/sessions/{conversation_id}/context-preview")
+    async def get_next_turn_preview(
+        conversation_id: str, request: Request
+    ) -> Response:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id):
+            raise HTTPException(404, "conversation not found")
+        if set(request.query_params) - {"model_id"}:
+            raise HTTPException(400, "unsupported preview query parameter")
+        try:
+            value = await request.app.state.run_service.next_turn_preview(
+                conversation_id,
+                model_id=request.query_params.get("model_id"),
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationConflictError as exc:
+            raise HTTPException(409, "conversation state changed") from exc
+        except ModelCatalogError as exc:
+            raise HTTPException(400, "model is not available") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "context preview is unavailable") from exc
+        return JSONResponse(value, headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/sessions/{conversation_id}/preparation")
+    async def get_run_preparation(
+        conversation_id: str, request: Request
+    ) -> Response:
+        _require_session(request)
+        if not RUN_ID.fullmatch(conversation_id) or request.query_params:
+            raise HTTPException(404, "conversation not found")
+        try:
+            value = await request.app.state.run_service.preparation_status(
                 conversation_id
             )
         except ConversationNotFoundError as exc:
             raise HTTPException(404, "conversation not found") from exc
         except ConversationStoreUnavailableError as exc:
-            raise HTTPException(503, "conversation state is unavailable") from exc
-        return _conversation_response(conversation)
+            raise HTTPException(503, "preparation status is unavailable") from exc
+        return JSONResponse(
+            value or {
+                "version": "run-preparation-v1",
+                "state": "idle",
+                "operation_id": None,
+                "stage": None,
+                "elapsed_ms": 0,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.post(
+        "/api/sessions/{conversation_id}/preparation/cancel",
+        status_code=202,
+    )
+    async def cancel_run_preparation(
+        conversation_id: str, request: Request
+    ) -> Response:
+        _require_csrf(request)
+        if not RUN_ID.fullmatch(conversation_id) or request.query_params:
+            raise HTTPException(404, "conversation not found")
+        body = await _read_json_object(request)
+        if set(body) != {"operation_id"} or not isinstance(
+            body.get("operation_id"), str
+        ) or RUN_ID.fullmatch(body["operation_id"]) is None:
+            raise HTTPException(400, "valid operation_id is required")
+        try:
+            value = await request.app.state.run_service.cancel_preparation(
+                conversation_id, body["operation_id"]
+            )
+        except ConversationNotFoundError as exc:
+            raise HTTPException(404, "conversation not found") from exc
+        except ConversationStoreUnavailableError as exc:
+            raise HTTPException(503, "preparation cancellation is unavailable") from exc
+        return JSONResponse(
+            value,
+            status_code=202,
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.delete("/api/sessions/{conversation_id}", status_code=204)
     async def delete_conversation(
@@ -1816,6 +2642,15 @@ def create_app(repository_root: Path | None = None) -> FastAPI:
             )
         except ConversationNotFoundError as exc:
             raise HTTPException(404, "conversation not found") from exc
+        except ConversationTurnCapacityError as exc:
+            raise HTTPException(
+                409,
+                {
+                    "code": exc.code,
+                    "message": "conversation turn capacity is exhausted",
+                    "turn_limit": MAX_TURNS_PER_CONVERSATION,
+                },
+            ) from exc
         except ConversationConflictError as exc:
             raise HTTPException(409, "conversation has an active Run") from exc
         except ConversationStoreUnavailableError as exc:

@@ -9,7 +9,7 @@ import re
 from typing import Protocol
 
 
-CONTEXT_COLLAPSE_VERSION = "context-collapse-v1"
+CONTEXT_COLLAPSE_VERSION = "context-collapse-v2"
 MAX_COLLAPSE_MESSAGES = 256
 MAX_COLLAPSE_RECEIPT_BYTES = 16 * 1024
 _MESSAGE_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -67,9 +67,9 @@ class ContextCollapseProjection:
             )
             or not isinstance(self.collapsed_message_ids, tuple)
             or not isinstance(self.preserved_message_ids, tuple)
-            or not 2 <= len(self.collapsed_message_ids) <= MAX_COLLAPSE_MESSAGES - 2
+            or not 2 <= len(self.collapsed_message_ids) <= MAX_COLLAPSE_MESSAGES
             or len(self.collapsed_message_ids) % 2
-            or not 2 <= len(self.preserved_message_ids) <= MAX_COLLAPSE_MESSAGES - 2
+            or not 0 <= len(self.preserved_message_ids) <= MAX_COLLAPSE_MESSAGES - 2
             or len(self.preserved_message_ids) % 2
             or len(self.collapsed_message_ids) + len(self.preserved_message_ids)
             > MAX_COLLAPSE_MESSAGES
@@ -99,7 +99,7 @@ class ContextCollapseProjection:
             or len(history) % 2
             or not isinstance(omitted_message_count, int)
             or isinstance(omitted_message_count, bool)
-            or not 2 <= omitted_message_count <= len(history) - 2
+            or not 2 <= omitted_message_count <= len(history)
             or omitted_message_count % 2
             or _DIGEST.fullmatch(source_history_digest) is None
             or any(
@@ -154,12 +154,16 @@ class ContextCollapseProjection:
         return {**self._unsigned_manifest(), "projection_digest": self.projection_digest}
 
     def placeholder(self) -> str:
+        suffix = (
+            "All following conversation turns are preserved in full."
+            if self.preserved_message_ids
+            else "No completed turn is preserved in this emergency model view."
+        )
         return (
             "The trusted runtime deterministically collapsed "
             f"{self.collapsed_turn_count} older completed conversation turns. "
             f"Projection receipt: {self.projection_digest}. The collapsed content is "
-            "unavailable in this model view; do not infer or invent it. All following "
-            "conversation turns are preserved in full."
+            f"unavailable in this model view; do not infer or invent it. {suffix}"
         )
 
 

@@ -250,6 +250,21 @@ def test_runtime_replay_accepts_independently_enabled_research_tool() -> None:
     assert gaps == ()
 
 
+def test_runtime_replay_accepts_qualified_text_only_model_toolset() -> None:
+    payload = _started_payload()
+    payload["visible_tools"] = []
+    context = payload["context_plan"]
+    assert isinstance(context, dict)
+    context["toolset_digest"] = toolset_digest(())
+
+    snapshot, gaps = project_durable_run(
+        (_event(1, "run.started", payload), _event(2, "run.failed", _failed()))
+    )
+
+    assert snapshot.complete is True
+    assert gaps == ()
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

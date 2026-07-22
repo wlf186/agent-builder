@@ -64,7 +64,7 @@ def test_projection_binds_content_identity_source_and_policy_inputs() -> None:
         replace(base, projection_digest="0" * 64)
 
 
-@pytest.mark.parametrize("omitted", (0, 1, 7, 8))
+@pytest.mark.parametrize("omitted", (0, 1, 7))
 def test_projection_never_splits_pairs_or_collapses_the_recent_tail(
     omitted: int,
 ) -> None:
@@ -72,3 +72,14 @@ def test_projection_never_splits_pairs_or_collapses_the_recent_tail(
         ContextCollapseProjection.create(
             _history(), omitted_message_count=omitted, source_history_digest="a" * 64
         )
+
+
+def test_emergency_projection_can_collapse_all_pairs_without_losing_receipt() -> None:
+    history = _history()
+    projection = ContextCollapseProjection.create(
+        history, omitted_message_count=len(history), source_history_digest="a" * 64
+    )
+
+    assert projection.collapsed_message_ids == tuple(item.message_id for item in history)
+    assert projection.preserved_message_ids == ()
+    assert "emergency model view" in projection.placeholder()

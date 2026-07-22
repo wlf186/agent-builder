@@ -1,7 +1,7 @@
 ---
 owner: repository-maintainers
 status: maintained
-last_reviewed: 2026-07-20
+last_reviewed: 2026-07-22
 review_cycle: quarterly
 ---
 
@@ -24,6 +24,8 @@ review_cycle: quarterly
 | Agent/Run 所有权与清理 | `docs/design/agent-capsule.md` | runtime maintainers | Capsule 目录、环境、生命周期、隔离或删除变化 |
 | 发布、平台、备份与回滚 | `docs/design/release.md` | runtime maintainers | release scope、平台、资格、产物或运维流程变化 |
 | 当前路线与缺口 | `docs/plans/runtime-rebuild.md` | plan owner | 工作开始、完成、换方向、阻塞或验收变化 |
+| 多轮、长上下文与压缩整改 | `docs/plans/context-reliability-remediation.md` | runtime maintainers | `CTX-R01` 子项开始、完成、拆分、阻塞、迁移或资格变化 |
+| Web UX 与运行韧性整改 | `docs/plans/ux-reliability-remediation.md` | runtime maintainers | `UX-R02` 子项开始、完成、拆分、阻塞或资格变化 |
 | Claude Code 研究范围 | `references/claude-code/*.md` | research maintainers | 材料、版本、hash、来源或使用边界变化 |
 
 一个事实只在一份权威文档中完整定义，其它位置用链接和简短摘要。若代码与文档冲突，

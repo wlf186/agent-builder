@@ -171,6 +171,9 @@ def test_runtime_catalog_brokers_capabilities_and_rejects_surrogates() -> None:
         "skill/run",
     ]
     assert "builtin/echo" not in {item.tool_id for item in specs}
+    delegate = next(item for item in specs if item.tool_id == "agent/delegate")
+    assert "supplies the exact ID" in delegate.description
+    assert "Never use this for ordinary writing" in delegate.description
     registry = runtime_tools(specs, brokered)  # type: ignore[arg-type]
     result = registry.execute(
         "file/glob", {"pattern": "**/*.txt"}, call_id="glob-call"

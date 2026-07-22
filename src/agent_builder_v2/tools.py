@@ -155,6 +155,7 @@ class ToolSpec:
     max_progress_events: int
     cancellation: str
     max_provider_projection_bytes: int = 4_096
+    min_provider_receipt_bytes: int = 512
     result_projection: str = "identity_or_digest_placeholder_v1"
 
     def __post_init__(self) -> None:
@@ -203,6 +204,11 @@ class ToolSpec:
             or not 512
             <= self.max_provider_projection_bytes
             <= min(self.max_result_bytes, MAX_PROVIDER_TOOL_RESULT_HISTORY_BYTES)
+            or not isinstance(self.min_provider_receipt_bytes, int)
+            or isinstance(self.min_provider_receipt_bytes, bool)
+            or not 256
+            <= self.min_provider_receipt_bytes
+            <= self.max_provider_projection_bytes
             or self.result_projection not in _RESULT_PROJECTION
         ):
             raise ValueError("invalid Tool specification")
@@ -287,6 +293,7 @@ class ToolSpec:
             manifest.update(
                 {
                     "max_provider_projection_bytes": self.max_provider_projection_bytes,
+                    "min_provider_receipt_bytes": self.min_provider_receipt_bytes,
                     "result_projection": self.result_projection,
                 }
             )
@@ -332,12 +339,12 @@ def _tool_result_content_digest(content: bytes) -> str:
 
 
 def _tool_result_placeholder(
-    call_id: str, original_bytes: int, content_digest: str
+    call_id: str, original_bytes: int, content_digest: str, reason: str
 ) -> str:
     return (
         "[tool-result compacted; "
         f"call_id={call_id}; original_bytes={original_bytes}; "
-        f"sha256={content_digest}; reason=provider_projection_limit]"
+        f"sha256={content_digest}; reason={reason}]"
     )
 
 
@@ -385,7 +392,9 @@ def project_tool_result(
     content_digest = _tool_result_content_digest(encoded)
     truncated = original_bytes > spec.max_provider_projection_bytes
     projected = (
-        _tool_result_placeholder(call_id, original_bytes, content_digest)
+        _tool_result_placeholder(
+            call_id, original_bytes, content_digest, "provider_projection_limit"
+        )
         if truncated
         else content
     )
@@ -413,6 +422,48 @@ def project_tool_result(
     )
 
 
+def compact_tool_result_projection(
+    spec: ToolSpec,
+    projection: ToolResultProjection,
+    *,
+    reason: str = "context_headroom",
+) -> ToolResultProjection:
+    """Replace a validated full projection with its identity-bound receipt."""
+
+    projection = validate_tool_result_projection(spec, projection)
+    if projection.truncated:
+        return projection
+    if reason != "context_headroom":
+        raise ValueError("invalid Tool result compaction reason")
+    content = _tool_result_placeholder(
+        projection.call_id,
+        projection.original_bytes,
+        projection.content_digest,
+        reason,
+    )
+    if len(content.encode("utf-8")) > spec.min_provider_receipt_bytes:
+        raise ValueError("Tool result receipt exceeds its minimum budget")
+    digest = _tool_result_projection_digest(
+        spec,
+        call_id=projection.call_id,
+        content=content,
+        original_bytes=projection.original_bytes,
+        content_digest=projection.content_digest,
+        truncated=True,
+        truncation_reason=reason,
+    )
+    return ToolResultProjection(
+        projection.call_id,
+        projection.tool_id,
+        content,
+        projection.original_bytes,
+        projection.content_digest,
+        True,
+        reason,
+        digest,
+    )
+
+
 def validate_tool_result_projection(
     spec: ToolSpec, projection: ToolResultProjection
 ) -> ToolResultProjection:
@@ -432,7 +483,7 @@ def validate_tool_result_projection(
         or not isinstance(projection.truncated, bool)
         or not isinstance(projection.truncation_reason, str)
         or projection.truncation_reason
-        not in {"none", "provider_projection_limit"}
+        not in {"none", "provider_projection_limit", "context_headroom"}
         or not isinstance(projection.projection_digest, str)
         or projected_bytes > spec.max_provider_projection_bytes
     ):
@@ -442,10 +493,15 @@ def validate_tool_result_projection(
             projection.call_id,
             projection.original_bytes,
             projection.content_digest,
+            projection.truncation_reason,
         )
         if (
-            projection.original_bytes <= spec.max_provider_projection_bytes
-            or projection.truncation_reason != "provider_projection_limit"
+            projection.truncation_reason
+            not in {"provider_projection_limit", "context_headroom"}
+            or (
+                projection.truncation_reason == "provider_projection_limit"
+                and projection.original_bytes <= spec.max_provider_projection_bytes
+            )
             or projection.content != expected_content
         ):
             raise ValueError("invalid compacted Tool result projection")
@@ -1021,7 +1077,9 @@ AGENT_DELEGATE_SPEC = ToolSpec(
     provider_name="agent_delegate",
     contract_version="3",
     description=(
-        "Delegate one bounded message to a different active Agent. The child runs "
+        "Use only when the current user explicitly asks to delegate and supplies "
+        "the exact ID of a different active Agent. Never use this for ordinary "
+        "writing, answering, research, or as a generic task solver. The child runs "
         "in its own Capsule, Conversation, Worker and sandbox; explicit operator "
         "approval is required and only its bounded answer returns."
     ),
@@ -1337,4 +1395,5 @@ __all__ = [
     "project_tool_result",
     "toolset_digest",
     "validate_tool_result_projection",
+    "compact_tool_result_projection",
 ]

@@ -135,6 +135,27 @@ def _broker(
     )
 
 
+def test_broker_accepts_only_enumerated_trusted_toolset_projections(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    policy = _policy()
+    current = prototype_effective_toolset().toolset_digest
+    broker = CapabilityBroker(
+        store,
+        generation_provider=lambda: 1,
+        toolset_digest_provider=lambda: (current, "f" * 64),
+        policy=policy,
+    )
+    try:
+        permission = broker.request(
+            _request(policy), turn_id=TURN_ID, interactive=True
+        )
+        assert permission.toolset_digest == current
+    finally:
+        store.close()
+
+
 class _Executor:
     executor_kind = "test-sandbox-executor"
     identity_digest = "e" * 64

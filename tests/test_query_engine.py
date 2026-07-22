@@ -394,6 +394,18 @@ class _SingleActiveRunService(_RunService):
         return record
 
 
+class _GatedStartRunService(_SingleActiveRunService):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+        self.allow_start = asyncio.Event()
+
+    async def start(self, command: StartRunCommand) -> _RunRecord:
+        self.start_entered.set()
+        await self.allow_start.wait()
+        return await super().start(command)
+
+
 class _GatedInternRegistry(QueryEngineRegistry):
     def __init__(self, service: _RunService) -> None:
         super().__init__(service, PROTOTYPE_AGENT_ID)  # type: ignore[arg-type]
@@ -726,6 +738,32 @@ def test_same_conversation_concurrent_submit_accepts_only_one_turn() -> None:
         assert len(service.started) == 1
         restored = await engine.restore()
         assert restored.active_run_id in service.runs
+
+    asyncio.run(scenario())
+
+
+def test_second_submit_fails_fast_while_first_admission_is_preparing() -> None:
+    async def scenario() -> None:
+        service = _GatedStartRunService()
+        registry = QueryEngineRegistry(
+            service, PROTOTYPE_AGENT_ID
+        )  # type: ignore[arg-type]
+        conversation = await registry.create_conversation("gated admission")
+        engine = await registry.for_conversation(conversation.conversation_id)
+
+        first = asyncio.create_task(engine.submit_message("first"))
+        await asyncio.wait_for(service.start_entered.wait(), timeout=0.25)
+
+        with pytest.raises(ConversationConflictError, match="in progress"):
+            await asyncio.wait_for(
+                engine.submit_message("must not queue"), timeout=0.05
+            )
+        assert service.started == []
+
+        service.allow_start.set()
+        admitted = await asyncio.wait_for(first, timeout=0.25)
+        assert admitted.conversation_id == conversation.conversation_id
+        assert [command.message for command in service.started] == ["first"]
 
     asyncio.run(scenario())
 

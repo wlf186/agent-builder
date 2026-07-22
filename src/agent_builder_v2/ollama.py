@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 from typing import Any
@@ -25,6 +26,7 @@ from .context import (
     CONTEXT_RENDERER_VERSION,
     PROMPT_SECTION_REGISTRY_VERSION,
     MAX_NATIVE_CONTEXT_TOKENS,
+    MAX_COMMITTED_ASSISTANT_BYTES,
     CompressionPolicy,
     ConversationMessage,
     ContextCompiler,
@@ -33,8 +35,10 @@ from .context import (
     ModelProfile,
     estimate_provider_input_tokens,
 )
+from .context_counts import SoftContextCalibration, SoftContextCalibrationRegistry
 from .model import MAX_BROKER_FRAME_BYTES, MAX_BROKER_RESPONSE_FRAMES
 from .model_catalog import (
+    MAX_CATALOG_MODELS,
     ModelCatalog,
     ModelCatalogEntry,
     ModelCatalogError,
@@ -49,13 +53,23 @@ from .semantic_summary import (
     SemanticSummaryError,
     SemanticSummarySnapshot,
 )
+from .semantic_summary_v2 import (
+    MAX_SUMMARY_V2_OUTPUT_BYTES,
+    SUMMARY_V2_TIMEOUT_SECONDS,
+    SemanticSummaryV2Snapshot,
+    summary_v2_request_messages,
+)
+from .completed_context import CompletedTurnContext
+from .generation import generation_options_for
 from .tools import (
     MAX_PROVIDER_TOOL_RESULT_HISTORY_BYTES,
     PROTOTYPE_ECHO_SPEC,
     ToolResultProjection,
     ToolSpec,
+    compact_tool_result_projection,
     project_tool_result,
     runtime_tool_catalog,
+    toolset_digest,
     validate_tool_result_projection,
 )
 
@@ -72,7 +86,16 @@ MAX_QUALIFICATION_BYTES = 1024 * 1024
 MAX_NDJSON_LINE_BYTES = 64 * 1024
 MAX_STREAM_BYTES = 512 * 1024
 MAX_STREAM_FRAMES = 4_096
-MAX_OUTPUT_BYTES = 12_288
+MAX_OUTPUT_BYTES = MAX_COMMITTED_ASSISTANT_BYTES
+OUTPUT_TRUNCATION_MARKER = (
+    "\n\n[回答达到模型输出长度上限；已保留此前内容。]"
+)
+_OUTPUT_TRUNCATION_MARKER_BYTES = len(
+    OUTPUT_TRUNCATION_MARKER.encode("utf-8")
+)
+MAX_UNTRUNCATED_OUTPUT_BYTES = (
+    MAX_OUTPUT_BYTES - _OUTPUT_TRUNCATION_MARKER_BYTES
+)
 MAX_MODEL_TURNS = 8
 MAX_CONCURRENT_MODEL_STREAMS = 2
 RUNTIME_CONTEXT_TOKEN_CAP = 32_768
@@ -88,6 +111,10 @@ REQUEST_DIGEST_DOMAIN = b"agent-builder-ollama-request-v1\0"
 SUMMARY_TIMEOUT_SECONDS = 15.0
 SUMMARY_CIRCUIT_FAILURES = 3
 SUMMARY_CIRCUIT_SECONDS = 60.0
+MODEL_HEALTH_ZERO_FRAME_FAILURES = 2
+MODEL_HEALTH_CIRCUIT_SECONDS = 30.0
+MAX_MODEL_HEALTH_ENTRIES = MAX_CATALOG_MODELS
+MAX_TRANSPORT_ATTEMPT_MILLISECONDS = 300_000
 TOOL_FINALIZATION_INSTRUCTION = (
     "Trusted runtime finalization: The Tool-call budget is exhausted. "
     "Do not call or mention any Tool. Respond now with only the final answer "
@@ -186,9 +213,31 @@ class OllamaRequestMetadata:
     iteration: int
     message_count: int
     tool_count: int
+    tool_ids: tuple[str, ...]
+    toolset_digest: str
     estimated_input_tokens: int
     request_bytes: int
     request_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaTransportAttempt:
+    """Safe, bounded first-frame telemetry for one provider HTTP attempt.
+
+    Exactly two observations are emitted for each attempted HTTP request: one
+    ``attempt_started`` observation before opening HTTP, followed by one
+    ``attempt_finished`` observation either when the first validated provider
+    frame arrives or when the attempt fails before such a frame.  The contract
+    deliberately contains no endpoint, request body, prompt, or provider error
+    text.
+    """
+
+    attempt: int
+    max_attempts: int
+    phase: str
+    outcome: str | None
+    elapsed_ms: int
+    first_frame_ms: int | None
 
 
 @dataclass(frozen=True)
@@ -211,9 +260,40 @@ class _PendingTool:
     assistant_call: dict[str, Any]
 
 
+@dataclass(slots=True)
+class _ModelHealth:
+    consecutive_zero_frame_failures: int
+    circuit_until: float
+    updated_at: float
+
+
 Resolver = Callable[..., list[tuple[Any, ...]]]
 CancelCheck = Callable[[], bool]
 RequestObserver = Callable[[OllamaRequestMetadata], Awaitable[None]]
+TransportAttemptObserver = Callable[[OllamaTransportAttempt], Awaitable[None]]
+
+_ATTEMPT_OUTCOME_BY_ERROR = {
+    "model_cancelled": "cancelled",
+    "model_first_frame_timeout": "first_frame_timeout",
+    "model_transport_timeout": "transport_timeout",
+    "model_turn_deadline": "turn_deadline",
+    "model_unavailable": "unavailable",
+    "model_missing": "unavailable",
+    "model_redirect_rejected": "rejected",
+}
+_ZERO_FRAME_HEALTH_ERROR_CODES = frozenset(
+    {
+        "model_first_frame_timeout",
+        "model_transport_timeout",
+        "model_turn_deadline",
+        "model_unavailable",
+    }
+)
+
+
+def _bounded_elapsed_ms(started_at: float, finished_at: float) -> int:
+    elapsed = max(0.0, finished_at - started_at)
+    return min(MAX_TRANSPORT_ATTEMPT_MILLISECONDS, int(elapsed * 1_000))
 
 
 def _bounded_text(value: object, maximum_bytes: int, *, allow_empty: bool) -> str:
@@ -342,13 +422,23 @@ class OllamaBroker:
         transport: httpx.AsyncBaseTransport | None = None,
         resolver: Resolver = socket.getaddrinfo,
         catalog: ModelCatalog | None = None,
-        semantic_summary_enabled: bool = True,
+        semantic_summary_enabled: bool | None = None,
     ) -> None:
-        # The whole catalog is an operator-owned constructor dependency.  No
-        # Worker or HTTP field can add an endpoint/model/options entry.
+        # Catalog and the summary gate are operator-owned constructor
+        # dependencies fixed before startup.  No Worker, prompt, or HTTP field
+        # can alter them. V1 creation is never selected by the Control Plane;
+        # this gate controls only the qualified v2 lifecycle. The legacy
+        # summarize() seam remains decoder/compatibility-test-only.
         self._transport = transport
         self._resolver = resolver
         self._catalog = catalog or default_model_catalog()
+        if semantic_summary_enabled is None:
+            configured = os.environ.get("HARNESS_V2_SEMANTIC_SUMMARY_V2", "1")
+            if configured not in {"0", "1"}:
+                raise ValueError(
+                    "HARNESS_V2_SEMANTIC_SUMMARY_V2 must be 0 or 1"
+                )
+            semantic_summary_enabled = configured == "1"
         if not isinstance(semantic_summary_enabled, bool):
             raise TypeError("semantic_summary_enabled must be bool")
         self._semantic_summary_enabled = semantic_summary_enabled
@@ -364,6 +454,11 @@ class OllamaBroker:
         self._model_slots = asyncio.Semaphore(MAX_CONCURRENT_MODEL_STREAMS)
         self._summary_failures = 0
         self._summary_circuit_until = 0.0
+        self._context_calibrations = SoftContextCalibrationRegistry()
+        # Process-local first-frame health is intentionally keyed only by the
+        # qualified model/profile identity.  It neither exposes nor persists
+        # the pinned endpoint, and its size cannot exceed the trusted catalog.
+        self._model_health: dict[tuple[str, str], _ModelHealth] = {}
 
     @property
     def qualification(self) -> OllamaQualification | None:
@@ -383,6 +478,81 @@ class OllamaBroker:
     @property
     def semantic_summary_enabled(self) -> bool:
         return self._semantic_summary_enabled
+
+    def soft_calibration_for(self, plan: ContextPlan) -> SoftContextCalibration | None:
+        if not isinstance(plan, ContextPlan):
+            raise TypeError("plan must be a ContextPlan")
+        return self._context_calibrations.calibration_for(plan.count_scope)
+
+    def observe_context_usage(
+        self,
+        plan: ContextPlan,
+        *,
+        admission_upper_bound_tokens: int,
+        actual_input_tokens: int,
+    ) -> None:
+        self._context_calibrations.observe(
+            plan.count_scope,
+            admission_upper_bound_tokens=admission_upper_bound_tokens,
+            actual_input_tokens=actual_input_tokens,
+        )
+
+    @staticmethod
+    def _health_key(qualification: OllamaQualification) -> tuple[str, str]:
+        return (
+            qualification.catalog_model_id,
+            qualification.model_profile.profile_digest,
+        )
+
+    def _raise_if_model_temporarily_unhealthy(
+        self, qualification: OllamaQualification
+    ) -> None:
+        key = self._health_key(qualification)
+        state = self._model_health.get(key)
+        if state is None:
+            return
+        now = asyncio.get_running_loop().time()
+        if state.circuit_until > now:
+            raise OllamaBrokerError(
+                "model_temporarily_unhealthy",
+                "The model is temporarily unhealthy after repeated first-frame failures.",
+                retryable=True,
+            )
+        if now - state.updated_at >= MODEL_HEALTH_CIRCUIT_SECONDS:
+            self._model_health.pop(key, None)
+
+    def _record_zero_frame_failure(
+        self, qualification: OllamaQualification
+    ) -> None:
+        key = self._health_key(qualification)
+        now = asyncio.get_running_loop().time()
+        state = self._model_health.get(key)
+        if state is None or now - state.updated_at >= MODEL_HEALTH_CIRCUIT_SECONDS:
+            if state is None and len(self._model_health) >= MAX_MODEL_HEALTH_ENTRIES:
+                oldest = min(
+                    self._model_health,
+                    key=lambda item: self._model_health[item].updated_at,
+                )
+                self._model_health.pop(oldest, None)
+            state = _ModelHealth(0, 0.0, now)
+            self._model_health[key] = state
+        state.consecutive_zero_frame_failures = min(
+            MODEL_HEALTH_ZERO_FRAME_FAILURES,
+            state.consecutive_zero_frame_failures + 1,
+        )
+        state.updated_at = now
+        if (
+            state.consecutive_zero_frame_failures
+            >= MODEL_HEALTH_ZERO_FRAME_FAILURES
+        ):
+            state.circuit_until = now + MODEL_HEALTH_CIRCUIT_SECONDS
+
+    def _record_first_frame_success(
+        self, qualification: OllamaQualification
+    ) -> None:
+        # A validated first frame proves first-frame health even if the stream
+        # later fails its idle/deadline/protocol contract.
+        self._model_health.pop(self._health_key(qualification), None)
 
     def qualification_for(self, model_id: str | None = None) -> OllamaQualification:
         try:
@@ -658,12 +828,17 @@ class OllamaBroker:
         model_id: str | None = None,
         is_cancelled: CancelCheck = lambda: False,
     ) -> SemanticSummarySnapshot:
-        """Run one bounded, no-Tool semantic summary request.
+        """Reject legacy v1 generation; its codec remains replay-only.
 
-        The source is trusted transcript data but semantically untrusted.  A
-        failure never retries here and callers retain deterministic collapse.
-        Three consecutive failures open a short process-local circuit.
+        The arguments remain for source compatibility with older integrations,
+        but no production or explicitly injected Broker may create a v1
+        snapshot after the v2 renderer became qualified.
         """
+
+        del source, model_id, is_cancelled
+        raise OllamaBrokerError(
+            "summary_v1_disabled", "Semantic summary v1 generation is disabled."
+        )
 
         if (
             not self._semantic_summary_enabled
@@ -809,6 +984,197 @@ class OllamaBroker:
                 "summary_timeout", "Semantic summary timed out.", retryable=True
             ) from exc
 
+    async def summarize_v2(
+        self,
+        source: tuple[CompletedTurnContext, ...],
+        *,
+        model_id: str | None = None,
+        parent: SemanticSummaryV2Snapshot | None = None,
+        aggregate_source: tuple[CompletedTurnContext, ...] | None = None,
+        is_cancelled: CancelCheck = lambda: False,
+    ) -> SemanticSummaryV2Snapshot:
+        """Execute the v2 two-role/no-Tool summary protocol exactly once."""
+
+        if not self._semantic_summary_enabled:
+            raise OllamaBrokerError(
+                "summary_disabled", "Semantic summary v2 is disabled."
+            )
+        qualification = self.qualification_for(model_id)
+        profile = qualification.model_profile
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._summary_circuit_until:
+            raise OllamaBrokerError(
+                "summary_circuit_open",
+                "Semantic summary is temporarily disabled.",
+                retryable=True,
+            )
+        if any(
+            not isinstance(bundle, CompletedTurnContext)
+            or bundle.agent_id != source[0].agent_id
+            or bundle.conversation_id != source[0].conversation_id
+            for bundle in source
+        ) if source else True:
+            raise OllamaBrokerError(
+                "summary_source_invalid", "Summary source is invalid."
+            )
+        aggregate = aggregate_source or source
+        if (
+            not aggregate
+            or (parent is None and aggregate != source)
+            or (
+                parent is not None
+                and (
+                    tuple(item.turn_id for item in aggregate[: len(parent.source_turn_ids)])
+                    != parent.source_turn_ids
+                    or aggregate[len(parent.source_turn_ids) :] != source
+                )
+            )
+        ):
+            raise OllamaBrokerError(
+                "summary_source_invalid", "Summary aggregate source is invalid."
+            )
+        try:
+            messages = list(summary_v2_request_messages(source, parent=parent))
+        except SemanticSummaryError as exc:
+            raise OllamaBrokerError(
+                "summary_source_limit", "Summary source is too large."
+            ) from exc
+        request = {
+            "model": profile.model,
+            "messages": messages,
+            "tools": [],
+            "stream": True,
+            "think": False,
+            "keep_alive": self.catalog.select(
+                qualification.catalog_model_id
+            ).keep_alive,
+            "options": {
+                "temperature": 0,
+                "seed": 0,
+                "num_ctx": profile.operational_context_tokens,
+                "num_predict": min(1_024, profile.max_output_tokens),
+            },
+        }
+        encoded_request = json.dumps(
+            request, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        if len(encoded_request) > profile.request_byte_budget:
+            raise OllamaBrokerError(
+                "summary_source_limit", "Summary request exceeds its byte limit."
+            )
+        request_digest = hashlib.sha256(
+            REQUEST_DIGEST_DOMAIN + encoded_request
+        ).hexdigest()
+        transport_plan = ContextCompiler().compile(
+            ".",
+            model_profile=profile,
+            tools=(),
+            agent_id=source[0].agent_id,
+            capsule_generation=1,
+        )
+        transport = self.new_run(transport_plan, max_tool_calls=1)
+        acquired = False
+        provider_started = False
+        try:
+            async with asyncio.timeout(SUMMARY_V2_TIMEOUT_SECONDS):
+                queue_deadline = loop.time() + SUMMARY_V2_TIMEOUT_SECONDS
+                while not acquired:
+                    if is_cancelled():
+                        raise asyncio.CancelledError
+                    self._raise_if_model_temporarily_unhealthy(qualification)
+                    remaining = queue_deadline - loop.time()
+                    if remaining <= 0:
+                        raise TimeoutError
+                    try:
+                        await asyncio.wait_for(
+                            self._model_slots.acquire(),
+                            timeout=min(CANCEL_POLL_SECONDS, remaining),
+                        )
+                        acquired = True
+                    except TimeoutError:
+                        continue
+                if is_cancelled():
+                    raise asyncio.CancelledError
+                self._raise_if_model_temporarily_unhealthy(qualification)
+                parts: list[str] = []
+                final: dict[str, Any] | None = None
+                provider_started = True
+                async for frame in transport._stream_response_attempt(
+                    self._require_client(), encoded_request, is_cancelled
+                ):
+                    message = frame.get("message")
+                    if (
+                        not isinstance(message, dict)
+                        or message.get("role") != "assistant"
+                        or message.get("tool_calls") not in (None, [])
+                        or not isinstance(message.get("content", ""), str)
+                    ):
+                        raise SemanticSummaryError(
+                            "summary v2 returned an invalid or Tool frame"
+                        )
+                    parts.append(message.get("content", ""))
+                    if frame.get("done"):
+                        final = frame
+                if final is None or final.get("done_reason") != "stop":
+                    raise SemanticSummaryError("summary v2 did not complete")
+                content_text = "".join(parts)
+                if len(content_text.encode("utf-8")) > MAX_SUMMARY_V2_OUTPUT_BYTES:
+                    raise SemanticSummaryError("summary v2 output exceeds its limit")
+                content = SemanticSummaryContent.from_object(json.loads(content_text))
+                input_tokens = final.get("prompt_eval_count")
+                output_tokens = final.get("eval_count")
+                if (
+                    not isinstance(input_tokens, int)
+                    or isinstance(input_tokens, bool)
+                    or input_tokens < 1
+                    or not isinstance(output_tokens, int)
+                    or isinstance(output_tokens, bool)
+                    or output_tokens < 0
+                ):
+                    raise SemanticSummaryError("summary v2 usage is invalid")
+                snapshot = SemanticSummaryV2Snapshot.create(
+                    source_bundles=aggregate,
+                    parent_snapshot_digest=(
+                        parent.snapshot_digest if parent is not None else None
+                    ),
+                    model_profile_digest=profile.profile_digest,
+                    renderer_version=CONTEXT_RENDERER_VERSION,
+                    section_registry_version=PROMPT_SECTION_REGISTRY_VERSION,
+                    content=content,
+                    provider_request_digest=request_digest,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                )
+                self._summary_failures = 0
+                self._summary_circuit_until = 0.0
+                return snapshot
+        except OllamaCancelledError as exc:
+            # Summary preparation cancellation is a control-flow cancellation,
+            # not a reusable negative summary result.  Translating it prevents
+            # callers from classifying it as an Ollama/summary failure.
+            raise asyncio.CancelledError from exc
+        except TimeoutError as exc:
+            self._summary_failures += 1
+            if self._summary_failures >= SUMMARY_CIRCUIT_FAILURES:
+                self._summary_circuit_until = loop.time() + SUMMARY_CIRCUIT_SECONDS
+            raise OllamaBrokerError(
+                "summary_timeout", "Semantic summary v2 timed out.", retryable=True
+            ) from exc
+        except (OllamaBrokerError, SemanticSummaryError, json.JSONDecodeError) as exc:
+            if isinstance(exc, OllamaBrokerError) and not provider_started:
+                raise
+            self._summary_failures += 1
+            if self._summary_failures >= SUMMARY_CIRCUIT_FAILURES:
+                self._summary_circuit_until = loop.time() + SUMMARY_CIRCUIT_SECONDS
+            if isinstance(exc, OllamaBrokerError):
+                raise
+            raise OllamaBrokerError(
+                "summary_invalid", "Semantic summary v2 failed validation."
+            ) from exc
+        finally:
+            if acquired:
+                self._model_slots.release()
+
     async def close(self) -> None:
         self._closed = True
         self._qualification = None
@@ -922,12 +1288,86 @@ class OllamaRunSession:
         # callers cannot mutate the Run's actual provider transcript.
         return tuple(json.loads(json.dumps(item)) for item in self._messages)
 
+    @staticmethod
+    def _maximum_tool_arguments(spec: ToolSpec) -> dict[str, str | int | bool]:
+        arguments: dict[str, str | int | bool] = {}
+        for field in spec.input_fields:
+            if field.value_kind == "string":
+                assert field.maximum_utf8_bytes is not None
+                arguments[field.name] = "x" * field.maximum_utf8_bytes
+            elif field.value_kind == "integer":
+                assert field.maximum_integer is not None
+                arguments[field.name] = field.maximum_integer
+            else:
+                arguments[field.name] = False
+        return arguments
+
+    def _tool_has_minimum_headroom(
+        self,
+        messages: list[dict[str, Any]],
+        spec: ToolSpec,
+        completed_tool_calls: int,
+    ) -> bool:
+        call_id = "call_headroom_probe"
+        projected = project_tool_result(spec, call_id, "x" * spec.max_result_bytes)
+        receipt = compact_tool_result_projection(spec, projected)
+        future = [json.loads(json.dumps(item)) for item in messages]
+        future.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "function": {
+                            "index": 0,
+                            "name": spec.provider_name,
+                            "arguments": self._maximum_tool_arguments(spec),
+                        },
+                    }
+                ],
+            }
+        )
+        future.append(
+            {
+                "role": "tool",
+                "tool_name": spec.provider_name,
+                "content": receipt.content,
+            }
+        )
+        next_count = completed_tool_calls + 1
+        next_tools = self._context_plan.tools if next_count < self._max_tool_calls else ()
+        if not next_tools:
+            future.append(
+                {"role": "system", "content": TOOL_FINALIZATION_INSTRUCTION}
+            )
+        try:
+            estimate = estimate_provider_input_tokens(future, next_tools)
+        except ContextPlanError:
+            return False
+        return estimate <= self._context_plan.policy.hard_input_tokens
+
+    @staticmethod
+    def _as_ollama_result(projection: ToolResultProjection, outcome: str) -> OllamaToolResult:
+        return OllamaToolResult(
+            call_id=projection.call_id,
+            tool_id=projection.tool_id,
+            content=projection.content,
+            outcome=outcome,
+            original_bytes=projection.original_bytes,
+            content_digest=projection.content_digest,
+            truncated=projection.truncated,
+            truncation_reason=projection.truncation_reason,
+            projection_digest=projection.projection_digest,
+        )
+
     async def stream_turn(
         self,
         user_message: str,
         tool_results: Sequence[OllamaToolResult] = (),
         is_cancelled: CancelCheck = lambda: False,
         on_request: RequestObserver | None = None,
+        on_transport_attempt: TransportAttemptObserver | None = None,
     ) -> AsyncIterator[OllamaFrame]:
         if self._in_flight:
             raise OllamaBrokerError(
@@ -941,6 +1381,8 @@ class OllamaRunSession:
             raise TypeError("is_cancelled must be callable")
         if on_request is not None and not callable(on_request):
             raise TypeError("on_request must be callable")
+        if on_transport_attempt is not None and not callable(on_transport_attempt):
+            raise TypeError("on_transport_attempt must be callable")
         message = _bounded_text(user_message, self._max_user_bytes, allow_empty=False)
         if message != self._context_plan.user_message():
             raise OllamaBrokerError(
@@ -1006,12 +1448,15 @@ class OllamaRunSession:
         profile = self._context_plan.model_profile
         # The immutable Tool set stays available until this Run's frozen call
         # budget is consumed; then the provider capability is narrowed to zero.
-        available_tools = (
-            self._context_plan.tools
+        available_tools = tuple(
+            spec
+            for spec in self._context_plan.tools
             if len(validated_results) < self._max_tool_calls
-            else ()
+            and self._tool_has_minimum_headroom(
+                candidate_messages, spec, len(validated_results)
+            )
         )
-        if not available_tools and len(validated_results) >= self._max_tool_calls:
+        if not available_tools and validated_results:
             # A schema-free request alone is not a reliable phase transition for
             # small models: the preceding assistant/tool transcript can prime a
             # stale Tool call even though `tools` is empty.  Put the trusted
@@ -1029,10 +1474,42 @@ class OllamaRunSession:
             raise OllamaBrokerError(
                 "model_context_limit", "The model context could not be bounded."
             ) from exc
+        if (
+            runtime_input_tokens > self._context_plan.policy.hard_input_tokens
+            and new_results
+            and not new_results[0].truncated
+        ):
+            result = new_results[0]
+            spec = self._tools_by_id[result.tool_id]
+            compacted = compact_tool_result_projection(
+                spec,
+                ToolResultProjection(
+                    call_id=result.call_id,
+                    tool_id=result.tool_id,
+                    content=result.content,
+                    original_bytes=result.original_bytes,  # type: ignore[arg-type]
+                    content_digest=result.content_digest,  # type: ignore[arg-type]
+                    truncated=result.truncated,  # type: ignore[arg-type]
+                    truncation_reason=result.truncation_reason,  # type: ignore[arg-type]
+                    projection_digest=result.projection_digest,  # type: ignore[arg-type]
+                ),
+            )
+            adapted = self._as_ollama_result(compacted, result.outcome)
+            validated_results = (*validated_results[:-1], adapted)
+            new_results = (adapted,)
+            candidate_messages[-1]["content"] = adapted.content
+            runtime_input_tokens = estimate_provider_input_tokens(
+                candidate_messages, available_tools
+            )
         if runtime_input_tokens > self._context_plan.policy.hard_input_tokens:
             raise OllamaBrokerError(
                 "model_context_limit", "The model context exceeded its token budget."
             )
+        generation_options = generation_options_for(
+            has_tools=bool(available_tools),
+            deterministic_temperature=self._catalog_entry.temperature,
+            seed=self._catalog_entry.seed,
+        )
         request = {
             "model": profile.model,
             "messages": candidate_messages,
@@ -1041,8 +1518,7 @@ class OllamaRunSession:
             "think": False,
             "keep_alive": self._catalog_entry.keep_alive,
             "options": {
-                "temperature": self._catalog_entry.temperature,
-                "seed": self._catalog_entry.seed,
+                **generation_options,
                 "num_ctx": profile.operational_context_tokens,
                 "num_predict": profile.max_output_tokens,
             },
@@ -1054,6 +1530,9 @@ class OllamaRunSession:
             raise OllamaBrokerError(
                 "model_context_limit", "The model request exceeded its byte budget."
             )
+        request_digest = hashlib.sha256(
+            REQUEST_DIGEST_DOMAIN + encoded_request
+        ).hexdigest()
 
         self._in_flight = True
         result: AsyncIterator[dict[str, Any]] | None = None
@@ -1069,20 +1548,26 @@ class OllamaRunSession:
                         iteration=self._turns + 1,
                         message_count=len(candidate_messages),
                         tool_count=len(available_tools),
+                        tool_ids=tuple(spec.tool_id for spec in available_tools),
+                        toolset_digest=toolset_digest(available_tools),
                         estimated_input_tokens=runtime_input_tokens,
                         request_bytes=len(encoded_request),
-                        request_digest=hashlib.sha256(
-                            REQUEST_DIGEST_DOMAIN + encoded_request
-                        ).hexdigest(),
+                        request_digest=request_digest,
                     )
                 )
             self._turns += 1
-            result = self._stream_response(encoded_request, is_cancelled)
+            result = self._stream_response(
+                encoded_request,
+                is_cancelled,
+                on_transport_attempt=on_transport_attempt,
+            )
             content_parts: list[str] = []
             coalesced: list[str] = []
             coalesced_bytes = 0
             content_frames = 0
             output_bytes = 0
+            output_truncated = False
+            visible_content_seen = False
             provider_call: dict[str, Any] | None = None
             final_frame: dict[str, Any] | None = None
             last_flush = asyncio.get_running_loop().time()
@@ -1126,7 +1611,7 @@ class OllamaRunSession:
                         raise OllamaBrokerError(
                             "model_protocol_error", "Only one Tool call is allowed per turn."
                         )
-                    provider_call = self._normalize_tool_call(call)
+                    provider_call = self._normalize_tool_call(call, available_tools)
 
                 if content:
                     try:
@@ -1136,34 +1621,48 @@ class OllamaRunSession:
                             "model_protocol_error",
                             "Ollama returned invalid Unicode content.",
                         ) from exc
-                    output_bytes += len(encoded_content)
-                    if output_bytes > MAX_OUTPUT_BYTES:
-                        raise OllamaBrokerError(
-                            "model_output_limit", "Model output exceeded its byte budget."
+                    if not output_truncated:
+                        remaining = MAX_UNTRUNCATED_OUTPUT_BYTES - output_bytes
+                        accepted = content
+                        if len(encoded_content) > remaining:
+                            accepted = encoded_content[: max(0, remaining)].decode(
+                                "utf-8", errors="ignore"
+                            )
+                            output_truncated = True
+                        if accepted:
+                            accepted_bytes = len(accepted.encode("utf-8"))
+                            output_bytes += accepted_bytes
+                            visible_content_seen = (
+                                visible_content_seen or bool(accepted.strip())
+                            )
+                            content_parts.append(accepted)
+                            coalesced.append(accepted)
+                            coalesced_bytes += accepted_bytes
+                        if output_truncated:
+                            output_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                            content_parts.append(OUTPUT_TRUNCATION_MARKER)
+                            coalesced.append(OUTPUT_TRUNCATION_MARKER)
+                            coalesced_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                        now = asyncio.get_running_loop().time()
+                        should_flush = (
+                            coalesced_bytes >= CONTENT_COALESCE_BYTES
+                            or now - last_flush >= CONTENT_COALESCE_SECONDS
                         )
-                    content_parts.append(content)
-                    coalesced.append(content)
-                    coalesced_bytes += len(encoded_content)
-                    now = asyncio.get_running_loop().time()
-                    should_flush = (
-                        coalesced_bytes >= CONTENT_COALESCE_BYTES
-                        or now - last_flush >= CONTENT_COALESCE_SECONDS
-                    )
-                    if should_flush:
-                        candidate_chunks = _split_content_for_ipc(
-                            "".join(coalesced)
-                        )
-                        if (
-                            content_frames + len(candidate_chunks)
-                            <= MAX_NORMALIZED_CONTENT_FRAMES
-                            - MAX_TAIL_CONTENT_FRAMES
-                        ):
-                            for chunk in candidate_chunks:
-                                yield OllamaFrame("content", {"text": chunk})
-                                content_frames += 1
-                            coalesced.clear()
-                            coalesced_bytes = 0
-                            last_flush = now
+                        if should_flush:
+                            candidate_chunks = _split_content_for_ipc(
+                                "".join(coalesced)
+                            )
+                            if (
+                                content_frames + len(candidate_chunks)
+                                <= MAX_NORMALIZED_CONTENT_FRAMES
+                                - MAX_TAIL_CONTENT_FRAMES
+                            ):
+                                for chunk in candidate_chunks:
+                                    yield OllamaFrame("content", {"text": chunk})
+                                    content_frames += 1
+                                coalesced.clear()
+                                coalesced_bytes = 0
+                                last_flush = now
 
                 if raw_frame["done"]:
                     if final_frame is not None:
@@ -1178,12 +1677,31 @@ class OllamaRunSession:
                 )
             done_reason = final_frame.get("done_reason")
             if done_reason == "length":
-                raise OllamaBrokerError(
-                    "model_output_limit", "Ollama exhausted the output token budget."
-                )
-            if done_reason != "stop":
+                if provider_call is not None or not visible_content_seen:
+                    raise OllamaBrokerError(
+                        "model_output_limit",
+                        "Ollama exhausted the output token budget without a usable answer.",
+                    )
+                if not output_truncated:
+                    output_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                    content_parts.append(OUTPUT_TRUNCATION_MARKER)
+                    coalesced.append(OUTPUT_TRUNCATION_MARKER)
+                    coalesced_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                    output_truncated = True
+            elif done_reason != "stop":
                 raise OllamaBrokerError(
                     "model_protocol_error", "Ollama returned an invalid stop reason."
+                )
+            if output_truncated and (
+                provider_call is not None or not visible_content_seen
+            ):
+                raise OllamaBrokerError(
+                    "model_output_limit",
+                    "The output limit was reached without a usable ordinary answer.",
+                )
+            if output_bytes > MAX_OUTPUT_BYTES:
+                raise OllamaBrokerError(
+                    "model_protocol_error", "Normalized output exceeded its commit limit."
                 )
             if is_cancelled():
                 raise OllamaCancelledError()
@@ -1209,9 +1727,20 @@ class OllamaRunSession:
                     )
                 usage[field] = value
 
+            if self._turns == 1 and available_tools == self._context_plan.tools:
+                self._broker.observe_context_usage(
+                    self._context_plan,
+                    admission_upper_bound_tokens=runtime_input_tokens,
+                    actual_input_tokens=usage["prompt_eval_count"],
+                )
+
             assistant: dict[str, Any] = {
                 "role": "assistant",
-                "content": "".join(content_parts),
+                # Text emitted before a Tool call is visible output but is not
+                # carried into the model loop. Only the structured call is
+                # needed for result correlation, which prevents unbounded
+                # assistant-before-Tool growth from consuming result headroom.
+                "content": "" if provider_call is not None else "".join(content_parts),
             }
             if provider_call is not None:
                 assistant["tool_calls"] = [provider_call]
@@ -1237,7 +1766,15 @@ class OllamaRunSession:
                 )
             else:
                 self._stopped = True
-                yield OllamaFrame("stop", {"reason": "end_turn", "usage": usage})
+                yield OllamaFrame(
+                    "stop",
+                    {
+                        "reason": (
+                            "max_output" if output_truncated else "end_turn"
+                        ),
+                        "usage": usage,
+                    },
+                )
         except OllamaBrokerError as exc:
             if (
                 exc.code in {"model_context_overflow", "model_media_overflow"}
@@ -1252,8 +1789,26 @@ class OllamaRunSession:
                 await result.aclose()
             self._in_flight = False
 
+    @staticmethod
+    async def _observe_transport_attempt(
+        observer: TransportAttemptObserver | None,
+        observation: OllamaTransportAttempt,
+    ) -> None:
+        if observer is None:
+            return
+        try:
+            await observer(observation)
+        except Exception:
+            # Diagnostics are deliberately best-effort.  A journal/UI observer
+            # must never change retry, streaming, or terminal model semantics.
+            return
+
     async def _stream_response(
-        self, encoded_request: bytes, is_cancelled: CancelCheck
+        self,
+        encoded_request: bytes,
+        is_cancelled: CancelCheck,
+        *,
+        on_transport_attempt: TransportAttemptObserver | None,
     ) -> AsyncIterator[dict[str, Any]]:
         if is_cancelled():
             raise OllamaCancelledError()
@@ -1264,6 +1819,12 @@ class OllamaRunSession:
         while True:
             if is_cancelled():
                 raise OllamaCancelledError()
+            # Health may change while another request owns every slot. Poll it
+            # with the cancellation cadence so queued work fails fast without
+            # waiting for capacity or opening provider HTTP.
+            self._broker._raise_if_model_temporarily_unhealthy(
+                self._qualification
+            )
             remaining = queue_deadline - loop.time()
             if remaining <= 0:
                 raise OllamaBrokerError(
@@ -1280,22 +1841,97 @@ class OllamaRunSession:
         try:
             if is_cancelled():
                 raise OllamaCancelledError()
+            # Close the check→acquire race: a prior request can open the
+            # profile circuit immediately before releasing this slot.
+            self._broker._raise_if_model_temporarily_unhealthy(
+                self._qualification
+            )
             for attempt in range(timeouts.first_frame_attempts):
                 frame_seen = False
+                attempt_number = attempt + 1
+                await self._observe_transport_attempt(
+                    on_transport_attempt,
+                    OllamaTransportAttempt(
+                        attempt=attempt_number,
+                        max_attempts=timeouts.first_frame_attempts,
+                        phase="attempt_started",
+                        outcome=None,
+                        elapsed_ms=0,
+                        first_frame_ms=None,
+                    ),
+                )
+                attempt_started = loop.time()
                 try:
                     async for frame in self._stream_response_attempt(
                         client, encoded_request, is_cancelled
                     ):
-                        frame_seen = True
+                        if not frame_seen:
+                            frame_seen = True
+                            first_frame_ms = _bounded_elapsed_ms(
+                                attempt_started, loop.time()
+                            )
+                            self._broker._record_first_frame_success(
+                                self._qualification
+                            )
+                            await self._observe_transport_attempt(
+                                on_transport_attempt,
+                                OllamaTransportAttempt(
+                                    attempt=attempt_number,
+                                    max_attempts=timeouts.first_frame_attempts,
+                                    phase="attempt_finished",
+                                    outcome="first_frame_received",
+                                    elapsed_ms=first_frame_ms,
+                                    first_frame_ms=first_frame_ms,
+                                ),
+                            )
                         yield frame
                     return
                 except OllamaBrokerError as exc:
+                    if not frame_seen:
+                        if (
+                            exc.retryable
+                            and exc.code in _ZERO_FRAME_HEALTH_ERROR_CODES
+                        ):
+                            self._broker._record_zero_frame_failure(
+                                self._qualification
+                            )
+                        await self._observe_transport_attempt(
+                            on_transport_attempt,
+                            OllamaTransportAttempt(
+                                attempt=attempt_number,
+                                max_attempts=timeouts.first_frame_attempts,
+                                phase="attempt_finished",
+                                outcome=_ATTEMPT_OUTCOME_BY_ERROR.get(
+                                    exc.code, "failed_before_first_frame"
+                                ),
+                                elapsed_ms=_bounded_elapsed_ms(
+                                    attempt_started, loop.time()
+                                ),
+                                first_frame_ms=None,
+                            ),
+                        )
                     if (
                         exc.code == "model_first_frame_timeout"
                         and not frame_seen
                         and attempt + 1 < timeouts.first_frame_attempts
                     ):
                         continue
+                    raise
+                except asyncio.CancelledError:
+                    if not frame_seen:
+                        await self._observe_transport_attempt(
+                            on_transport_attempt,
+                            OllamaTransportAttempt(
+                                attempt=attempt_number,
+                                max_attempts=timeouts.first_frame_attempts,
+                                phase="attempt_finished",
+                                outcome="cancelled",
+                                elapsed_ms=_bounded_elapsed_ms(
+                                    attempt_started, loop.time()
+                                ),
+                                first_frame_ms=None,
+                            ),
+                        )
                     raise
         finally:
             self._broker._model_slots.release()
@@ -1520,7 +2156,9 @@ class OllamaRunSession:
             )
         return value
 
-    def _normalize_tool_call(self, value: object) -> dict[str, Any]:
+    def _normalize_tool_call(
+        self, value: object, available_tools: tuple[ToolSpec, ...]
+    ) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise OllamaBrokerError(
                 "model_protocol_error", "Ollama returned an invalid Tool call."
@@ -1532,7 +2170,11 @@ class OllamaRunSession:
             if isinstance(provider_name, str)
             else None
         )
-        if not isinstance(function, dict) or spec is None:
+        if (
+            not isinstance(function, dict)
+            or spec is None
+            or spec not in available_tools
+        ):
             raise OllamaBrokerError(
                 "model_protocol_error", "Ollama selected an unknown Tool."
             )
@@ -1638,5 +2280,7 @@ __all__ = [
     "OllamaRequestMetadata",
     "OllamaRunSession",
     "OllamaToolResult",
+    "MAX_UNTRUNCATED_OUTPUT_BYTES",
+    "OUTPUT_TRUNCATION_MARKER",
     "REQUEST_DIGEST_DOMAIN",
 ]

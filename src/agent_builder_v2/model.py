@@ -354,11 +354,11 @@ class BrokeredStreamingModel:
                     "request_id",
                     "type",
                     "reason",
-                } or frame.get("reason") != "end_turn":
+                } or frame.get("reason") not in {"end_turn", "max_output"}:
                     raise RuntimeError("model broker stop frame is invalid")
                 if block_open:
                     yield ModelBlock("text.finish", {"block_id": block_id})
-                yield ModelBlock("stop", {"reason": "end_turn"})
+                yield ModelBlock("stop", {"reason": frame["reason"]})
                 return
             if frame_type == "error":
                 if set(frame) != {

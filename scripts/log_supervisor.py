@@ -86,6 +86,7 @@ def _sanitised_environment(source: dict[str, str]) -> dict[str, str]:
         "HARNESS_V2_HOST",
         "HARNESS_V2_PORT",
         "HARNESS_V2_CONTEXT_REVEAL",
+        "HARNESS_V2_SEMANTIC_SUMMARY_V2",
     }
     return {key: value for key, value in source.items() if key in allowed}
 

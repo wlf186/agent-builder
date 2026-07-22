@@ -11,6 +11,7 @@ import re
 import signal
 import stat
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -18,6 +19,19 @@ from typing import Any, AsyncIterator
 from .capsule import AgentCapsule, CapsuleManager, PROTOTYPE_AGENT_ID, SAFE_ID
 from .context import ConversationMessage, ContextCompiler, ContextPlan, ContextPlanError
 from .context_projection import ContextProjectionBoundary
+from .context_counts import (
+    CountScope,
+    SoftContextCalibration,
+    SoftContextCalibrationRegistry,
+)
+from .completed_context import CompletedContextItem, CompletedTurnContext
+from .semantic_summary_v2 import (
+    SUMMARY_V2_POLICY_DIGEST,
+    SUMMARY_V2_PROMPT_DIGEST,
+    SemanticSummaryV2Snapshot,
+    completed_bundle_digest,
+    summary_v2_source_digest,
+)
 from .contracts import (
     LoopLimits,
     RUN_CURSOR_RESERVED_THROUGH,
@@ -37,6 +51,7 @@ from .ollama import (
     OllamaRequestMetadata,
     OllamaRunSession,
     OllamaToolResult,
+    OllamaTransportAttempt,
 )
 from .file_read import FileReadExecutor
 from .file_search import FileSearchExecutor
@@ -59,11 +74,16 @@ from .sessions import (
     CapabilityAuditEvent,
     Conversation,
     ConversationDeleteResult,
+    ConversationPage,
     ConversationNotFoundError,
     ConversationConflictError,
     ConversationStore,
+    ConversationStoreUnavailableError,
     ConversationSummary,
+    MAX_USER_CONTENT_BYTES,
+    MAX_TURNS_PER_CONVERSATION,
     PermissionRecord,
+    SummaryProjectionRecord,
 )
 from .state import (
     EventJournal,
@@ -117,6 +137,130 @@ MAX_WORKER_EVENT_BYTES = 65_536
 MAX_ACTIVE_RUNS = 4
 MAX_RETAINED_RUNS = 64
 MAX_LIVE_EVENT_BYTES = 1024 * 1024
+SUMMARY_TRANSIENT_NEGATIVE_TTL_SECONDS = 60
+DURABLE_CALIBRATION_SAMPLE_LIMIT = 16
+PREPARATION_STAGES = (
+    "reading_history",
+    "building_context",
+    "evaluating_compaction",
+    "summarizing_history",
+    "verifying_continuation",
+    "admitting_run",
+)
+
+# The release model is intentionally small.  Sending the complete execution
+# ToolSet on every conversational turn makes it both slower and more likely to
+# invent a Tool call.  This fixed, inspectable router activates execution
+# capabilities only when the current authenticated user message contains a
+# concrete workspace/action signal.  It is not an LLM classifier and grants no
+# authority: every selected Tool remains frozen in the TurnRuntimeSnapshot and
+# passes the normal capability broker.
+_TURN_TOOL_DIRECT_INTENT = re.compile(
+    r"(?ix)(?:"
+    r"https?://|(?:^|\s)(?:\.{0,2}/)[^\s]+|"
+    r"\b[A-Za-z0-9_-]+\.(?:py|js|ts|tsx|jsx|json|ya?ml|toml|md|txt|"
+    r"pdf|docx?|xlsx?|csv|html?|css|sh|sql)\b|"
+    r"\b(?:browse\s+(?:the\s+)?(?:web|internet)|web\s+search|"
+    r"search\s+(?:the\s+)?(?:web|internet)|deep\s+research|"
+    r"delegate\s+(?:this|the\s+task)|subagent)\b|"
+    r"浏览(?:网页|互联网)|联网搜索|深度研究|委派(?:任务|给)|子智能体"
+    r")"
+)
+_TURN_TOOL_ACTION = re.compile(
+    r"(?ix)(?:"
+    r"\b(?:read|open|list|find|search|inspect|check|edit|modify|rename|"
+    r"delete|update|fix|implement|run|execute|install|compile|build|deploy|test)\b|"
+    r"读取|打开|列出|查找|搜索|检查|查看|编辑|修改|重命名|删除|更新|修复|"
+    r"实现|运行|执行|安装|编译|构建|部署|测试"
+    r")"
+)
+_TURN_TOOL_OBJECT = re.compile(
+    r"(?ix)(?:"
+    r"\b(?:files?|folders?|director(?:y|ies)|workspace|repository|repo|"
+    r"codebase|source\s+code|frontend|backend|database|terminal|shell|"
+    r"commands?|scripts?|packages?|dependenc(?:y|ies)|pdf|docx?|documents?|"
+    r"spreadsheets?|websites?|webpages?|skills?|extensions?|mcp|tests?|bugs?)\b|"
+    r"文件|目录|文件夹|工作区|仓库|代码库|源代码|前端|后端|数据库|终端|命令|"
+    r"脚本|依赖|安装包|文档|网页|网站|技能|扩展|测试|缺陷"
+    r")"
+)
+_TURN_TOOL_REQUEST = re.compile(
+    r"(?ix)(?:"
+    r"(?:^|\b(?:please|can\s+you|could\s+you|would\s+you|"
+    r"i\s+(?:need|want)\s+you\s+to)\s+)(?:(?:use|call)\s+"
+    r"(?:the\s+)?(?:available\s+)?tools?|fix|implement|run|execute|"
+    r"install|compile|build|deploy|test|research)\b|"
+    r"^\s*(?:请|帮我|请帮我)?(?:使用工具|调用工具|修复|实现|运行|执行|安装|"
+    r"编译|构建|部署|测试|研究)"
+    r")"
+)
+_TURN_NO_TOOLS = re.compile(
+    r"(?i)(?:\b(?:(?:do\s+not|don't)\s+use|without\s+using)\s+"
+    r"(?:any\s+)?tools?\b|"
+    r"\bno[- ]tools?\b|不要使用工具|不使用工具|无需工具)"
+)
+_DELEGATION_INTENT = re.compile(
+    r"(?i)(?:\b(?:delegate|subagent|ask\s+(?:the\s+)?agent)\b|委派|子智能体|"
+    r"让.{0,16}(?:智能体|agent))"
+)
+_AGENT_ID_IN_TEXT = re.compile(r"(?<![a-f0-9-])([a-f0-9-]{32,36})(?![a-f0-9-])")
+
+
+def _turn_needs_tools(message: str) -> bool:
+    """Return the deterministic conversational/execution routing decision."""
+
+    if _TURN_NO_TOOLS.search(message) is not None:
+        return False
+    return bool(
+        _TURN_TOOL_DIRECT_INTENT.search(message)
+        or _TURN_TOOL_REQUEST.search(message)
+        or (
+            _TURN_TOOL_ACTION.search(message)
+            and _TURN_TOOL_OBJECT.search(message)
+        )
+    )
+
+
+def _summary_negative_is_reusable(
+    record: SummaryProjectionRecord,
+    *, now: datetime | None = None,
+) -> bool:
+    """Keep deterministic source limits, but expire transient negative results."""
+
+    if record.status == "source_limit":
+        return True
+    if record.status not in {"timeout", "invalid", "circuit_open"}:
+        return False
+    try:
+        updated = datetime.fromisoformat(record.updated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if updated.tzinfo is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    age = (current - updated.astimezone(timezone.utc)).total_seconds()
+    return 0 <= age < SUMMARY_TRANSIENT_NEGATIVE_TTL_SECONDS
+
+
+def _soft_calibration_from_samples(
+    scope: CountScope,
+    samples: tuple[tuple[int, int], ...],
+) -> SoftContextCalibration | None:
+    """Rebuild the exact bounded calibrator from durable ordered samples."""
+
+    registry = SoftContextCalibrationRegistry(
+        maximum_scopes=1,
+        samples_per_scope=DURABLE_CALIBRATION_SAMPLE_LIMIT,
+    )
+    for admission_upper_bound_tokens, actual_input_tokens in samples:
+        registry.observe(
+            scope,
+            admission_upper_bound_tokens=admission_upper_bound_tokens,
+            actual_input_tokens=actual_input_tokens,
+        )
+    return registry.calibration_for(scope)
+
+
 MAX_DURABLE_BYTES_PER_RUN = 256 * 1024
 TERMINAL_EVENT_RESERVE = 8 * 1024
 RECOVERY_EVENT_RESERVE = 32 * 1024
@@ -418,7 +562,12 @@ class RunRecord:
     user_message: str | None = field(default=None, repr=False)
     conversation_managed: bool = False
     conversation_revision: int | None = None
+    preparation_operation_id: str | None = None
+    turn_position: int | None = None
+    summary_status: str = "disabled"
     context_plan: ContextPlan | None = None
+    active_context_plan: ContextPlan | None = None
+    active_runtime_snapshot: TurnRuntimeSnapshot | None = None
     recovery_context_plan: ContextPlan | None = None
     recovery_history: tuple[ConversationMessage, ...] = field(default=(), repr=False)
     recovery_prompt_sources: PromptSourceSnapshot | None = field(default=None, repr=False)
@@ -444,6 +593,9 @@ class RunRecord:
         str, tuple[str, dict[str, str]]
     ] = field(default_factory=dict)
     broker_tool_results: list[OllamaToolResult] = field(default_factory=list)
+    completed_tool_calls: list[
+        tuple[str, str, str, dict[str, str | int | bool]]
+    ] = field(default_factory=list, repr=False)
     brokered_capability_calls: set[str] = field(default_factory=set)
     brokered_capability_results: dict[str, tuple[str, str]] = field(
         default_factory=dict, repr=False
@@ -491,6 +643,30 @@ class RunRecord:
                 and (not available or available[-1].kind in TERMINAL_KINDS)
             )
             return available, done
+
+
+@dataclass
+class PreparationStatus:
+    """Bounded, prompt-free progress for one pre-Run admission operation."""
+
+    operation_id: str
+    conversation_id: str
+    stage: str
+    started_at: float
+    cancel_requested: asyncio.Event
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.operation_id, str)
+            or SAFE_ID.fullmatch(self.operation_id) is None
+            or not isinstance(self.conversation_id, str)
+            or SAFE_ID.fullmatch(self.conversation_id) is None
+            or self.stage not in PREPARATION_STAGES
+            or not isinstance(self.started_at, float)
+            or self.started_at < 0
+            or not isinstance(self.cancel_requested, asyncio.Event)
+        ):
+            raise ValueError("invalid Run preparation status")
 
 
 class RunService:
@@ -587,6 +763,7 @@ class RunService:
         self.model_qualification: OllamaQualification | None = None
         self.sandbox_qualification: HostQualification | None = None
         self.runs: dict[str, RunRecord] = {}
+        self._preparations: dict[str, PreparationStatus] = {}
         self._lock = asyncio.Lock()
         self._control_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
@@ -648,7 +825,7 @@ class RunService:
                 generation_provider=lambda: (
                     self.capsule.generation if self.capsule is not None else 0
                 ),
-                toolset_digest_provider=lambda: self.effective_toolset.toolset_digest,
+                toolset_digest_provider=self._trusted_toolset_digests,
                 policy=self.capability_policy,
             )
             self.file_read_executor = FileReadExecutor(self.capsule)
@@ -813,6 +990,67 @@ class RunService:
         )
         self.effective_tools = self.effective_toolset.specs
 
+    def _toolset_projection(
+        self, *, allow_tools: bool, allow_delegation: bool = False
+    ) -> EffectiveToolSet:
+        if not allow_tools:
+            policy = ToolPolicy(
+                revision="turn-conversation-only-v1",
+                allowed_tool_ids=(),
+            )
+        elif allow_delegation:
+            policy = self.tool_policy
+        else:
+            policy = ToolPolicy(
+                revision="turn-tools-no-delegation-v1",
+                allowed_tool_ids=tuple(
+                    item
+                    for item in self.tool_policy.allowed_tool_ids
+                    if item != "agent/delegate"
+                ),
+                denied_tool_ids=self.tool_policy.denied_tool_ids,
+                allowed_risks=self.tool_policy.allowed_risks,
+            )
+        return EffectiveToolSet.resolve(self.tool_catalog, policy)
+
+    def _trusted_toolset_digests(self) -> tuple[str, ...]:
+        """Enumerate the bounded projections that a current Run may freeze."""
+
+        return tuple(
+            sorted(
+                {
+                    self._toolset_projection(allow_tools=False).toolset_digest,
+                    self._toolset_projection(allow_tools=True).toolset_digest,
+                    self._toolset_projection(
+                        allow_tools=True, allow_delegation=True
+                    ).toolset_digest,
+                }
+            )
+        )
+
+    async def _turn_effective_toolset(
+        self, message: str, *, supports_tools: bool
+    ) -> EffectiveToolSet:
+        if not supports_tools or not _turn_needs_tools(message):
+            return self._toolset_projection(allow_tools=False)
+        allow_delegation = False
+        if self.subagent_coordinator is not None and _DELEGATION_INTENT.search(message):
+            mentioned = set(_AGENT_ID_IN_TEXT.findall(message))
+            if mentioned:
+                records = await asyncio.to_thread(
+                    self.subagent_coordinator.registry.list
+                )
+                allow_delegation = any(
+                    item.agent_id != self.agent_id
+                    and item.state == "active"
+                    and item.agent_id in mentioned
+                    for item in records
+                )
+        return self._toolset_projection(
+            allow_tools=True,
+            allow_delegation=allow_delegation,
+        )
+
     async def list_skills(self) -> tuple[SkillRecord, ...]:
         if self.skill_registry is None:
             raise RuntimeError("Skill registry is unavailable")
@@ -868,6 +1106,17 @@ class RunService:
             operation.add_done_callback(delete_if_created)
             raise
 
+    async def create_conversation_continuation(
+        self, source_conversation_id: str, *, title: str = "续接会话"
+    ) -> tuple[Conversation, int, int]:
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        return await asyncio.to_thread(
+            self._conversation_store().create_continuation,
+            source_conversation_id,
+            title=title,
+        )
+
     async def _create_conversation_owned(
         self,
         title: str,
@@ -896,6 +1145,295 @@ class RunService:
             self._conversation_store().get_conversation,
             conversation_id,
         )
+
+    async def get_conversation_page(
+        self,
+        conversation_id: str,
+        *,
+        limit: int,
+        before_position: int | None = None,
+        expected_revision: int | None = None,
+    ) -> ConversationPage:
+        return await asyncio.to_thread(
+            self._conversation_store().get_conversation_page,
+            conversation_id,
+            limit=limit,
+            before_position=before_position,
+            expected_revision=expected_revision,
+        )
+
+    async def rename_conversation(
+        self,
+        conversation_id: str,
+        title: str,
+        *,
+        expected_revision: int,
+    ) -> Conversation:
+        """Rename through the public RunService persistence boundary."""
+
+        if self._closing:
+            raise RuntimeError("RunService is closing")
+        return await asyncio.to_thread(
+            self._conversation_store().rename_conversation,
+            conversation_id,
+            title,
+            expected_revision=expected_revision,
+        )
+
+    async def _durable_soft_calibration(
+        self, plan: ContextPlan
+    ) -> SoftContextCalibration | None:
+        scope = plan.count_scope
+        samples = await asyncio.to_thread(
+            self._conversation_store().recent_provider_calibration_samples,
+            **scope.to_dict(),
+            limit=DURABLE_CALIBRATION_SAMPLE_LIMIT,
+        )
+        return _soft_calibration_from_samples(scope, samples)
+
+    async def next_turn_preview(
+        self, conversation_id: str, *, model_id: str | None = None
+    ) -> dict[str, object]:
+        """Project committed fixed context from durable state only."""
+
+        if self.capsule is None:
+            raise RuntimeError("RunService is not initialized")
+        store = self._conversation_store()
+        conversation = await asyncio.to_thread(
+            store.get_conversation, conversation_id
+        )
+        selector = getattr(self.model_broker, "qualification_for", None)
+        if callable(selector):
+            qualification = selector(model_id)
+        elif model_id is None and self.model_qualification is not None:
+            qualification = self.model_qualification
+        else:
+            raise RuntimeError("model qualification is unavailable")
+        profile = qualification.model_profile
+        # A next message is not available yet, so preview the conservative
+        # execution-capable default while withholding delegation (which can be
+        # activated only by an explicit current-message target).
+        effective_toolset = self._toolset_projection(
+            allow_tools=profile.supports_tools,
+            allow_delegation=False,
+        )
+        projection_mode = (
+            "conservative_tools" if effective_toolset.specs else "chat_only"
+        )
+        base: dict[str, object] = {
+            "version": "next-turn-projection-v1",
+            "agent_id": self.capsule.agent_id,
+            "conversation_id": conversation_id,
+            "conversation_revision": conversation.revision,
+            "model_id": profile.catalog_model_id or profile.model,
+            "model_profile_digest": profile.profile_digest,
+            "capsule_generation": self.capsule.generation,
+            "turn_count": len(conversation.turns),
+            "turn_limit": MAX_TURNS_PER_CONVERSATION,
+            "turns_remaining": max(
+                0, MAX_TURNS_PER_CONVERSATION - len(conversation.turns)
+            ),
+            "single_message_byte_limit": MAX_USER_CONTENT_BYTES,
+            "operational_context_tokens": profile.operational_context_tokens,
+            "output_reserve_tokens": profile.max_output_tokens,
+            "availability": "unavailable",
+            "stale_reason": None,
+            "fixed_context_tokens": None,
+            "fixed_context_error_margin_tokens": None,
+            "safe_user_tokens": None,
+            "compact_before_user_tokens": None,
+            "soft_trigger_tokens": None,
+            "hard_input_tokens": None,
+            "projection_strategy": None,
+            "count_basis": None,
+            "count_version": "soft-context-estimate-v1",
+            "last_run_usage": None,
+            "summary_status": "disabled",
+            "projection_mode": projection_mode,
+            "chat_calibration_available": False,
+            "chat_only_projection": None,
+        }
+        if conversation.active_run_id is not None:
+            return {**base, "stale_reason": "active_run"}
+        if len(conversation.turns) >= MAX_TURNS_PER_CONVERSATION:
+            return {**base, "stale_reason": "conversation_turn_capacity_exhausted"}
+        snapshot = await asyncio.to_thread(store.snapshot_for_turn, conversation_id)
+        prompt_sources = await asyncio.to_thread(collect_prompt_sources, self.capsule)
+
+        def compile_preview(
+            tools: tuple[ToolSpec, ...],
+            *,
+            soft_calibration: SoftContextCalibration | None = None,
+        ) -> ContextPlan:
+            return self.context_compiler.compile(
+                ".",
+                model_profile=profile,
+                tools=tools,
+                agent_id=self.capsule.agent_id,
+                capsule_generation=self.capsule.generation,
+                history=(
+                    () if snapshot.completed_turn_contexts else tuple(
+                        ConversationMessage(item.message_id, item.role, item.content)
+                        for item in snapshot.committed_history
+                    )
+                ),
+                completed_turns=snapshot.completed_turn_contexts,
+                continuation_context=snapshot.continuation_context,
+                prompt_sources=prompt_sources,
+                soft_calibration=soft_calibration,
+            )
+
+        try:
+            plan = compile_preview(effective_toolset.specs)
+        except ContextPlanError:
+            return {**base, "stale_reason": "projection_unavailable"}
+        summary = await asyncio.to_thread(
+            store.read_summary_projection, conversation_id
+        )
+        common = {
+            **base,
+            "toolset_digest": plan.reference.toolset_digest,
+            "renderer_version": plan.count_scope.renderer_version,
+            "policy_digest": plan.policy.policy_digest,
+            "soft_trigger_tokens": plan.policy.compact_at_tokens,
+            "hard_input_tokens": plan.policy.hard_input_tokens,
+            "projection_strategy": plan.windowing_strategy,
+            "summary_status": summary.status if summary is not None else "disabled",
+        }
+        completed = next(
+            (turn for turn in reversed(conversation.turns) if turn.status == "completed"),
+            None,
+        )
+        usage = (
+            await asyncio.to_thread(
+                store.provider_usage_for_run, completed.run_id
+            )
+            if completed is not None
+            else ()
+        )
+        usage_summary = (
+            {
+                "input_tokens": sum(item.input_tokens or 0 for item in usage),
+                "output_tokens": sum(item.output_tokens or 0 for item in usage),
+                "provider_calls": len(usage),
+                "complete": all(item.status == "complete" for item in usage),
+            }
+            if usage
+            else None
+        )
+        calibration = await self._durable_soft_calibration(plan)
+        chat_calibration_available = False
+        chat_plan: ContextPlan | None = None
+        chat_calibration: SoftContextCalibration | None = None
+        if projection_mode == "chat_only":
+            chat_plan = plan
+            chat_calibration = calibration
+            chat_calibration_available = calibration is not None
+        else:
+            # A pure-chat observation belongs to the empty ToolSet scope.  It
+            # may be returned as a separately labelled chat-only projection,
+            # but its ratio and capacity are never transferred to the
+            # conservative ToolSet scope.
+            try:
+                chat_plan = compile_preview(
+                    self._toolset_projection(allow_tools=False).specs
+                )
+            except ContextPlanError:
+                chat_plan = None
+            if chat_plan is not None:
+                chat_calibration = await self._durable_soft_calibration(chat_plan)
+                chat_calibration_available = chat_calibration is not None
+
+        chat_only_projection: dict[str, object] | None = None
+        if chat_plan is not None and chat_calibration is not None:
+            calibrated_chat = compile_preview(
+                chat_plan.tools,
+                soft_calibration=chat_calibration,
+            )
+            chat_estimate = calibrated_chat.soft_context_estimate
+            assert chat_estimate.estimated_tokens is not None
+            assert chat_estimate.error_margin_tokens is not None
+            chat_upper = chat_estimate.upper_tokens_for(calibrated_chat.count_scope)
+            chat_only_projection = {
+                "version": "next-turn-chat-only-projection-v1",
+                "availability": "available",
+                "projection_mode": "chat_only",
+                "fixed_context_tokens": chat_estimate.estimated_tokens,
+                "fixed_context_error_margin_tokens": (
+                    chat_estimate.error_margin_tokens
+                ),
+                "safe_user_tokens": max(
+                    0, calibrated_chat.policy.hard_input_tokens - chat_upper
+                ),
+                "compact_before_user_tokens": max(
+                    0, calibrated_chat.policy.compact_at_tokens - chat_upper
+                ),
+                "soft_trigger_tokens": calibrated_chat.policy.compact_at_tokens,
+                "hard_input_tokens": calibrated_chat.policy.hard_input_tokens,
+                "operational_context_tokens": (
+                    calibrated_chat.model_profile.operational_context_tokens
+                ),
+                "projection_strategy": calibrated_chat.windowing_strategy,
+                "count_basis": chat_estimate.basis,
+                "renderer_version": calibrated_chat.count_scope.renderer_version,
+                "toolset_digest": calibrated_chat.reference.toolset_digest,
+            }
+        if calibration is None:
+            if (
+                projection_mode == "conservative_tools"
+                and chat_calibration_available
+            ):
+                stale_reason = "toolset_calibration_unavailable"
+            elif not usage:
+                stale_reason = "no_provider_observation"
+            elif any(item.status != "complete" for item in usage):
+                stale_reason = "incomplete_provider_usage"
+            else:
+                stale_reason = "profile_or_projection_drift"
+            return {
+                **common,
+                "stale_reason": stale_reason,
+                "last_run_usage": usage_summary,
+                "chat_calibration_available": chat_calibration_available,
+                "chat_only_projection": chat_only_projection,
+            }
+        projected = self.context_compiler.compile(
+            ".",
+            model_profile=profile,
+            tools=effective_toolset.specs,
+            agent_id=self.capsule.agent_id,
+            capsule_generation=self.capsule.generation,
+            history=(
+                () if snapshot.completed_turn_contexts else tuple(
+                    ConversationMessage(item.message_id, item.role, item.content)
+                    for item in snapshot.committed_history
+                )
+            ),
+            completed_turns=snapshot.completed_turn_contexts,
+            continuation_context=snapshot.continuation_context,
+            prompt_sources=prompt_sources,
+            soft_calibration=calibration,
+        )
+        estimate = projected.soft_context_estimate
+        assert estimate.estimated_tokens is not None
+        assert estimate.error_margin_tokens is not None
+        upper = estimate.upper_tokens_for(projected.count_scope)
+        return {
+            **common,
+            "availability": "available",
+            "stale_reason": None,
+            "fixed_context_tokens": estimate.estimated_tokens,
+            "fixed_context_error_margin_tokens": estimate.error_margin_tokens,
+            "safe_user_tokens": max(0, projected.policy.hard_input_tokens - upper),
+            "compact_before_user_tokens": max(
+                0, projected.policy.compact_at_tokens - upper
+            ),
+            "projection_strategy": projected.windowing_strategy,
+            "count_basis": estimate.basis,
+            "last_run_usage": usage_summary,
+            "chat_calibration_available": chat_calibration_available,
+            "chat_only_projection": chat_only_projection,
+        }
 
     async def list_permission_requests(
         self, *, pending_only: bool = True
@@ -977,6 +1515,10 @@ class RunService:
         # so request cancellation cannot abandon a committed database delete
         # before the corresponding records have been retired.
         async with self._lock:
+            if conversation_id in self._preparations:
+                raise ConversationConflictError(
+                    "cannot delete a conversation with a preparing Run"
+                )
             if self.subagent_coordinator is not None:
                 await self.subagent_coordinator.cleanup_conversation(
                     self, conversation_id
@@ -1093,6 +1635,167 @@ class RunService:
             records.append((link, mailbox))
         return tuple(records)
 
+    async def preparation_status(
+        self, conversation_id: str
+    ) -> dict[str, object] | None:
+        """Return safe transient progress without exposing prompt or context."""
+
+        async with self._lock:
+            value = self._preparations.get(conversation_id)
+            if value is not None:
+                elapsed = max(
+                    0.0, asyncio.get_running_loop().time() - value.started_at
+                )
+                return {
+                    "version": "run-preparation-v1",
+                    "state": (
+                        "cancelling"
+                        if value.cancel_requested.is_set()
+                        else "preparing"
+                    ),
+                    "operation_id": value.operation_id,
+                    "stage": value.stage,
+                    "elapsed_ms": min(300_000, int(elapsed * 1_000)),
+                }
+            handed_off_run = next(
+                (
+                    record
+                    for record in self.runs.values()
+                    if record.conversation_id == conversation_id
+                    and record.terminal_kind is None
+                    and record.preparation_operation_id is not None
+                ),
+                None,
+            )
+            if handed_off_run is not None:
+                started = handed_off_run.cancel_requested_at
+                elapsed = (
+                    max(0.0, asyncio.get_running_loop().time() - started)
+                    if started is not None
+                    else 0.0
+                )
+                return {
+                    "version": "run-preparation-v1",
+                    "state": (
+                        "cancelling"
+                        if handed_off_run.cancel_requested
+                        else "preparing"
+                    ),
+                    "operation_id": handed_off_run.preparation_operation_id,
+                    "stage": "admitting_run",
+                    "elapsed_ms": min(300_000, int(elapsed * 1_000)),
+                }
+            # Keep the same fence used by delete/start while performing this
+            # fixed-cost lookup.  Thus an idle response cannot race a delete
+            # into returning success for a now-missing Conversation.
+            exists = await asyncio.to_thread(
+                self._conversation_store().conversation_exists,
+                conversation_id,
+            )
+            if not exists:
+                raise ConversationNotFoundError("conversation not found")
+            return None
+
+    async def cancel_preparation(
+        self, conversation_id: str, operation_id: str
+    ) -> dict[str, object]:
+        """Cancel admission, including its atomic handoff to an active Run.
+
+        This control path deliberately bypasses QueryEngine admission locks so
+        it remains responsive while a model-backed summary is blocked. The
+        preparation event and in-memory Run lookup share ``_lock``: there is no
+        gap in which the admission has left one state but is absent from both.
+        """
+
+        if SAFE_ID.fullmatch(operation_id) is None:
+            raise ValueError("invalid preparation operation identity")
+        run_id: str | None = None
+        async with self._lock:
+            preparation = self._preparations.get(conversation_id)
+            if preparation is not None:
+                if preparation.operation_id != operation_id:
+                    return {
+                        "version": "run-preparation-cancel-v1",
+                        "state": "stale",
+                        "target": None,
+                    }
+                preparation.cancel_requested.set()
+                return {
+                    "version": "run-preparation-cancel-v1",
+                    "state": "cancellation_requested",
+                    "target": "preparation",
+                }
+            active = next(
+                (
+                    record
+                    for record in self.runs.values()
+                    if record.conversation_id == conversation_id
+                    and record.terminal_kind is None
+                    and record.preparation_operation_id == operation_id
+                ),
+                None,
+            )
+            if active is not None:
+                run_id = active.run_id
+            elif any(
+                record.conversation_id == conversation_id
+                and record.terminal_kind is None
+                and record.preparation_operation_id != operation_id
+                for record in self.runs.values()
+            ):
+                return {
+                    "version": "run-preparation-cancel-v1",
+                    "state": "stale",
+                    "target": None,
+                }
+            else:
+                exists = await asyncio.to_thread(
+                    self._conversation_store().conversation_exists,
+                    conversation_id,
+                )
+                if not exists:
+                    raise ConversationNotFoundError("conversation not found")
+        if run_id is None:
+            return {
+                "version": "run-preparation-cancel-v1",
+                "state": "idle",
+                "target": None,
+            }
+        await self.cancel(run_id)
+        return {
+            "version": "run-preparation-cancel-v1",
+            "state": "cancellation_requested",
+            "target": "run",
+        }
+
+    def _set_preparation_stage(
+        self, preparation: PreparationStatus | None, stage: str
+    ) -> None:
+        if preparation is None:
+            return
+        if stage not in PREPARATION_STAGES:
+            raise ValueError("invalid Run preparation stage")
+        current = self._preparations.get(preparation.conversation_id)
+        if current is preparation:
+            current.stage = stage
+
+    async def _prepare_run_owned(
+        self,
+        command: StartRunCommand,
+        request_cancelled: asyncio.Event,
+        preparation: PreparationStatus | None,
+    ) -> RunRecord:
+        try:
+            return await self._prepare_run(
+                command, request_cancelled, preparation=preparation
+            )
+        finally:
+            if preparation is not None:
+                async with self._lock:
+                    current = self._preparations.get(preparation.conversation_id)
+                    if current is preparation:
+                        self._preparations.pop(preparation.conversation_id, None)
+
     async def start(self, command: StartRunCommand) -> RunRecord:
         command.validate()
         if self._closing:
@@ -1108,8 +1811,30 @@ class RunService:
             raise ValueError("unknown agent")
 
         request_cancelled = asyncio.Event()
+        preparation: PreparationStatus | None = None
+        if command.conversation_id is not None:
+            async with self._lock:
+                active = sum(
+                    existing.terminal_kind is None for existing in self.runs.values()
+                )
+                if command.conversation_id in self._preparations:
+                    raise ConversationConflictError(
+                        "conversation already has a preparing Run"
+                    )
+                if active + len(self._preparations) >= MAX_ACTIVE_RUNS:
+                    raise ValueError("prototype active Run capacity exhausted")
+                preparation = PreparationStatus(
+                    operation_id=new_id(),
+                    conversation_id=command.conversation_id,
+                    stage="reading_history",
+                    started_at=asyncio.get_running_loop().time(),
+                    cancel_requested=request_cancelled,
+                )
+                self._preparations[command.conversation_id] = preparation
         operation = asyncio.create_task(
-            self._prepare_run(command, request_cancelled),
+            self._prepare_run_owned(
+                command, request_cancelled, preparation
+            ),
             name="harness-v2-start-admission",
         )
         self._track_control_task(operation)
@@ -1142,6 +1867,8 @@ class RunService:
         self,
         command: StartRunCommand,
         request_cancelled: asyncio.Event,
+        *,
+        preparation: PreparationStatus | None = None,
     ) -> RunRecord:
         """Prepare one Run in an owned task that survives request cancellation."""
 
@@ -1171,10 +1898,13 @@ class RunService:
             )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
+            self._set_preparation_stage(preparation, "building_context")
             context_history = tuple(
                 ConversationMessage(message.message_id, message.role, message.content)
                 for message in snapshot.committed_history
             )
+            completed_contexts = snapshot.completed_turn_contexts
+            compile_history = () if completed_contexts else context_history
             try:
                 selector = getattr(self.model_broker, "qualification_for", None)
                 if callable(selector):
@@ -1189,81 +1919,223 @@ class RunService:
                     )
             except OllamaBrokerError as exc:
                 raise ValueError("model is not available") from exc
-            if model_qualification.model_profile.supports_tools:
-                effective_toolset = EffectiveToolSet.resolve(
-                    self.tool_catalog, self.tool_policy
-                )
-            else:
-                effective_toolset = EffectiveToolSet.resolve(
-                    self.tool_catalog,
-                    ToolPolicy(
-                        revision="model-no-tools-v1",
-                        allowed_tool_ids=(),
-                    ),
-                )
+            effective_toolset = await self._turn_effective_toolset(
+                command.message,
+                supports_tools=model_qualification.model_profile.supports_tools,
+            )
             prompt_sources = await asyncio.to_thread(
                 collect_prompt_sources, self.capsule
             )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
+            self._set_preparation_stage(preparation, "evaluating_compaction")
             context_plan = self.context_compiler.compile(
                 command.message,
                 model_profile=model_qualification.model_profile,
                 tools=effective_toolset.specs,
                 agent_id=command.agent_id,
                 capsule_generation=self.capsule.generation,
-                history=context_history,
+                history=compile_history,
                 prompt_sources=prompt_sources,
                 force_compact=command.compact,
+                completed_turns=completed_contexts,
+                continuation_context=snapshot.continuation_context,
             )
+            # Soft policy is rebuilt from scope-bound durable samples for every
+            # admission.  Provider-local memory may remain as a diagnostic
+            # cache, but it is never an authoritative production decision.
+            soft_calibration = await self._durable_soft_calibration(context_plan)
+            if soft_calibration is not None:
+                context_plan = self.context_compiler.compile(
+                    command.message,
+                    model_profile=model_qualification.model_profile,
+                    tools=effective_toolset.specs,
+                    agent_id=command.agent_id,
+                    capsule_generation=self.capsule.generation,
+                    history=compile_history,
+                    prompt_sources=prompt_sources,
+                    force_compact=command.compact,
+                    soft_calibration=soft_calibration,
+                    completed_turns=completed_contexts,
+                    continuation_context=snapshot.continuation_context,
+                )
+            summary_status = "disabled"
             if (
                 context_plan.windowing_strategy == "completed-turn-collapse-v2"
                 and context_plan.collapse_projection is not None
+                and completed_contexts
                 and getattr(self.model_broker, "semantic_summary_enabled", False)
+                and callable(getattr(self.model_broker, "summarize_v2", None))
                 and not request_cancelled.is_set()
                 and not self._closing
             ):
-                collapsed_count = len(
-                    context_plan.collapse_projection.collapsed_message_ids
+                self._set_preparation_stage(preparation, "summarizing_history")
+                omitted_turns = (
+                    context_plan.history_message_count
+                    - context_plan.included_history_message_count
+                ) // 2
+                summary_source = completed_contexts[:omitted_turns]
+                source_digest = summary_v2_source_digest(summary_source)
+                stored = await asyncio.to_thread(
+                    self.conversations.read_summary_projection, conversation_id
                 )
+                semantic_summary: SemanticSummaryV2Snapshot | None = None
+                if (
+                    stored is not None
+                    and stored.status in {"generated", "reused"}
+                    and stored.source_digest == source_digest
+                    and stored.snapshot is not None
+                    and stored.snapshot.source_digest == source_digest
+                    and stored.snapshot.model_profile_digest
+                    == model_qualification.model_profile.profile_digest
+                    and stored.snapshot.prompt_digest == SUMMARY_V2_PROMPT_DIGEST
+                    and stored.snapshot.policy_digest == SUMMARY_V2_POLICY_DIGEST
+                ):
+                    semantic_summary = stored.snapshot
+                    summary_status = "reused"
+                elif (
+                    stored is not None
+                    and stored.source_digest == source_digest
+                    and stored.status in {
+                        "source_limit", "timeout", "invalid", "circuit_open"
+                    }
+                    and _summary_negative_is_reusable(stored)
+                ):
+                    summary_status = stored.status
+                else:
+                    parent = stored.snapshot if stored is not None else None
+                    if parent is not None:
+                        prefix = len(parent.source_turn_ids)
+                        if (
+                            tuple(turn.turn_id for turn in summary_source[:prefix])
+                            != parent.source_turn_ids
+                            or tuple(
+                                completed_bundle_digest(turn)
+                                for turn in summary_source[:prefix]
+                            )
+                            != parent.source_bundle_digests
+                            or parent.model_profile_digest
+                            != model_qualification.model_profile.profile_digest
+                        ):
+                            parent = None
+                    delta = (
+                        summary_source[len(parent.source_turn_ids) :]
+                        if parent is not None else summary_source
+                    )
+                    try:
+                        if not delta:
+                            raise ContextPlanError("summary source has no delta")
+                        semantic_summary = await self.model_broker.summarize_v2(
+                            delta,
+                            aggregate_source=summary_source,
+                            parent=parent,
+                            model_id=(
+                                model_qualification.model_profile.catalog_model_id
+                                or model_qualification.model
+                            ),
+                            is_cancelled=lambda: (
+                                request_cancelled.is_set() or self._closing
+                            ),
+                        )
+                        summary_status = "generated"
+                    except OllamaBrokerError as exc:
+                        summary_status = {
+                            "summary_source_limit": "source_limit",
+                            "summary_timeout": "timeout",
+                            "summary_circuit_open": "circuit_open",
+                        }.get(exc.code, "invalid")
+                    except ContextPlanError:
+                        summary_status = "invalid"
+                if semantic_summary is not None:
+                    try:
+                        candidate = self.context_compiler.compile(
+                            command.message,
+                            model_profile=model_qualification.model_profile,
+                            tools=effective_toolset.specs,
+                            agent_id=command.agent_id,
+                            capsule_generation=self.capsule.generation,
+                            prompt_sources=prompt_sources,
+                            semantic_summary=semantic_summary,
+                            force_compact=command.compact,
+                            soft_calibration=soft_calibration,
+                            completed_turns=completed_contexts,
+                            continuation_context=snapshot.continuation_context,
+                        )
+                        if (
+                            candidate.soft_estimate is not None
+                            and candidate.soft_estimate.upper_tokens_for(
+                                candidate.count_scope
+                            ) > candidate.policy.compact_target_tokens
+                        ):
+                            raise ContextPlanError(
+                                "summary does not satisfy compact target"
+                            )
+                        context_plan = candidate
+                    except ContextPlanError:
+                        semantic_summary = None
+                        summary_status = "invalid"
                 try:
-                    semantic_summary = await self.model_broker.summarize(
-                        context_history[:collapsed_count],
-                        model_id=(
-                            model_qualification.model_profile.catalog_model_id
-                            or model_qualification.model
-                        ),
-                        is_cancelled=lambda: (
-                            request_cancelled.is_set() or self._closing
+                    await asyncio.to_thread(
+                        self.conversations.write_summary_projection,
+                        conversation_id,
+                        status=summary_status,
+                        source_digest=source_digest,
+                        snapshot=semantic_summary or (
+                            stored.snapshot if stored is not None else None
                         ),
                     )
-                    context_plan = self.context_compiler.compile(
-                        command.message,
-                        model_profile=model_qualification.model_profile,
-                        tools=effective_toolset.specs,
-                        agent_id=command.agent_id,
-                        capsule_generation=self.capsule.generation,
-                        history=context_history,
-                        prompt_sources=prompt_sources,
-                        semantic_summary=semantic_summary,
-                        force_compact=command.compact,
-                    )
-                except (OllamaBrokerError, ContextPlanError):
-                    # Summary is an optional projection layer.  Its only safe
-                    # fallback is the already-verified deterministic collapse.
-                    LOGGER.info("semantic summary unavailable; using deterministic collapse")
+                except (
+                    ValueError,
+                    ConversationConflictError,
+                    ConversationStoreUnavailableError,
+                ):
+                    # The projection is optional and deterministic collapse is
+                    # already valid. A deletion race will fail admission later.
+                    if semantic_summary is not None:
+                        context_plan = self.context_compiler.compile(
+                            command.message,
+                            model_profile=model_qualification.model_profile,
+                            tools=effective_toolset.specs,
+                            agent_id=command.agent_id,
+                            capsule_generation=self.capsule.generation,
+                            prompt_sources=prompt_sources,
+                            force_compact=command.compact,
+                            soft_calibration=soft_calibration,
+                            completed_turns=completed_contexts,
+                            continuation_context=snapshot.continuation_context,
+                        )
+                    summary_status = "invalid"
+            self._set_preparation_stage(preparation, "verifying_continuation")
+            # A completed Turn may commit the Broker's maximum assistant body.
+            # Prove before Worker/model/Tool side effects that the same frozen
+            # profile, ToolSet, generation and prompt sources can still admit a
+            # minimal following user Turn. The canonical transcript remains
+            # intact; the proof may select deterministic history projection.
+            self.context_compiler.require_completed_turn_continuation(
+                command.message,
+                model_profile=model_qualification.model_profile,
+                tools=effective_toolset.specs,
+                agent_id=command.agent_id,
+                capsule_generation=self.capsule.generation,
+                history=(() if completed_contexts else context_history),
+                completed_turns=completed_contexts,
+                continuation_context=snapshot.continuation_context,
+                prompt_sources=prompt_sources,
+            )
             recovery_context_plan: ContextPlan | None = None
-            if len(context_history) >= 4:
+            if context_plan.history_message_count >= 4:
                 candidate_recovery = self.context_compiler.compile(
                     command.message,
                     model_profile=model_qualification.model_profile,
                     tools=effective_toolset.specs,
                     agent_id=command.agent_id,
                     capsule_generation=self.capsule.generation,
-                    history=context_history,
+                    history=compile_history,
                     prompt_sources=prompt_sources,
                     force_compact=True,
                     collapse_to_recent=True,
+                    completed_turns=completed_contexts,
+                    continuation_context=snapshot.continuation_context,
                 )
                 if candidate_recovery.reference != context_plan.reference:
                     recovery_context_plan = candidate_recovery
@@ -1277,7 +2149,7 @@ class RunService:
                 effective_toolset=effective_toolset,
                 projection_reason=(
                     "manual_compact"
-                    if command.compact and context_plan.semantic_summary is not None
+                    if command.compact
                     else (
                         "semantic_summary"
                         if context_plan.semantic_summary is not None else "admission"
@@ -1286,6 +2158,7 @@ class RunService:
             )
             if request_cancelled.is_set() or self._closing:
                 raise asyncio.CancelledError
+            self._set_preparation_stage(preparation, "admitting_run")
         except BaseException:
             if created_conversation:
                 await asyncio.to_thread(
@@ -1301,7 +2174,12 @@ class RunService:
             user_message=command.message,
             conversation_managed=True,
             conversation_revision=snapshot.revision,
+            preparation_operation_id=(
+                preparation.operation_id if preparation is not None else None
+            ),
+            summary_status=summary_status,
             context_plan=context_plan,
+            active_context_plan=context_plan,
             recovery_context_plan=recovery_context_plan,
             recovery_history=(context_history if recovery_context_plan is not None else ()),
             recovery_prompt_sources=(
@@ -1309,6 +2187,7 @@ class RunService:
             ),
             effective_tools=effective_toolset.specs,
             runtime_snapshot=runtime_snapshot,
+            active_runtime_snapshot=runtime_snapshot,
             deadline_at=(
                 asyncio.get_running_loop().time()
                 + runtime_snapshot.wall_timeout_seconds
@@ -1727,7 +2606,7 @@ class RunService:
             runtime_snapshot = record.runtime_snapshot
             if (
                 keys != {"reason", "model_iterations"}
-                or payload.get("reason") != "end_turn"
+                or payload.get("reason") not in {"end_turn", "max_output"}
                 or not isinstance(payload.get("model_iterations"), int)
                 or isinstance(payload.get("model_iterations"), bool)
                 or payload["model_iterations"] != record.model_request_count
@@ -1793,6 +2672,9 @@ class RunService:
             )
             if spec is None:
                 raise RuntimeError("Tool result lost its frozen specification")
+            arguments = record.pending_tool_arguments.get(call_id)
+            if arguments is None:
+                raise RuntimeError("Tool result lost its validated arguments")
             projection = project_tool_result(spec, call_id, payload["result"])
             record.broker_tool_results.append(
                 OllamaToolResult(
@@ -1806,6 +2688,9 @@ class RunService:
                     truncation_reason=projection.truncation_reason,
                     projection_digest=projection.projection_digest,
                 )
+            )
+            record.completed_tool_calls.append(
+                (call_id, tool_id, spec.provider_name, dict(arguments))
             )
             record.pending_tools.pop(call_id, None)
             record.pending_tool_arguments.pop(call_id, None)
@@ -1994,6 +2879,7 @@ class RunService:
         recovery: bool = False,
         provider_usage_start: dict[str, Any] | None = None,
         provider_usage_complete: dict[str, Any] | None = None,
+        context_recovery: tuple[ContextProjectionBoundary, str] | None = None,
     ) -> EventEnvelope:
         # Managed terminal commits, RunRecord state, and Conversation deletion
         # share this fence.  A successful DELETE can therefore retire every
@@ -2007,7 +2893,68 @@ class RunService:
                 recovery=recovery,
                 provider_usage_start=provider_usage_start,
                 provider_usage_complete=provider_usage_complete,
+                context_recovery=context_recovery,
             )
+
+    @staticmethod
+    def _completed_turn_context(record: RunRecord) -> CompletedTurnContext:
+        plan = record.active_context_plan or record.context_plan
+        if (
+            plan is None
+            or record.user_message is None
+            or record.final_assistant_content is None
+            or record.turn_position is None
+            or len(record.completed_tool_calls) != len(record.broker_tool_results)
+        ):
+            raise RuntimeError("completed Run context is incomplete")
+        items: list[CompletedContextItem] = [
+            CompletedContextItem.plain(0, "user", record.user_message)
+        ]
+        for call, result in zip(
+            record.completed_tool_calls, record.broker_tool_results, strict=True
+        ):
+            call_id, tool_id, provider_name, arguments = call
+            if result.call_id != call_id or result.tool_id != tool_id:
+                raise RuntimeError("completed Tool context identity changed")
+            if result.projection_digest is None:
+                raise RuntimeError("completed Tool result has no projection digest")
+            items.append(
+                CompletedContextItem.tool_use(
+                    len(items),
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    provider_name=provider_name,
+                    arguments=arguments,
+                )
+            )
+            items.append(
+                CompletedContextItem.tool_result(
+                    len(items),
+                    call_id=call_id,
+                    tool_id=tool_id,
+                    provider_name=provider_name,
+                    content=result.content,
+                    outcome=result.outcome,
+                    original_bytes=result.original_bytes or 0,
+                    projection_reason=result.truncation_reason or "none",
+                    projection_digest=result.projection_digest,
+                )
+            )
+        items.append(
+            CompletedContextItem.plain(
+                len(items), "assistant_final", record.final_assistant_content
+            )
+        )
+        return CompletedTurnContext(
+            agent_id=record.agent_id,
+            conversation_id=record.conversation_id,
+            turn_id=record.turn_id,
+            run_id=record.run_id,
+            position=record.turn_position,
+            model_profile_digest=plan.model_profile.profile_digest,
+            context_plan_digest=plan.reference.digest,
+            items=tuple(items),
+        )
 
     async def _publish_locked(
         self,
@@ -2019,6 +2966,7 @@ class RunService:
         recovery: bool = False,
         provider_usage_start: dict[str, Any] | None = None,
         provider_usage_complete: dict[str, Any] | None = None,
+        context_recovery: tuple[ContextProjectionBoundary, str] | None = None,
     ) -> EventEnvelope:
         """Validate and publish one event under the Control-plane state fence."""
 
@@ -2028,6 +2976,13 @@ class RunService:
             raise RuntimeError("attempted event after terminal")
         if provider_usage_start is not None and provider_usage_complete is not None:
             raise RuntimeError("provider boundary cannot start and complete together")
+        if context_recovery is not None and (
+            kind != "model.recovery.started"
+            or durability != "durable"
+            or provider_usage_start is not None
+            or provider_usage_complete is not None
+        ):
+            raise RuntimeError("context recovery persistence is invalid")
         if record.conversation_managed and (
             (kind == "model.request.started" and provider_usage_start is None)
             or (
@@ -2106,7 +3061,7 @@ class RunService:
                     run_id=record.run_id,
                     conversation_revision=record.conversation_revision,
                 )
-                await asyncio.to_thread(
+                begin_result = await asyncio.to_thread(
                     self.conversations.begin_turn,
                     record.conversation_id,
                     turn_id=record.turn_id,
@@ -2116,6 +3071,7 @@ class RunService:
                     started_event=envelope,
                     context_projection=context_projection,
                 )
+                record.turn_position = begin_result.turn.position
             elif record.conversation_managed and provider_usage_start is not None:
                 if self.conversations is None:
                     raise RuntimeError("conversation store is unavailable")
@@ -2134,6 +3090,16 @@ class RunService:
                     boundary_event=envelope,
                     **provider_usage_complete,
                 )
+            elif record.conversation_managed and context_recovery is not None:
+                if self.conversations is None:
+                    raise RuntimeError("conversation store is unavailable")
+                recovery_boundary, expected_boundary_digest = context_recovery
+                await asyncio.to_thread(
+                    self.conversations.replace_context_projection_boundary_with_event,
+                    recovery_boundary,
+                    envelope,
+                    expected_boundary_digest=expected_boundary_digest,
+                )
             elif record.conversation_managed and kind in TERMINAL_KINDS:
                 if self.conversations is None:
                     raise RuntimeError("conversation store is unavailable")
@@ -2145,6 +3111,7 @@ class RunService:
                         record.run_id,
                         record.final_assistant_content,
                         envelope,
+                        self._completed_turn_context(record),
                     )
                 else:
                     status = "cancelled" if kind == "run.cancelled" else "failed"
@@ -2518,6 +3485,9 @@ class RunService:
                 ensure_ascii=True,
             )
             capability_preview = f"Use {tool_id} in workspace target {target_preview}"
+        runtime_snapshot = record.runtime_snapshot
+        if runtime_snapshot is None:
+            raise RuntimeError("Run ToolSet snapshot is unavailable")
         capability_request = CapabilityRequest.create(
             agent_id=record.agent_id,
             capsule_generation=self.capsule.generation,
@@ -2525,7 +3495,7 @@ class RunService:
             run_id=record.run_id,
             call_id=call_id,
             capability_id=tool_id,
-            toolset_digest=self.effective_toolset.toolset_digest,
+            toolset_digest=runtime_snapshot.context_plan.reference.toolset_digest,
             policy_digest=self.capability_policy.digest,
             arguments=capability_arguments,
             preview=capability_preview,
@@ -2624,11 +3594,13 @@ class RunService:
     ) -> ContextPlan:
         """Install the sole pre-admitted recovery projection for one Run."""
 
-        current = record.context_plan
+        admission = record.context_plan
+        current = record.active_context_plan or admission
         recovery = record.recovery_context_plan
-        runtime = record.runtime_snapshot
+        runtime = record.active_runtime_snapshot or record.runtime_snapshot
         if (
             record.overflow_recovery_count != 0
+            or admission is None
             or current is None
             or recovery is None
             or runtime is None
@@ -2657,11 +3629,7 @@ class RunService:
             loop_limits=runtime.loop_limits,
             wall_timeout_seconds=runtime.wall_timeout_seconds,
             effective_toolset=effective_toolset,
-            projection_reason=(
-                "semantic_summary"
-                if recovery.semantic_summary is not None
-                else "admission"
-            ),
+            projection_reason="overflow_recovery",
         )
         if self.conversations is None:
             raise RuntimeError("conversation store is unavailable")
@@ -2679,11 +3647,6 @@ class RunService:
             conversation_revision=record.conversation_revision or 0,
         )
         session.install_recovery_context(recovery)
-        await asyncio.to_thread(
-            self.conversations.replace_context_projection_boundary,
-            recovery_boundary,
-            expected_boundary_digest=previous_boundary.boundary_digest,
-        )
         await self._publish(
             record,
             "model.recovery.started",
@@ -2699,7 +3662,13 @@ class RunService:
                 "to_context_plan_digest": recovery.reference.digest,
                 "boundary_digest": recovery_boundary.boundary_digest,
             },
+            context_recovery=(
+                recovery_boundary,
+                previous_boundary.boundary_digest,
+            ),
         )
+        record.active_context_plan = recovery
+        record.active_runtime_snapshot = recovery_runtime
         record.overflow_recovery_count = 1
         record.model_usage["complete"] = False
         return recovery
@@ -2760,11 +3729,12 @@ class RunService:
             + b"\0"
             + str(expected_iteration).encode("ascii")
         ).hexdigest()[:32]
-        active_context_plan = context_plan
+        active_context_plan = record.active_context_plan or context_plan
 
         for attempt in range(2):
             request_started = False
             response_finished = False
+            transport_attempt_states: dict[int, str] = {}
             provider_call_index = record.provider_call_count + 1
             attempt_request_id = (
                 request_id if attempt == 0 else f"{request_id}-recovery-1"
@@ -2773,13 +3743,36 @@ class RunService:
             async def observe_request(metadata: OllamaRequestMetadata) -> None:
                 nonlocal request_started
                 runtime_snapshot = record.runtime_snapshot
+                active_tools_by_id = {
+                    spec.tool_id: spec for spec in active_context_plan.tools
+                }
+                metadata_tool_ids = (
+                    metadata.tool_ids
+                    if isinstance(metadata, OllamaRequestMetadata)
+                    else ()
+                )
+                selected_tools = tuple(
+                    active_tools_by_id[tool_id]
+                    for tool_id in metadata_tool_ids
+                    if tool_id in active_tools_by_id
+                )
                 if (
                     not isinstance(metadata, OllamaRequestMetadata)
                     or request_started
                     or runtime_snapshot is None
                     or metadata.iteration != expected_iteration
                     or not 1 <= metadata.message_count <= 256
-                    or not 0 <= metadata.tool_count <= len(record.effective_tools)
+                    or not isinstance(metadata.tool_ids, tuple)
+                    or metadata.tool_count != len(metadata.tool_ids)
+                    or len(set(metadata.tool_ids)) != len(metadata.tool_ids)
+                    or tuple(
+                        spec.tool_id
+                        for spec in active_context_plan.tools
+                        if spec.tool_id in set(metadata.tool_ids)
+                    )
+                    != metadata.tool_ids
+                    or len(selected_tools) != metadata.tool_count
+                    or metadata.toolset_digest != toolset_digest(selected_tools)
                     or not 1
                     <= metadata.estimated_input_tokens
                     <= active_context_plan.policy.hard_input_tokens
@@ -2787,13 +3780,6 @@ class RunService:
                     <= metadata.request_bytes
                     <= active_context_plan.model_profile.request_byte_budget
                     or re.fullmatch(r"[a-f0-9]{64}", metadata.request_digest) is None
-                    or metadata.tool_count
-                    != (
-                        len(active_context_plan.tools)
-                        if len(trusted_result_call_ids)
-                        < runtime_snapshot.loop_limits.max_tool_calls
-                        else 0
-                    )
                 ):
                     raise RuntimeError("trusted model request metadata is invalid")
                 await self._publish(
@@ -2821,6 +3807,7 @@ class RunService:
                         "model": active_context_plan.model_profile.model,
                         "profile_digest": profile_digest,
                         "context_plan_id": active_context_plan.reference.plan_id,
+                        "toolset_digest": metadata.toolset_digest,
                         "estimated_input_tokens": metadata.estimated_input_tokens,
                         "hard_input_tokens": active_context_plan.policy.hard_input_tokens,
                     },
@@ -2831,6 +3818,75 @@ class RunService:
                 record.broker_stop_iteration = None
                 record.model_failure = None
                 record.model_usage["complete"] = False
+
+            async def observe_transport_attempt(
+                observation: OllamaTransportAttempt,
+            ) -> None:
+                if (
+                    not isinstance(observation, OllamaTransportAttempt)
+                    or not request_started
+                    or response_finished
+                    or not 1 <= observation.attempt <= observation.max_attempts <= 4
+                    or observation.phase not in {
+                        "attempt_started", "attempt_finished"
+                    }
+                    or not 0 <= observation.elapsed_ms <= 3_600_000
+                    or (
+                        observation.first_frame_ms is not None
+                        and not 0 <= observation.first_frame_ms <= observation.elapsed_ms
+                    )
+                ):
+                    raise RuntimeError("trusted transport attempt metadata is invalid")
+                previous = transport_attempt_states.get(observation.attempt)
+                if observation.phase == "attempt_started":
+                    if (
+                        previous is not None
+                        or observation.outcome is not None
+                        or observation.elapsed_ms != 0
+                        or observation.first_frame_ms is not None
+                        or observation.attempt != len(transport_attempt_states) + 1
+                    ):
+                        raise RuntimeError("transport attempt start is out of sequence")
+                elif (
+                    previous != "attempt_started"
+                    or observation.outcome not in {
+                        "first_frame_received",
+                        "first_frame_timeout",
+                        "transport_timeout",
+                        "turn_deadline",
+                        "unavailable",
+                        "rejected",
+                        "cancelled",
+                        "failed_before_first_frame",
+                    }
+                    or (
+                        observation.outcome == "first_frame_received"
+                        and observation.first_frame_ms != observation.elapsed_ms
+                    )
+                    or (
+                        observation.outcome != "first_frame_received"
+                        and observation.first_frame_ms is not None
+                    )
+                ):
+                    raise RuntimeError("transport attempt finish is out of sequence")
+                await self._publish(
+                    record,
+                    "model.transport.attempt",
+                    "durable",
+                    {
+                        "version": "provider-transport-attempt-v1",
+                        "request_id": attempt_request_id,
+                        "iteration": expected_iteration,
+                        "provider_call_index": provider_call_index,
+                        "attempt": observation.attempt,
+                        "max_attempts": observation.max_attempts,
+                        "phase": observation.phase,
+                        "outcome": observation.outcome,
+                        "elapsed_ms": observation.elapsed_ms,
+                        "first_frame_ms": observation.first_frame_ms,
+                    },
+                )
+                transport_attempt_states[observation.attempt] = observation.phase
 
             async def finish_response(
                 outcome: str,
@@ -2877,6 +3933,7 @@ class RunService:
                     tuple(record.broker_tool_results),
                     lambda: record.cancel_requested,
                     observe_request,
+                    observe_transport_attempt,
                 )
                 async for frame in model_frames:
                     if frame.kind == "content":
@@ -2962,6 +4019,12 @@ class RunService:
                                 "model_protocol_error",
                                 "Invalid normalized stop frame.",
                             )
+                        stop_reason = frame.payload.get("reason")
+                        if stop_reason not in {"end_turn", "max_output"}:
+                            raise OllamaBrokerError(
+                                "model_protocol_error",
+                                "Invalid normalized stop reason.",
+                            )
                         prompt_tokens, output_tokens = self._validated_model_usage(
                             record, frame.payload["usage"]
                         )
@@ -2989,7 +4052,7 @@ class RunService:
                             stream,
                             request_id,
                             "stop",
-                            reason=frame.payload["reason"],
+                            reason=stop_reason,
                         )
                     else:
                         raise OllamaBrokerError(

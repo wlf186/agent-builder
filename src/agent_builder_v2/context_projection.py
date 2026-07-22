@@ -15,17 +15,26 @@ from .context import (
 )
 from .runtime import TurnRuntimeSnapshot
 from .semantic_summary import SemanticSummaryError, SemanticSummarySnapshot
+from .semantic_summary_v2 import (
+    SEMANTIC_SUMMARY_V2_VERSION,
+    SemanticSummaryV2Snapshot,
+)
 
 
-CONTEXT_PROJECTION_VERSION = "context-projection-v2"
+CONTEXT_PROJECTION_VERSION = "context-projection-v3"
 LEGACY_CONTEXT_PROJECTION_VERSION = "context-projection-v1"
-LEGACY_CONTEXT_RENDERER_VERSION = "ordered-sections-v4"
-LEGACY_SECTION_REGISTRY_VERSION = "prompt-section-registry-v3"
+LEGACY_CONTEXT_PROJECTION_VERSION_V2 = "context-projection-v2"
+PREVIOUS_CONTEXT_RENDERER_VERSION = "ordered-sections-v6"
+PREVIOUS_SECTION_REGISTRY_VERSION = "prompt-section-registry-v5"
+LEGACY_CONTEXT_RENDERER_VERSION = "ordered-sections-v5"
+LEGACY_SECTION_REGISTRY_VERSION = "prompt-section-registry-v4"
+OLDER_CONTEXT_RENDERER_VERSION = "ordered-sections-v4"
+OLDER_SECTION_REGISTRY_VERSION = "prompt-section-registry-v3"
 OLDEST_CONTEXT_RENDERER_VERSION = "ordered-sections-v3"
 OLDEST_SECTION_REGISTRY_VERSION = "prompt-section-registry-v2"
 MAX_CONTEXT_PROJECTION_BYTES = 16 * 1024
 ProjectionReason = Literal[
-    "admission", "replay", "manual_compact", "semantic_summary"
+    "admission", "replay", "manual_compact", "semantic_summary", "overflow_recovery"
 ]
 
 _RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
@@ -37,6 +46,7 @@ _REASONS = {
     "replay",
     "manual_compact",
     "semantic_summary",
+    "overflow_recovery",
 }
 
 
@@ -91,7 +101,7 @@ class ContextProjectionBoundary:
     section_registry_version: str
     windowing_strategy: str
     estimated_input_tokens: int
-    semantic_summary: SemanticSummarySnapshot | None
+    semantic_summary: SemanticSummarySnapshot | SemanticSummaryV2Snapshot | None
     boundary_digest: str
     version: str = CONTEXT_PROJECTION_VERSION
 
@@ -99,7 +109,9 @@ class ContextProjectionBoundary:
         unsigned = self._unsigned_dict()
         if (
             self.version not in {
-                CONTEXT_PROJECTION_VERSION, LEGACY_CONTEXT_PROJECTION_VERSION
+                CONTEXT_PROJECTION_VERSION,
+                LEGACY_CONTEXT_PROJECTION_VERSION,
+                LEGACY_CONTEXT_PROJECTION_VERSION_V2,
             }
             or _AGENT_ID.fullmatch(self.agent_id) is None
             or any(
@@ -142,24 +154,39 @@ class ContextProjectionBoundary:
             or (self.renderer_version, self.section_registry_version)
             not in {
                 (CONTEXT_RENDERER_VERSION, PROMPT_SECTION_REGISTRY_VERSION),
+                (
+                    PREVIOUS_CONTEXT_RENDERER_VERSION,
+                    PREVIOUS_SECTION_REGISTRY_VERSION,
+                ),
                 (LEGACY_CONTEXT_RENDERER_VERSION, LEGACY_SECTION_REGISTRY_VERSION),
+                (OLDER_CONTEXT_RENDERER_VERSION, OLDER_SECTION_REGISTRY_VERSION),
                 (OLDEST_CONTEXT_RENDERER_VERSION, OLDEST_SECTION_REGISTRY_VERSION),
             }
             or self.windowing_strategy
             not in {
                 "full", "completed-turn-tail-v1", "completed-turn-collapse-v2",
-                "semantic-summary-v1",
+                "semantic-summary-v1", "semantic-summary-v2",
             }
             or (
                 self.version == LEGACY_CONTEXT_PROJECTION_VERSION
                 and self.semantic_summary is not None
             )
             or (
+                self.version == LEGACY_CONTEXT_PROJECTION_VERSION_V2
+                and isinstance(self.semantic_summary, SemanticSummaryV2Snapshot)
+            )
+            or (
                 self.windowing_strategy == "semantic-summary-v1"
                 and not isinstance(self.semantic_summary, SemanticSummarySnapshot)
             )
             or (
-                self.windowing_strategy != "semantic-summary-v1"
+                self.windowing_strategy == "semantic-summary-v2"
+                and not isinstance(self.semantic_summary, SemanticSummaryV2Snapshot)
+            )
+            or (
+                self.windowing_strategy not in {
+                    "semantic-summary-v1", "semantic-summary-v2"
+                }
                 and self.semantic_summary is not None
             )
             or not isinstance(self.estimated_input_tokens, int)
@@ -168,8 +195,10 @@ class ContextProjectionBoundary:
             or self.boundary_digest
             != _digest(
                 (
-                    b"agent-builder-context-projection-v2"
+                    b"agent-builder-context-projection-v3"
                     if self.version == CONTEXT_PROJECTION_VERSION
+                    else b"agent-builder-context-projection-v2"
+                    if self.version == LEGACY_CONTEXT_PROJECTION_VERSION_V2
                     else b"agent-builder-context-projection-v1"
                 ),
                 unsigned,
@@ -258,7 +287,7 @@ class ContextProjectionBoundary:
             ),
         }
         boundary_digest = _digest(
-            b"agent-builder-context-projection-v2", values
+            b"agent-builder-context-projection-v3", values
         )
         return cls(
             **{key: value for key, value in values.items() if key != "semantic_summary"},
@@ -336,7 +365,11 @@ class ContextProjectionBoundary:
         version = value.get("version")
         expected = (
             legacy_expected | {"semantic_summary"}
-            if version == CONTEXT_PROJECTION_VERSION else legacy_expected
+            if version in {
+                CONTEXT_PROJECTION_VERSION,
+                LEGACY_CONTEXT_PROJECTION_VERSION_V2,
+            }
+            else legacy_expected
         )
         if set(value) != expected:
             raise ContextProjectionError("invalid context projection fields")
@@ -346,11 +379,17 @@ class ContextProjectionBoundary:
         ):
             raise ContextProjectionError("invalid projection history identities")
         value["included_history_message_ids"] = tuple(message_ids)
-        if version == CONTEXT_PROJECTION_VERSION:
+        if version in {
+            CONTEXT_PROJECTION_VERSION,
+            LEGACY_CONTEXT_PROJECTION_VERSION_V2,
+        }:
             summary = value.get("semantic_summary")
             try:
                 value["semantic_summary"] = (
-                    SemanticSummarySnapshot.from_object(summary)
+                    SemanticSummaryV2Snapshot.from_object(summary)
+                    if isinstance(summary, dict)
+                    and summary.get("version") == SEMANTIC_SUMMARY_V2_VERSION
+                    else SemanticSummarySnapshot.from_object(summary)
                     if summary is not None else None
                 )
             except SemanticSummaryError as exc:

@@ -2,7 +2,10 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
+    />
     <meta name="color-scheme" content="light" />
     <title>Agent Builder</title>
     <link rel="icon" href="data:," />
@@ -21,14 +24,14 @@
         </div>
         <div class="status-line">
           <span id="status-dot" class="status-dot" aria-hidden="true"></span>
-          <span id="status-text">尚未认证</span>
+          <span id="status-text" role="status" aria-live="polite" aria-atomic="true">尚未认证</span>
           <button id="logout-button" class="quiet" type="button" hidden>退出</button>
         </div>
       </header>
 
       <section id="login-panel" class="panel login-panel">
         <div>
-          <p class="section-label">LOCAL ACCESS</p>
+          <p class="section-label">本地访问</p>
           <h2>连接本地控制面</h2>
           <p>输入项目运行目录中生成的访问令牌。令牌只用于本次登录，不会写入浏览器存储。</p>
         </div>
@@ -50,10 +53,10 @@
       </section>
 
       <section id="workspace" class="workspace" hidden>
-        <aside id="navigation-rail" class="navigation-rail" aria-label="Agent 与会话导航">
+        <aside id="navigation-rail" class="navigation-rail" aria-label="智能体与会话导航">
           <div class="rail-heading">
             <div>
-              <p class="section-label">WORKSPACE</p>
+              <p class="section-label">工作区</p>
               <strong>你的工作区</strong>
             </div>
             <button id="navigation-close" class="icon-button quiet" type="button" aria-label="关闭导航">
@@ -63,52 +66,52 @@
         <details id="agent-drawer" class="panel agent-panel agent-drawer">
           <summary class="agent-drawer-summary">
             <span class="agent-current">
-              <span class="section-label">AGENT</span>
-              <strong id="active-agent-title">正在读取 Agent…</strong>
+              <span class="section-label">智能体</span>
+              <strong id="active-agent-title">正在读取智能体…</strong>
             </span>
             <code id="agent-id">未选择</code>
-            <span class="agent-drawer-hint">Agent 管理</span>
+            <span class="agent-drawer-hint">智能体管理</span>
           </summary>
           <div class="agent-drawer-body" aria-labelledby="agents-title">
             <div class="section-heading agent-heading">
               <div>
-                <p class="section-label">AGENTS</p>
-                <h2 id="agents-title">Agent</h2>
+                <p class="section-label">智能体</p>
+                <h2 id="agents-title">智能体管理</h2>
               </div>
               <form id="new-agent-form" class="agent-create-form">
-                <label class="sr-only" for="new-agent-name">新 Agent 名称</label>
+                <label class="sr-only" for="new-agent-name">新智能体名称</label>
                 <input
                   id="new-agent-name"
                   name="display_name"
                   type="text"
                   maxlength="128"
                   autocomplete="off"
-                  placeholder="输入新 Agent 名称"
+                  placeholder="输入新智能体名称"
                   required
                 />
-                <button id="new-agent-button" type="submit">新建 Agent</button>
+                <button id="new-agent-button" type="submit">新建智能体</button>
               </form>
             </div>
             <p id="agent-list-status" class="agent-list-status" role="status">
-              正在读取 Agent…
+              正在读取智能体…
             </p>
-            <ol id="agent-list" class="agent-list" aria-label="已有 Agent"></ol>
+            <ol id="agent-list" class="agent-list" aria-label="已有智能体"></ol>
             <p id="agent-empty" class="agent-empty" hidden>
-              当前没有可用 Agent。
+              当前没有可用智能体。
             </p>
             <p class="agent-boundary-note">
-              系统 Agent 是正式默认运行时，始终保留。重命名不会重建环境；运行代升级仅用于基础环境或安全策略发生实质变化的高级场景。
+              系统智能体是正式默认运行时，始终保留。重命名不会重建环境；运行环境重建仅用于基础环境或安全策略发生实质变化的高级场景。
             </p>
             <section class="research-environment" aria-labelledby="research-environment-title">
               <div class="research-environment-heading">
                 <div>
-                  <p class="section-label">PERSISTENT ENVIRONMENT</p>
+                  <p class="section-label">持久环境</p>
                   <h3 id="research-environment-title">研究与文档环境</h3>
                 </div>
                 <span id="research-environment-status" class="agent-badge">正在读取</span>
               </div>
               <p class="research-environment-copy">
-                安装在当前 Agent Capsule 内，PDF / DOCX 依赖可跨会话复用；不会进入其他 Agent，删除 Agent 时一并清理。
+                安装在当前智能体的隔离环境内，PDF / DOCX 依赖可跨会话复用；不会进入其他智能体，删除智能体时一并清理。
               </p>
               <p id="research-environment-packages" class="research-environment-packages"></p>
               <div class="research-environment-actions">
@@ -122,7 +125,7 @@
         <details id="session-drawer" class="panel session-panel session-drawer" open>
           <summary class="session-drawer-summary">
             <span class="session-current">
-              <span class="section-label">CONVERSATION</span>
+              <span class="section-label">会话</span>
               <strong>会话</strong>
             </span>
             <span class="session-drawer-hint">最近</span>
@@ -130,7 +133,7 @@
           <div class="session-drawer-body" aria-labelledby="sessions-title">
             <div class="section-heading session-heading">
               <div>
-                <p class="section-label">CONVERSATIONS</p>
+                <p class="section-label">会话</p>
                 <h2 id="sessions-title">会话</h2>
               </div>
               <button id="new-session-button" type="button">新建会话</button>
@@ -190,7 +193,7 @@
           >
             <header class="replay-heading">
               <div>
-                <p class="section-label">RUNTIME TRACE</p>
+                <p class="section-label">运行轨迹</p>
                 <h2 id="timeline-title">运行详情</h2>
                 <p class="timeline-hint">
                   Run 事件按 seq 排列，Turn fact 明确标为 UI 投影；选择节点可检查消息体。
@@ -410,7 +413,7 @@
             >
               <header class="conversation-heading">
                 <div>
-                  <p class="section-label">CONVERSATION</p>
+                  <p class="section-label">对话</p>
                   <h2 id="conversation-title">与智能体协作</h2>
                 </div>
               </header>
@@ -419,8 +422,9 @@
                   id="conversation-messages"
                   class="conversation-messages"
                   tabindex="0"
-                  aria-live="polite"
-                  aria-label="当前会话按 Turn 分组的消息"
+                  role="log"
+                  aria-live="off"
+                  aria-label="当前会话按轮次分组的消息"
                 ></div>
                 <button
                   id="conversation-latest-button"
@@ -432,7 +436,7 @@
                 </button>
                 <div id="conversation-empty" class="conversation-empty">
                   <span class="empty-mark" aria-hidden="true">A</span>
-                  <h2>今天想让 Agent 做什么？</h2>
+                  <h2>今天想让智能体做什么？</h2>
                   <p>选择或新建一个会话，然后描述目标。运行细节会在需要时出现在右侧。</p>
                   <div class="prompt-suggestions" aria-label="快捷提示">
                     <button type="button" class="quiet" data-prompt-suggestion="帮我梳理这个项目的结构，并指出最值得优先改进的地方。">理解项目</button>
@@ -451,12 +455,12 @@
             >
               <header class="conversation-heading">
                 <div>
-                  <p class="section-label">SUBAGENT MAILBOX</p>
+                  <p class="section-label">子智能体消息</p>
                   <h2 id="subagent-title">子智能体委派</h2>
                 </div>
               </header>
               <p class="conversation-hint">
-                父 Task、子 Run 与双向消息是独立事实；选择子 Run 可在左侧查看其完整事件序列。
+                父任务、子运行与双向消息是独立事实；选择子运行可查看其完整事件序列。
               </p>
               <div id="subagent-list" class="subagent-list"></div>
             </section>
@@ -465,16 +469,17 @@
               <h2 id="composer-title" class="visually-hidden">发送新一轮</h2>
               <form id="run-form">
                 <label class="sr-only" for="message-input">给智能体发送消息</label>
-                <div id="context-usage" class="context-usage" aria-live="polite">
+                <div id="context-usage" class="context-usage">
                   <div class="context-usage-copy">
-                    <span id="context-usage-label">下一条消息预算</span>
-                    <strong id="context-usage-value">等待上一轮结算</strong>
+                    <span id="context-usage-label">下一轮上下文</span>
+                    <strong id="context-usage-value">选择会话后显示占用与剩余</strong>
                   </div>
                   <div
                     id="context-usage-meter"
                     class="context-usage-meter"
                     role="progressbar"
-                    aria-label="当前会话上下文窗口占用"
+                    aria-label="上下文窗口占用"
+                    aria-describedby="context-usage-value context-usage-detail"
                     aria-valuemin="0"
                     aria-valuemax="100"
                     aria-valuenow="0"
@@ -482,24 +487,29 @@
                     <span id="context-usage-fill"></span>
                   </div>
                   <p id="context-usage-detail" class="context-usage-detail">
-                    将优先使用模型供应商返回的实际 token 推导
+                    仅展示服务端可验证的下一轮投影；不可用时不会猜测 token
                   </p>
                   <div class="turn-token-usage">
-                    <span id="turn-token-usage-label">本轮 Provider 实际用量</span>
+                    <span id="turn-token-usage-label">本轮模型实际计算量</span>
                     <strong id="turn-token-usage-value">等待模型响应</strong>
                   </div>
+                  <details class="context-technical-details">
+                    <summary>容量计算详情</summary>
+                    <p id="context-technical-value">尚无可展示的模型与计数依据</p>
+                  </details>
                 </div>
                 <textarea
                   id="message-input"
-                  maxlength="8192"
                   rows="1"
+                  maxlength="8192"
                   aria-keyshortcuts="Enter"
-                  placeholder="给 Agent 发消息，输入 / 使用命令…"
+                  placeholder="给智能体发消息，输入 / 使用命令…"
                   required
                   disabled
                 ></textarea>
                 <div class="composer-toolbar">
                   <div class="composer-options">
+                    <span id="message-byte-usage" class="message-byte-usage">0 / 8,192 字节</span>
                     <label class="model-picker" for="model-select">
                       <span class="sr-only">本轮模型</span>
                       <select id="model-select" aria-label="本轮模型" disabled>
@@ -511,21 +521,29 @@
                       <div class="composer-more-popover">
                         <label class="inline-check" for="compact-input">
                           <input id="compact-input" type="checkbox" disabled />
-                          发送前压缩上下文
+                          整理较早消息（完整会话记录不会删除）
                         </label>
+                        <p class="composer-option-help">
+                          如需生成摘要，发送前可能会多等待片刻；失败时会安全回退到确定性整理。
+                        </p>
                         <details id="command-help" class="command-help">
-                          <summary>Slash Commands</summary>
-                          <ul id="command-help-list" aria-label="可用 Slash Command"></ul>
+                          <summary>快捷命令</summary>
+                          <ul id="command-help-list" aria-label="可用快捷命令"></ul>
                         </details>
                       </div>
                     </details>
                   </div>
                   <div class="actions">
+                    <button id="continue-session-button" class="quiet" type="button" hidden>继续为新会话</button>
                     <button id="cancel-button" class="danger" type="button" disabled>停止</button>
                     <button id="run-button" type="submit" disabled>发送</button>
                   </div>
                 </div>
-                <p id="composer-status" class="composer-status" role="status" aria-live="polite"></p>
+                <p id="composer-status" class="composer-status" aria-live="off"></p>
+                <p id="interaction-live-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+                <p id="preparation-live-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+                <p id="run-live-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+                <p id="failure-live-status" class="sr-only" role="alert" aria-live="assertive" aria-atomic="true"></p>
                 <section id="command-result" class="command-result" aria-live="polite" hidden>
                   <div class="command-result-heading">
                     <strong id="command-result-title">命令结果</strong>

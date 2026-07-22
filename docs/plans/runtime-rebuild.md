@@ -1,7 +1,7 @@
 ---
 owner: runtime-maintainers
 status: active
-last_reviewed: 2026-07-21
+last_reviewed: 2026-07-22
 review_cycle: quarterly
 ---
 
@@ -16,11 +16,22 @@ review_cycle: quarterly
 本计划描述方向与验收，不承诺日期。逐项完成状态只使用下方 Execution ledger 定义的
 状态机；上面的 Implemented baseline 只是带日期的现状说明，不是第二份状态账本。
 
+2026-07-21 的多轮/长上下文/自动压缩专项审计曾重新打开 context/release Gate；随后
+`CTX-R01-01..15` 已按依赖完成，`GATE-05` 与 `GATE-07` 已重新关闭。历史 RR、审计发现与
+迁移/回滚记录不删除；细粒度 checklist 和最终资格证据位于
+[Context reliability remediation plan](context-reliability-remediation.md)。
+
+2026-07-22 的 Web/Provider 稳定性复审建立了 14 项 `UX-R02` 子计划，覆盖 transport
+诊断与 circuit、可取消准备态、持久失败恢复、窄屏/无障碍、重启一致校准、后台 Run、
+分页、会话命名/分支和安全消息渲染。细粒度状态与证据只维护在
+[Web UX and runtime resilience remediation plan](ux-reliability-remediation.md)。
+
 ## Implemented baseline
 
 - 根级 bootstrap/start/stop/purge/governance 生命周期与 checkout-local 环境边界；
-- `0.0.0.0:20815` 认证 Web UI、CSRF、Conversation create/list/read/delete、同会话
-  多轮 Run/cancel、SSE 和完整事件详情；
+- `0.0.0.0:20815` 认证 Web UI、CSRF、Conversation create/list/paged-read/rename/
+  completed-head branch/delete、同会话多轮、按会话后台 Run/草稿、失败恢复、受限 Markdown、
+  Run/cancel、SSE 和完整事件详情；
 - 有界 `QueryEngineRegistry` 与每 Conversation 一个逻辑 `QueryEngine`；Engine 固定
   Agent/Conversation 身份，提供 restore/submit/interrupt/delete，返回不可变 Run handle，
   删除后 retire/驱逐，重启后从 SQLite 懒重建且不复制 durable 或 per-Run 状态；
@@ -28,7 +39,8 @@ review_cycle: quarterly
 - 单一 `HarnessKernel` context → model → tool → model loop，无 LangGraph/LangChain；
 - operator-owned ModelCatalog 与受信 Ollama Broker；默认 entry 为
   `iollama:11434/qwen3.5:2b`，启动时从 `/api/show` 资格检查 binary、能力和原生上下文窗口，
-  并应用 entry 的 operational cap/output reserve；Web 只能选择目录内 ID，endpoint 不公开；
+  并应用 entry 的 operational cap/output reserve；生成固定走流式 `/api/chat` 而不是
+  `/api/generate`；Web 只能选择目录内 ID，endpoint 和 Provider 路径不公开；
 - Agent-scoped `state.sqlite` 中的 Conversation/Turn repository；一个 Conversation 同时
   最多一个 active Run，Turn 接受/终态与 boundary event 事务提交，Gateway 重启将遗留
   `running` Turn 收敛为 `interrupted`；
@@ -49,6 +61,9 @@ review_cycle: quarterly
   报告 usage，Control Plane 按模型 profile 校验并累计，Worker 不可伪造；
 - Model Broker 最多同时执行 2 路 provider stream，其它 active Run 在总容量内有界排队，
   30 秒无 slot 时以可重试 `model_busy` 失败；
+- 每个首帧 HTTP attempt 有内容安全、按 attempt 写一次而非按 timer/frame 写入的 transport
+  start/finish 诊断；同 model/profile 连续两个零首帧失败开启 30 秒、最多 16 项的进程内
+  circuit，open 时不占 slot/不发 HTTP，成功首帧复位；
 - ModelCatalog 为每个模型固定 queue/first-frame/stream-idle/turn timeout；默认 qwen 为
   30/60/20/120 秒，首帧前零输出 timeout 最多透明重试一次，Run wall deadline 为 240 秒。
   阶段错误码进入 canonical model response/terminal，Web 显示等待首帧、生成中和具体失败阶段；
@@ -56,6 +71,9 @@ review_cycle: quarterly
   外部或 workspace 状态和用户明确操作请求才进入既有 EffectiveToolSet；
 - 每轮最多 4096 个 provider 原始帧，合并为最多 128 个 content IPC frame；Broker error
   code/retryability 由 Control Plane 绑定 canonical terminal；
+- 普通 assistant 正文达到 12 KiB commit ceiling 时保留有界 UTF-8 前缀和恰好一次受信
+  marker，同时继续排空有界 Provider stream 以取得最终 usage，并以
+  `run.completed.reason=max_output` 完成；上限处的 Tool call、无正文或协议错误继续 fail closed；
 - Worker 无网络，Landlock + seccomp + rlimits + attestation，无 unconfined fallback；
 - runtime release ToolSet 包含 descriptor-anchored stat/read/glob/grep，以及要求
   same-Run receipt 和 operator diff 审批的原子 edit/write；每 Run 最多两次顺序 Tool 调用，
@@ -70,7 +88,10 @@ review_cycle: quarterly
   回放；Turn/Run/node 双向定位，支持过滤、
   步进/播放和常驻节点检查。推导的 User → Harness 提交节点不冒充 EventEnvelope；详情
   分开显示逻辑消息、payload 和完整 canonical envelope。按需 context inspector 只返回
-  `no-store`、正文隐藏的 ContextPlan/section 元数据或经验证历史摘要；
+  `no-store`、正文隐藏的 ContextPlan/section 元数据或经验证历史摘要。会话操作是不会被
+  列表 overflow 裁切的 top-layer Popover；终态刷新以 canonical assistant 覆盖 live buffer，
+  不产生重复 Turn。composer 优先显示 `conservative_tools` next-turn projection，仅在独立
+  空 ToolSet scope 已校准时退到明确标注的 `chat_only_projection`；
 - bounded Run/event/log/journal/tree 资源与安全的 PID/process-group 清理；
 - 旧系统隔离到 `_legacy-reference/`，当前 runtime 不依赖它；
 - P1-P8 权威文档和自动文档/边界治理。
@@ -79,6 +100,23 @@ review_cycle: quarterly
 [release contract](../design/release.md)为准，不能扩大成互联网、多租户或未资格平台承诺。
 
 ## Current validation evidence
+
+2026-07-22 的 `UX-R02-01..14` 已全部完成；细粒度实现、Chromium 竞态矩阵、真实模型
+TTFB/长回答和限制见 [UX/可靠性整改计划](ux-reliability-remediation.md)。最终门禁为
+`741 passed` 与 governance/diff/JavaScript/软链接检查全绿。当前 worktree 在真实
+`qwen3.5:2b`、`landlock+seccomp` 上完成四轮 warm/长回答 smoke、Gateway 跨重启两轮
+continuity，并以 `RR-QUA-20260722-02` 完成 4 completed、1 cancelled、1 rejected、2
+Conversation 删除验证；Run/Worker residual 为 0，显式 libc 计数得到 12 次成功 `fsync`、
+0 次失败，cache/temp 零增长。normal/force stop 与普通/计数模式 start 均通过，最终 Web
+以普通模式监听 `0.0.0.0:20815`。不从这份有界证据推导 SMART、物理 flush、长期 SSD
+寿命、任意模型或新平台保证。
+
+同日资格收口后的四项定向修正相关回归为 `226 passed`。真实固定
+`iollama:11434/qwen3.5:2b` `/api/chat` 长回答提交 `12,286 / 12,288` UTF-8 bytes，受信
+截断 marker 一次，终态 `run.completed.reason=max_output`，最终 Provider usage 为
+`252 input / 2,357 output`。该补充证据验证菜单 top layer、canonical/live terminal fence、
+两种 projection scope 分离和普通长回答有界完成，不替代上方完整 release gate，也不声明
+随机模型每次都能达到同样长度。
 
 2026-07-18 在当前 `x86_64` checkout 完成了受控环境全量测试、文档治理、diff/脚本语法
 门禁和真实 lifecycle 复验：Gateway 在 `0.0.0.0:20815` 以真实
@@ -563,6 +601,7 @@ graph。
 | 26 | SKILL-01 | P2 | versioned Skill registry 与隔离执行 | AGT-01, TOOL-01, PERM-01, EXEC-01 | done |
 | 27 | SUB-01 | P2 | Task/mailbox 驱动的子智能体 | REC-01, AGT-01, PERM-01, TASK-01 | done |
 | 28 | REL-01 | release | 首个受支持版本资格与运维契约 | QUA-01 | done |
+| 29 | CTX-R01 | P0 | 多轮、长上下文、压缩与 recovery 可靠性整改 | CMP-01, CMP-02, CMP-03, CMP-04, CMP-05, MODEL-01, REL-01 | done |
 
 ### Phase exit gates
 
@@ -575,9 +614,9 @@ work item 状态。
 | GATE-02 recovery | done | REC-01 完成；所有支持的崩溃点恢复到最后 durable boundary，客户端能区分 replay/gap/live |
 | GATE-03 Agent lifecycle | done | AGT-01 完成；create/upgrade/delete 可恢复、可回滚、无跨 Agent 影响或残留 |
 | GATE-04 capability/read | done | LOOP-01、TOOL-01、PERM-01、CMP-01、READ-01、SEARCH-01 完成，Worker 权限未扩大 |
-| GATE-05 context | done | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01 完成；projection 可复现、summary/overflow recovery 可恢复且 canonical transcript 不变 |
+| GATE-05 context | done | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01、CTX-R01 完成；projection 可复现、summary/overflow recovery 可恢复且 canonical transcript 不变 |
 | GATE-06 tasks/sub-agents | done | TASK-01、SUB-01 和纳入范围的执行能力完成；取消/崩溃/重启/删除无 orphan |
-| GATE-07 release | done | GATE-01 至 GATE-06 和 REL-01 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
+| GATE-07 release | done | GATE-01 至 GATE-06、REL-01 和 CTX-R01 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
 
 依赖只决定“可以完成”的顺序，不禁止安全设计、评测和测试脚手架并行；唯一推进顺序
 由总状态表中的顺序与 `depends_on` 共同确定。
@@ -1279,6 +1318,26 @@ CycloneDX 1.4 SBOM。checkout-local source archive 为 571967 bytes，SHA-256
 分别在 workload 前被 argparse 拒绝，失败目录已移入 checkout-local quarantine；新增 EXIT
 恢复保证后 Gateway 均保持健康，未把失败记录伪装为 PASS。GATE-01 至 GATE-06 已先关闭，
 本项通过后 GATE-07 和全部 28 项同步关闭。
+
+### CTX-R01 — Context reliability remediation
+
+Authority：[专项整改计划](context-reliability-remediation.md)、
+[架构](../design/architecture.md)、[事件协议](../design/event-protocol.md)和
+[安全边界](../../SECURITY.md)。
+
+状态：`done`（2026-07-21 完成全部 15 项实现、故障矩阵、真实模型、资源和生命周期资格）。
+
+- [x] 固化 2026-07-21 审计基线：全量 `581 passed`，并复现合法 pair 阻断下一轮、
+  byte estimator 过早压缩、Tool result headroom、summary aggregate boundary、
+  recovery active-plan 漂移和 UI baseline 问题；
+- [x] 建立唯一细粒度子计划，包含 15 个稳定工作项、依赖、迁移/回滚、故障矩阵和 Gate；
+- [x] 子计划 `CTX-R01-01` 至 `CTX-R01-15` 全部 done；
+- [x] 生成最终 `RR-CTXREL-*`，同步权威文档和 release contract；
+- [x] 重新关闭 `GATE-05` 与 `GATE-07`。
+
+该 parent 不抹除历史 RR，也不把已发现缺陷伪装成新的 baseline。历史
+`CMP-04/CMP-05/REL-01 done` 表示当时交付；当前 release readiness 还由本项的独立
+`RR-CTXREL-20260721-01` 和资源资格共同证明。
 
 ### Follow-on record — Agent-scoped research environment
 

@@ -8,6 +8,8 @@ import json
 import re
 from typing import Iterable
 
+from .generation import generation_policy_manifest
+
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9._:/+-]{1,128}$")
 _HOST = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
@@ -133,7 +135,11 @@ class ModelCatalogEntry:
             or not isinstance(self.output_token_cap, int)
             or isinstance(self.output_token_cap, bool)
             or not 1 <= self.output_token_cap < self.operational_context_cap
+            or not isinstance(self.temperature, int)
+            or isinstance(self.temperature, bool)
             or self.temperature != 0
+            or not isinstance(self.seed, int)
+            or isinstance(self.seed, bool)
             or self.seed != 0
             or self.keep_alive != "5m"
             or not isinstance(self.timeouts, ModelTimeoutProfile)
@@ -150,8 +156,10 @@ class ModelCatalogEntry:
             b"agent-builder-generation-options-v1\0",
             {
                 "keep_alive": self.keep_alive,
-                "seed": self.seed,
-                "temperature": self.temperature,
+                "policy": generation_policy_manifest(
+                    deterministic_temperature=self.temperature,
+                    seed=self.seed,
+                ),
             },
         )
 

@@ -5,6 +5,7 @@
 data/*
 !data/.gitkeep
 backups/
+.worktrees/
 
 # Private historical and third-party research material
 _legacy-reference/

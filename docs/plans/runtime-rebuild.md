@@ -1,7 +1,7 @@
 ---
 owner: runtime-maintainers
 status: active
-last_reviewed: 2026-07-22
+last_reviewed: 2026-07-24
 review_cycle: quarterly
 ---
 
@@ -25,6 +25,13 @@ review_cycle: quarterly
 诊断与 circuit、可取消准备态、持久失败恢复、窄屏/无障碍、重启一致校准、后台 Run、
 分页、会话命名/分支和安全消息渲染。细粒度状态与证据只维护在
 [Web UX and runtime resilience remediation plan](ux-reliability-remediation.md)。
+
+2026-07-24 对 Conversation `e018b18b9a634e338e500d089589295d` 的复审确认：普通 response
+采样可进入精确重复循环，重复 completed history 会污染续轮，而当前 512 KiB raw stream
+上限还会把随后长生成归类为 `model_protocol_error`。`REP-R03` 已开始 B+ 整改：确认重复后
+立即关闭 Provider stream，以有界 marker 正常完成但不伪造 usage；细粒度合同、测试与资格
+位于 [Model repetition remediation plan](model-repetition-remediation.md)。整改期间
+`GATE-05` 与 `GATE-07` 保持 reopened。
 
 ## Implemented baseline
 
@@ -602,6 +609,7 @@ graph。
 | 27 | SUB-01 | P2 | Task/mailbox 驱动的子智能体 | REC-01, AGT-01, PERM-01, TASK-01 | done |
 | 28 | REL-01 | release | 首个受支持版本资格与运维契约 | QUA-01 | done |
 | 29 | CTX-R01 | P0 | 多轮、长上下文、压缩与 recovery 可靠性整改 | CMP-01, CMP-02, CMP-03, CMP-04, CMP-05, MODEL-01, REL-01 | done |
+| 30 | REP-R03 | P0 | 模型重复循环止损、completed continuation 与 raw stream 修复 | MODEL-01, CTX-R01, REL-01 | in_progress |
 
 ### Phase exit gates
 
@@ -614,9 +622,9 @@ work item 状态。
 | GATE-02 recovery | done | REC-01 完成；所有支持的崩溃点恢复到最后 durable boundary，客户端能区分 replay/gap/live |
 | GATE-03 Agent lifecycle | done | AGT-01 完成；create/upgrade/delete 可恢复、可回滚、无跨 Agent 影响或残留 |
 | GATE-04 capability/read | done | LOOP-01、TOOL-01、PERM-01、CMP-01、READ-01、SEARCH-01 完成，Worker 权限未扩大 |
-| GATE-05 context | done | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01、CTX-R01 完成；projection 可复现、summary/overflow recovery 可恢复且 canonical transcript 不变 |
+| GATE-05 context | in_progress | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01、CTX-R01、REP-R03 完成；projection 可复现、summary/overflow recovery/重复截断可恢复且 canonical transcript 不变 |
 | GATE-06 tasks/sub-agents | done | TASK-01、SUB-01 和纳入范围的执行能力完成；取消/崩溃/重启/删除无 orphan |
-| GATE-07 release | done | GATE-01 至 GATE-06、REL-01 和 CTX-R01 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
+| GATE-07 release | in_progress | GATE-01 至 GATE-06、REL-01、CTX-R01 和 REP-R03 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
 
 依赖只决定“可以完成”的顺序，不禁止安全设计、评测和测试脚手架并行；唯一推进顺序
 由总状态表中的顺序与 `depends_on` 共同确定。
@@ -1338,6 +1346,21 @@ Authority：[专项整改计划](context-reliability-remediation.md)、
 该 parent 不抹除历史 RR，也不把已发现缺陷伪装成新的 baseline。历史
 `CMP-04/CMP-05/REL-01 done` 表示当时交付；当前 release readiness 还由本项的独立
 `RR-CTXREL-20260721-01` 和资源资格共同证明。
+
+### REP-R03 — Model repetition containment and continuation
+
+Authority：[专项整改计划](model-repetition-remediation.md)、
+[架构](../design/architecture.md)、[事件协议](../design/event-protocol.md)和
+[release contract](../design/release.md)。
+
+状态：`in_progress`（2026-07-24 完成只读复现并确认 B+ 设计，等待 red tests、实现和资格）。
+
+- [x] 证明第 4 Turn 重复来自模型 raw stream，而不是 delta 消费方式；
+- [x] 证明第 5 Turn 失败来自 512 KiB raw stream budget，Conversation 没有遗留 active Run；
+- [x] 确认产品合同：截断重复尾部、追加 trusted marker、Turn completed，下一轮从新 revision
+  重算且 incomplete Provider usage 不参与校准；
+- [ ] 完成 `REP-R03-01..08`、三次目标五轮真实模型资格和 forced-cancel 证据；
+- [ ] 同步权威文档并重新关闭 `GATE-05` 与 `GATE-07`。
 
 ### Follow-on record — Agent-scoped research environment
 

@@ -1,7 +1,7 @@
 ---
 owner: runtime-maintainers
 status: maintained
-last_reviewed: 2026-07-22
+last_reviewed: 2026-07-24
 review_cycle: quarterly
 ---
 
@@ -58,6 +58,10 @@ Conversation 128 个 Turn；全局最多 4 个 active Run 和 2 个 provider str
 512 live event/1 MiB、256 KiB durable replay、240 秒 wall、16 MiB logical/32 MiB allocated
 Run tree。每 Agent 最多 128 个 Task（4 active、终态 7 天）、16 个 Skill；extension catalog
 最多 8 个且默认空；subagent 全局 2 个、每 parent Run 1 个、depth 1、45 秒 wall。
+每次 Ollama response stream 最多 1 MiB/4096 raw frames，规范正文最多 12 KiB并合并为最多
+128 个 content IPC frame。普通无 Tool response 命中有界 exact-suffix guard 后会立即关闭
+stream，以 `repetition_truncated` completed 和 incomplete Provider usage 收敛；不会为取得 usage
+继续消耗 Provider 资源。
 
 Gateway 日志每段 5 MiB、3 个备份，总上界 20 MiB并批量刷新。Conversation、event、
 permission、operation、provider-call、Task 和 context-reveal audit 均有数据库行数/字节上限；
@@ -100,7 +104,11 @@ fail closed，绝不覆盖：
 日志、token 或运行中进程。必须把 token 独立安全保管；恢复数据不会恢复旧 token/session。
 跨版本升级前先备份并停止，更新受审源码/锁文件，运行 `./bootstrap.sh` 和 `./release.sh`。
 若新版本失败，停止后切回上一已审核的源码版本，运行 `./bootstrap.sh --offline`（缓存存在时）
-并恢复升级前备份。不要手工编辑 SQLite/WAL、manifest 或 recovery tree。
+并恢复升级前备份。已经运行过 repetition containment writer 的数据可能包含 additive
+`model.response.finished.outcome=repetition_truncated` 和
+`run.completed.reason=repetition_truncated`；任何回滚 writer 必须保留这两个值的严格 decoder，
+或恢复到启用新 writer 前的完整备份，不能用不认识新枚举的旧 binary 直接打开现有 SQLite。
+不要手工编辑 SQLite/WAL、manifest 或 recovery tree。
 
 ## 发布门禁与产物
 
@@ -133,6 +141,16 @@ worktree 产物只能作为本地 release candidate 证据。CI 从 cold checkou
 测试/治理/pip-audit；发布者还必须核对 CI 对应同一 commit、归档 SHA-256、RR result=pass、
 SBOM 无已知漏洞，并用 `./start.sh`/`/health`/Web/`./stop.sh` 做一次产物解包 smoke test。
 
+2026-07-24 的 repetition containment 候选以
+`.runtime/test-results/RR-REPETITION-20260724-01/summary.json` 留下本地 PASS：真实
+`qwen3.5:2b`、`landlock+seccomp` 上三次执行目标五输入序列，15/15 Turn completed，算术
+结果、Turn 4 natural completion 和 Turn 5 的 8-message committed history 均通过；旧采样仅在
+独立受信测试进程中触发一次 `repetition_truncated`，`10.317s` 后关闭并以 incomplete usage
+完成，后续短请求 `1.443s` 完成。配套全量为 `775 passed`，治理与 lifecycle 门禁通过，
+API Conversation、active Run、Broker slot、Worker/PID/Run root residual 为零。该记录只资格
+当前固定模型、输入和阈值，不证明任意模型、语义重复检测或长期负载；正式发布仍要求上方
+clean reviewed commit、cold-checkout CI、SBOM/vulnerability audit 和 `release.sh` 产物。
+
 2026-07-22 的 UX/runtime resilience worktree 候选以
 `.runtime/qualification/RR-QUA-20260722-02/summary.json` 留下本地 PASS：真实
 `qwen3.5:2b`、`landlock+seccomp`，4 completed、1 cancelled、1 rejected，全部临时 API
@@ -158,6 +176,8 @@ cache/temp 零增长。配套全量为 `741 passed`，governance、JavaScript、
   只减少连续零首帧故障风暴，不保证外部 Provider 可用性或自动重放 partial output；
 - crash 后不重建旧 Worker、provider stream 或 ephemeral delta，未完成 Turn 收敛为
   `interrupted`；
+- exact-suffix guard 是资源保护而非语义质量判断；用户明确要求逐字重复较长段落时也可能被
+  截断并以 marker completed。此取舍不授权关闭 guard、放宽到无界输出或从请求覆盖阈值；
 - Skill v1 没有依赖/capability，extension 默认空，subagent 仅一层，命令不是通用 shell；
 - 数据删除和 `purge` 不保证 SSD 物理擦除；恢复保留的旧 data 需由 operator 在确认后按
   明确目标清理。

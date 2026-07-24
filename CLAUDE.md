@@ -11,6 +11,12 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
 > 当前 release；完整合同和证据见
 > [completed remediation plan](docs/plans/context-reliability-remediation.md)。
 
+> **Repetition containment qualification（2026-07-24）**：`REP-R03-01..08` 已完成并重新
+> 关闭 context/release Gate。受信 sampling、1 MiB raw stream budget、有界 exact-suffix
+> detector、立即 Provider close、`repetition_truncated` completed/incomplete-usage 合同和
+> marker-bound continuation 已纳入当前 release；稳定证据见
+> [runtime rebuild plan](docs/plans/runtime-rebuild.md#rep-r03--model-repetition-containment-and-continuation)。
+
 ## 当前事实
 
 - Web Gateway 固定监听 `0.0.0.0:20815`，`GET /health` 是唯一无需登录的运行状态
@@ -62,7 +68,10 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
 - 真实模型固定为 `iollama:11434` 上的 `qwen3.5:2b`；端点、模型和参数不能由
   浏览器或 Worker 覆盖。启动资格检查从 Ollama `/api/show` 读取原生上下文窗口；
   当前模型报告 `262144` tokens，受信运行策略将实际窗口封顶为 `32768`，预留
-  `4096` 输出 tokens，因此硬输入预算为 `28672`。每个 ModelCatalog entry 同时固定有界
+  `4096` 输出 tokens，因此硬输入预算为 `28672`。普通无 Tool response 固定使用
+  `temperature=1.0/top_p=0.95/top_k=20/presence_penalty=1.5/seed=0`，Tool selection 固定
+  `temperature=0/seed=0`；两者均由受信 generation policy 固化并进入 profile digest。
+  每个 ModelCatalog entry 同时固定有界
   queue/first-frame/stream-idle/turn timeout；只有首帧前零输出 timeout 可透明重试一次，
   部分输出、idle timeout 和 turn deadline 不得重试。每个实际 HTTP attempt 只产生一对
   无 endpoint/prompt/正文的有界 transport 诊断；同 profile 连续两个零首帧失败后开启 30 秒
@@ -113,8 +122,9 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
   Shell、package 或 MCP。
 - 受信 Agent 指令要求默认直接回答；只有回答依赖外部/workspace 状态，或用户明确要求执行
   操作时才调用 Tool。创作与上下文内自包含问题不得触发 Tool，以避免小模型生成无意义的
-  buffered Tool call；这只约束其余已授权能力的选择策略。无业务价值的 Echo 已在受信
-  release policy 层移除，不能仅依赖提示词约束小模型。
+  buffered Tool call；算术表达式明确使用常规运算优先级并在回答前复核。这只约束其余已授权
+  能力的选择策略。无业务价值的 Echo 已在受信 release policy 层移除，不能仅依赖提示词约束
+  小模型。
 - Model Broker 全局最多同时打开 2 路 provider stream；其它请求只能在最多 4 个 active
   Run 的边界内有界等待，30 秒仍未取得 slot 时以可重试 `model_busy` 失败。
 - `extension/call` 提供 MCP/LSP 共用的 permission/result adapter，但 release catalog 默认为空，
@@ -138,8 +148,14 @@ GNU/Linux x86_64 上受支持的 single-operator、本地优先 release；当前
   Agent，并在自己的 Capsule/Conversation/Run/Worker/sandbox 中执行。全局最多 2 个、每父
   Run 1 个、depth 1、wall 45 秒；取消、重启、会话/Agent 删除必须收敛 child 且不得自动
   重放。不得用普通模型文本伪造 mailbox，也不得把 child workspace/environment 权限交给父侧。
-- Provider 最多 4096 个原始流帧会被合并为最多 128 个 content IPC frame；Broker 的
-  受信错误 code/retryability 由 Control Plane 绑定到 canonical failure，Worker 不能改写。
+- Provider 每次流最多 1 MiB/4096 个原始帧，并合并为最多 128 个 content IPC frame。
+  普通无 Tool 回答若在有界尾窗内出现至少 3 份、累计至少 512 bytes 的精确 suffix cycle，
+  Broker 会截掉尚未发出的重复尾部、追加一次固定 marker 并立即关闭 HTTP stream；Turn 以
+  `run.completed.reason=repetition_truncated` 提交，Provider usage 明确为 incomplete 且不参与
+  soft calibration。下一轮仍从该 completed bundle 和新 revision 重新执行硬 admission；软
+  preview 在取得同 scope 完整 observation 前显示 unavailable，不使用中止调用的零值猜数。
+  Broker 的受信错误 code/retryability 由 Control Plane 绑定到 canonical failure，Worker
+  不能改写。
 - `state.sqlite` 使用 WAL，只在会话/Turn 状态和 durable 语义事件边界写入；流式 delta
   保持内存态，不逐 token 落盘。认证的 `/api/runs/<id>/replay` 和 events endpoint 的
   durable fallback 会在返回前严格验证完整有界 Run、canonical payload/ToolSpec、显式 gap

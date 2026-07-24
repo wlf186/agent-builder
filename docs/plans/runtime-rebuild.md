@@ -28,10 +28,11 @@ review_cycle: quarterly
 
 2026-07-24 对 Conversation `e018b18b9a634e338e500d089589295d` 的复审确认：普通 response
 采样可进入精确重复循环，重复 completed history 会污染续轮，而当前 512 KiB raw stream
-上限还会把随后长生成归类为 `model_protocol_error`。`REP-R03` 已开始 B+ 整改：确认重复后
-立即关闭 Provider stream，以有界 marker 正常完成但不伪造 usage；细粒度合同、测试与资格
-位于 [Model repetition remediation plan](model-repetition-remediation.md)。整改期间
-`GATE-05` 与 `GATE-07` 保持 reopened。
+上限还会把随后长生成归类为 `model_protocol_error`。`REP-R03` 的 B+ 整改已完成：确认重复后
+立即关闭 Provider stream，以有界 marker 正常完成但不伪造 usage；detector、Broker、事件、
+Turn bundle、replay、Web 和跨重启 continuation 已进入 release。三次目标五轮真实模型、
+旧采样 forced guard、完整测试、治理和 lifecycle 资格均通过，`GATE-05` 与 `GATE-07` 已
+重新关闭；稳定合同位于 architecture/event/release 文档，细粒度活动计划已按治理规则删除。
 
 ## Implemented baseline
 
@@ -76,8 +77,14 @@ review_cycle: quarterly
   阶段错误码进入 canonical model response/terminal，Web 显示等待首帧、生成中和具体失败阶段；
 - 受信 Agent 指令采用 direct-answer-first Tool policy；创作/自包含问答不调用 Tool，只有
   外部或 workspace 状态和用户明确操作请求才进入既有 EffectiveToolSet；
-- 每轮最多 4096 个 provider 原始帧，合并为最多 128 个 content IPC frame；Broker error
-  code/retryability 由 Control Plane 绑定 canonical terminal；
+- 普通无 Tool response 使用固定受信 sampling
+  `temperature=1.0/top_p=0.95/top_k=20/presence_penalty=1.5/seed=0`，Tool selection 继续使用
+  `temperature=0/seed=0`；请求和 Worker 不可覆盖；
+- 每轮最多 1 MiB/4096 个 provider 原始帧，合并为最多 128 个 content IPC frame；Broker
+  error code/retryability 由 Control Plane 绑定 canonical terminal；
+- 普通无 Tool 回答的有界 exact-suffix guard 在至少 3 份/512-byte 证据后截掉未发重复尾部、
+  追加 marker 并立即关闭 HTTP；Turn 以 `repetition_truncated` completed，Provider usage 保持
+  incomplete，下一轮从该 completed bundle 硬准入而不拿零值校准；
 - 普通 assistant 正文达到 12 KiB commit ceiling 时保留有界 UTF-8 前缀和恰好一次受信
   marker，同时继续排空有界 Provider stream 以取得最终 usage，并以
   `run.completed.reason=max_output` 完成；上限处的 Tool call、无正文或协议错误继续 fail closed；
@@ -107,6 +114,19 @@ review_cycle: quarterly
 [release contract](../design/release.md)为准，不能扩大成互联网、多租户或未资格平台承诺。
 
 ## Current validation evidence
+
+2026-07-24 的 `RR-REPETITION-20260724-01` 以真实 `qwen3.5:2b` 和
+`landlock+seccomp` 完成目标五输入序列三次纵向资格：15/15 Turn 均为
+`run.completed.reason=end_turn`，三次算术结果均含 `935401`，三次第 4 Turn 均自然结束，
+三次第 5 Turn 均非空且 `history_message_count=8`；零 failed/cancelled/interrupted、零
+`model_protocol_error`。独立受信测试进程仅对第 4 Turn 临时恢复旧
+`temperature=0.7/top_p=0.8/seed=0` 后，真实 stream 在 `10.317s` 收敛为
+`repetition_truncated`、usage incomplete，随后 `ok` 在 `1.443s` 以 8 条 committed history
+正常完成。三个 API Conversation 均删除；正常/强制 stop 后 active Run、Broker slot、Worker、
+PID 和 Run root residual 均为零。最终全量为 `775 passed`，治理、diff、shell/JavaScript
+语法和 `AGENTS.md -> CLAUDE.md` 门禁通过。原问题 Conversation 全程只读，资格使用新建的
+隔离 Conversation；有界 aggregate 证据位于被忽略的
+`.runtime/test-results/RR-REPETITION-20260724-01/summary.json`。
 
 2026-07-22 的 `UX-R02-01..14` 已全部完成；细粒度实现、Chromium 竞态矩阵、真实模型
 TTFB/长回答和限制见 [UX/可靠性整改计划](ux-reliability-remediation.md)。最终门禁为
@@ -609,7 +629,7 @@ graph。
 | 27 | SUB-01 | P2 | Task/mailbox 驱动的子智能体 | REC-01, AGT-01, PERM-01, TASK-01 | done |
 | 28 | REL-01 | release | 首个受支持版本资格与运维契约 | QUA-01 | done |
 | 29 | CTX-R01 | P0 | 多轮、长上下文、压缩与 recovery 可靠性整改 | CMP-01, CMP-02, CMP-03, CMP-04, CMP-05, MODEL-01, REL-01 | done |
-| 30 | REP-R03 | P0 | 模型重复循环止损、completed continuation 与 raw stream 修复 | MODEL-01, CTX-R01, REL-01 | in_progress |
+| 30 | REP-R03 | P0 | 模型重复循环止损、completed continuation 与 raw stream 修复 | MODEL-01, CTX-R01, REL-01 | done |
 
 ### Phase exit gates
 
@@ -622,9 +642,9 @@ work item 状态。
 | GATE-02 recovery | done | REC-01 完成；所有支持的崩溃点恢复到最后 durable boundary，客户端能区分 replay/gap/live |
 | GATE-03 Agent lifecycle | done | AGT-01 完成；create/upgrade/delete 可恢复、可回滚、无跨 Agent 影响或残留 |
 | GATE-04 capability/read | done | LOOP-01、TOOL-01、PERM-01、CMP-01、READ-01、SEARCH-01 完成，Worker 权限未扩大 |
-| GATE-05 context | in_progress | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01、CTX-R01、REP-R03 完成；projection 可复现、summary/overflow recovery/重复截断可恢复且 canonical transcript 不变 |
+| GATE-05 context | done | CTX-01 至 CTX-04、CMP-02 至 CMP-05、MODEL-01、CTX-R01、REP-R03 完成；projection 可复现、summary/overflow recovery/重复截断可恢复且 canonical transcript 不变 |
 | GATE-06 tasks/sub-agents | done | TASK-01、SUB-01 和纳入范围的执行能力完成；取消/崩溃/重启/删除无 orphan |
-| GATE-07 release | in_progress | GATE-01 至 GATE-06、REL-01、CTX-R01 和 REP-R03 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
+| GATE-07 release | done | GATE-01 至 GATE-06、REL-01、CTX-R01 和 REP-R03 完成；首发 scope 的平台、容量、安全、备份恢复和运维证据通过 |
 
 依赖只决定“可以完成”的顺序，不禁止安全设计、评测和测试脚手架并行；唯一推进顺序
 由总状态表中的顺序与 `depends_on` 共同确定。
@@ -1349,18 +1369,25 @@ Authority：[专项整改计划](context-reliability-remediation.md)、
 
 ### REP-R03 — Model repetition containment and continuation
 
-Authority：[专项整改计划](model-repetition-remediation.md)、
-[架构](../design/architecture.md)、[事件协议](../design/event-protocol.md)和
+Authority：[架构](../design/architecture.md)、[事件协议](../design/event-protocol.md)和
 [release contract](../design/release.md)。
 
-状态：`in_progress`（2026-07-24 完成只读复现并确认 B+ 设计，等待 red tests、实现和资格）。
+状态：`done`（2026-07-24 完成 B+ 实现、故障矩阵、真实模型和生命周期资格）。
 
 - [x] 证明第 4 Turn 重复来自模型 raw stream，而不是 delta 消费方式；
 - [x] 证明第 5 Turn 失败来自 512 KiB raw stream budget，Conversation 没有遗留 active Run；
 - [x] 确认产品合同：截断重复尾部、追加 trusted marker、Turn completed，下一轮从新 revision
   重算且 incomplete Provider usage 不参与校准；
-- [ ] 完成 `REP-R03-01..08`、三次目标五轮真实模型资格和 forced-cancel 证据；
-- [ ] 同步权威文档并重新关闭 `GATE-05` 与 `GATE-07`。
+- [x] 完成 `REP-R03-01..06`：detector、sampling/raw budget、主动 close、事件/usage/replay、
+  Web 和跨重启 continuation；受影响矩阵 `394 passed`；
+- [x] 完成 `REP-R03-07..08`：三次目标五轮真实模型、旧采样 forced guard、正常/强制 stop、
+  residual audit 和最终 `775 passed`；
+- [x] 同步权威文档、记录 `RR-REPETITION-20260724-01` 并重新关闭 `GATE-05` 与 `GATE-07`。
+
+该整改保留一个明确取舍：exact-suffix guard 可能截断用户显式要求逐字重复的大段内容；它只
+是有界资源保护，不是一般质量检测。提前关闭的调用不伪造 usage，soft preview 暂时
+unavailable，但下一轮仍从带 marker 的 committed bundle 做 exact hard admission。稳定行为、
+回滚 decoder 和事件组合由上列权威文档维护；已完成的专项计划由 Git 历史保留。
 
 ### Follow-on record — Agent-scoped research environment
 

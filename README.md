@@ -537,7 +537,8 @@ NVMe 实际写入。完整使用和 A/B 观测者效应要求见资格契约。
 
 2026-07-24 的 repetition containment 资格把目标五输入会话在三个新 Conversation 中完整
 执行三次，并另用独立受信测试进程恢复旧采样触发真实 guard；15 个普通 Turn、截断后的续轮、
-Provider usage、删除和正常/强制 stop 均通过。完整的有界结果和限制见
+Provider usage、删除和正常/强制 stop 均通过。实现合并到 `main` 后又从合并后的 checkout
+完成 `776 passed`、治理和 `/health` 验证。完整的有界结果和限制见
 [REP-R03 record](docs/plans/runtime-rebuild.md#rep-r03--model-repetition-containment-and-continuation)。
 
 ## 仓库结构

@@ -141,13 +141,14 @@ worktree 产物只能作为本地 release candidate 证据。CI 从 cold checkou
 测试/治理/pip-audit；发布者还必须核对 CI 对应同一 commit、归档 SHA-256、RR result=pass、
 SBOM 无已知漏洞，并用 `./start.sh`/`/health`/Web/`./stop.sh` 做一次产物解包 smoke test。
 
-2026-07-24 的 repetition containment 候选以
+2026-07-24 的 repetition containment 实现已合并到 `main`，并以
 `.runtime/test-results/RR-REPETITION-20260724-01/summary.json` 留下本地 PASS：真实
 `qwen3.5:2b`、`landlock+seccomp` 上三次执行目标五输入序列，15/15 Turn completed，算术
 结果、Turn 4 natural completion 和 Turn 5 的 8-message committed history 均通过；旧采样仅在
 独立受信测试进程中触发一次 `repetition_truncated`，`10.317s` 后关闭并以 incomplete usage
 完成，后续短请求 `1.443s` 完成。配套全量为 `776 passed`，治理与 lifecycle 门禁通过，
-API Conversation、active Run、Broker slot、Worker/PID/Run root residual 为零。该记录只资格
+API Conversation、active Run、Broker slot、Worker/PID/Run root residual 为零；合并后的
+checkout 又复跑 `776 passed`、governance 和固定模型 `/health`。该记录只资格
 当前固定模型、输入和阈值，不证明任意模型、语义重复检测或长期负载；正式发布仍要求上方
 clean reviewed commit、cold-checkout CI、SBOM/vulnerability audit 和 `release.sh` 产物。
 

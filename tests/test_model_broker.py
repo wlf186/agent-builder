@@ -123,6 +123,30 @@ def test_brokered_model_normalizes_tool_then_final_content() -> None:
     ]
 
 
+def test_brokered_model_accepts_repetition_truncation_stop() -> None:
+    model = BrokeredStreamingModel(
+        BytesIO(
+            b"".join(
+                (
+                    _frame("model-1", "content", text="bounded answer"),
+                    _frame(
+                        "model-1",
+                        "stop",
+                        reason="repetition_truncated",
+                    ),
+                )
+            )
+        ),
+        BytesIO(),
+        effective_tools=(),
+    )
+
+    blocks = list(model.stream(_context("write a joke", tools=()), (), lambda: False))
+
+    assert blocks[-1].kind == "stop"
+    assert blocks[-1].payload == {"reason": "repetition_truncated"}
+
+
 def test_brokered_model_rejects_mismatched_or_oversized_frames() -> None:
     context = _context("hello")
     mismatched = BrokeredStreamingModel(

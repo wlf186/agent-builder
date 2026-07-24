@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -21,6 +22,7 @@ from agent_builder_v2.control import RunService
 from agent_builder_v2.context_projection import ContextProjectionBoundary
 from agent_builder_v2.ollama import (
     OUTPUT_TRUNCATION_MARKER,
+    REPETITION_TRUNCATION_MARKER,
     OllamaBrokerError,
     OllamaCancelledError,
     OllamaFrame,
@@ -558,6 +560,57 @@ class _TruncatedModelBroker(_FakeModelBroker):
     ) -> _TruncatedModelSession:
         assert max_tool_calls == 2
         return _TruncatedModelSession(context_plan)
+
+
+class _RepetitionTruncatedModelSession(_DirectModelSession):
+    async def stream_turn(
+        self,
+        _user_message: str,
+        _tool_results: tuple[OllamaToolResult, ...] = (),
+        _is_cancelled: object = None,
+        on_request: object = None,
+        on_transport_attempt: object = None,
+    ) -> object:
+        del on_transport_attempt
+        if on_request is not None:
+            await on_request(  # type: ignore[operator]
+                OllamaRequestMetadata(
+                    iteration=1,
+                    message_count=len(self.context_plan.provider_messages()),
+                    tool_count=0,
+                    tool_ids=(),
+                    toolset_digest=toolset_digest(()),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens,
+                    request_bytes=512,
+                    request_digest="8" * 64,
+                )
+            )
+        yield OllamaFrame(
+            "content",
+            {"text": f"bounded prefix{REPETITION_TRUNCATION_MARKER}"},
+        )
+        yield OllamaFrame(
+            "stop",
+            {"reason": "repetition_truncated", "usage": None},
+        )
+
+
+class _RepetitionTruncatedModelBroker(_FakeModelBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.qualification = replace(
+            self.qualification,
+            model_profile=replace(
+                self.qualification.model_profile,
+                supports_tools=False,
+            ),
+        )
+
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _RepetitionTruncatedModelSession:
+        assert max_tool_calls == 2
+        return _RepetitionTruncatedModelSession(context_plan)
 
 
 class _CancellableModelSession:
@@ -1853,6 +1906,94 @@ def test_output_limit_commits_truncated_turn_with_machine_readable_terminal(
             )
             assert replay.events[-1].payload["reason"] == "max_output"
             assert replay.snapshot.complete is True
+        finally:
+            await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_repetition_truncation_commits_with_incomplete_provider_usage(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        service = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=_RepetitionTruncatedModelBroker(),  # type: ignore[arg-type]
+        )
+        try:
+            await service.initialize()
+            record = await service.start(
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "write a joke",
+                )
+            )
+            events = [
+                event
+                async for event in service.stream(record.run_id)
+                if event is not None
+            ]
+
+            model_finished = next(
+                event
+                for event in events
+                if event.kind == "model.response.finished"
+            )
+            assert model_finished.payload == {
+                "request_id": "model-1",
+                "iteration": 1,
+                "attempt": 0,
+                "recovery_id": None,
+                "provider_call_index": 1,
+                "outcome": "repetition_truncated",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "usage_complete": False,
+                "error_code": None,
+            }
+            assert events[-1].kind == "run.completed"
+            assert events[-1].payload == {
+                "reason": "repetition_truncated",
+                "model_iterations": 1,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "last_input_tokens": 0,
+                    "complete": False,
+                },
+            }
+
+            assert service.conversations is not None
+            conversation = service.conversations.get_conversation(
+                record.conversation_id
+            )
+            completed_turn = conversation.turns[-1]
+            assert completed_turn.status == "completed"
+            assert completed_turn.assistant_content.endswith(
+                REPETITION_TRUNCATION_MARKER
+            )
+            usage = service.conversations.provider_usage_for_run(record.run_id)
+            assert len(usage) == 1
+            assert usage[0].status == "incomplete"
+            assert usage[0].input_tokens is None
+            assert usage[0].output_tokens is None
+            snapshot = service.conversations.snapshot_for_turn(
+                record.conversation_id
+            )
+            assert snapshot.completed_turn_contexts[-1].items[-1].content == (
+                completed_turn.assistant_content
+            )
+
+            identity = await service.resolve_run_identity(record.run_id)
+            replay = await service.replay_run(
+                record.run_id,
+                after=0,
+                limit=128,
+                expected_identity=identity,
+            )
+            assert replay.snapshot.complete is True
+            assert replay.events[-1].payload["reason"] == "repetition_truncated"
         finally:
             await service.close()
 

@@ -9,7 +9,13 @@ from typing import Iterator
 
 from .context import ContextPlanReference, ModelContext
 from .contracts import LoopLimits, TERMINAL_KINDS, WorkerEvent
-from .model import FakeStreamingModel, ModelBlock, ModelToolResult, StreamingModel
+from .model import (
+    VALID_COMPLETED_STOP_REASONS,
+    FakeStreamingModel,
+    ModelBlock,
+    ModelToolResult,
+    StreamingModel,
+)
 from .tools import ToolRegistry, prototype_tools, toolset_digest
 
 
@@ -214,7 +220,7 @@ class HarnessKernel:
                     if block.kind == "stop":
                         saw_stop = True
                         reason = block.payload.get("reason")
-                        if reason not in {"end_turn", "max_output"}:
+                        if reason not in VALID_COMPLETED_STOP_REASONS:
                             raise RuntimeError("model returned an invalid stop reason")
                         stop_reason = str(reason)
                     yield from self._handle_model_block(block)

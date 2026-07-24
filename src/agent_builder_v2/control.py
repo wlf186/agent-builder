@@ -42,7 +42,11 @@ from .contracts import (
     utc_now,
 )
 from .runtime import TurnRuntimeSnapshot
-from .model import BROKER_PROTOCOL_VERSION, MAX_BROKER_FRAME_BYTES
+from .model import (
+    BROKER_PROTOCOL_VERSION,
+    MAX_BROKER_FRAME_BYTES,
+    VALID_COMPLETED_STOP_REASONS,
+)
 from .ollama import (
     OllamaBroker,
     OllamaBrokerError,
@@ -608,6 +612,7 @@ class RunRecord:
     provider_call_count: int = 0
     overflow_recovery_count: int = 0
     broker_stop_iteration: int | None = None
+    broker_stop_reason: str | None = None
     final_assistant_content: str | None = field(default=None, repr=False)
     model_failure: tuple[str, bool] | None = None
     model_usage: dict[str, int | bool] = field(
@@ -2606,12 +2611,13 @@ class RunService:
             runtime_snapshot = record.runtime_snapshot
             if (
                 keys != {"reason", "model_iterations"}
-                or payload.get("reason") not in {"end_turn", "max_output"}
+                or payload.get("reason") not in VALID_COMPLETED_STOP_REASONS
                 or not isinstance(payload.get("model_iterations"), int)
                 or isinstance(payload.get("model_iterations"), bool)
                 or payload["model_iterations"] != record.model_request_count
                 or record.model_response_count != record.model_request_count
                 or record.broker_stop_iteration != record.model_request_count
+                or payload.get("reason") != record.broker_stop_reason
                 or runtime_snapshot is None
                 or not 1 <= record.model_request_count <= (
                     runtime_snapshot.loop_limits.max_model_iterations
@@ -3734,6 +3740,7 @@ class RunService:
         for attempt in range(2):
             request_started = False
             response_finished = False
+            request_tool_count: int | None = None
             transport_attempt_states: dict[int, str] = {}
             provider_call_index = record.provider_call_count + 1
             attempt_request_id = (
@@ -3741,7 +3748,7 @@ class RunService:
             )
 
             async def observe_request(metadata: OllamaRequestMetadata) -> None:
-                nonlocal request_started
+                nonlocal request_started, request_tool_count
                 runtime_snapshot = record.runtime_snapshot
                 active_tools_by_id = {
                     spec.tool_id: spec for spec in active_context_plan.tools
@@ -3816,8 +3823,10 @@ class RunService:
                 record.provider_call_count = provider_call_index
                 record.model_request_count = expected_iteration
                 record.broker_stop_iteration = None
+                record.broker_stop_reason = None
                 record.model_failure = None
                 record.model_usage["complete"] = False
+                request_tool_count = metadata.tool_count
 
             async def observe_transport_attempt(
                 observation: OllamaTransportAttempt,
@@ -4020,32 +4029,59 @@ class RunService:
                                 "Invalid normalized stop frame.",
                             )
                         stop_reason = frame.payload.get("reason")
-                        if stop_reason not in {"end_turn", "max_output"}:
+                        if stop_reason not in VALID_COMPLETED_STOP_REASONS:
                             raise OllamaBrokerError(
                                 "model_protocol_error",
                                 "Invalid normalized stop reason.",
                             )
-                        prompt_tokens, output_tokens = self._validated_model_usage(
-                            record, frame.payload["usage"]
-                        )
                         assistant_content = "".join(trusted_content)
-                        await finish_response(
-                            "end_turn",
-                            input_tokens=prompt_tokens,
-                            output_tokens=output_tokens,
-                            usage_complete=True,
-                            error_code=None,
-                        )
-                        self._apply_validated_model_usage(
-                            record, prompt_tokens, output_tokens
-                        )
-                        if not assistant_content.strip():
-                            raise OllamaBrokerError(
-                                "model_empty_response",
-                                "The model returned no visible assistant content.",
-                                retryable=True,
+                        if stop_reason == "repetition_truncated":
+                            if (
+                                frame.payload["usage"] is not None
+                                or request_tool_count != 0
+                            ):
+                                raise OllamaBrokerError(
+                                    "model_protocol_error",
+                                    "Invalid repetition truncation boundary.",
+                                )
+                            if not assistant_content.strip():
+                                raise OllamaBrokerError(
+                                    "model_empty_response",
+                                    "The model returned no visible assistant content.",
+                                    retryable=True,
+                                )
+                            await finish_response(
+                                "repetition_truncated",
+                                input_tokens=0,
+                                output_tokens=0,
+                                usage_complete=False,
+                                error_code=None,
                             )
+                            record.model_usage["complete"] = False
+                        else:
+                            prompt_tokens, output_tokens = (
+                                self._validated_model_usage(
+                                    record, frame.payload["usage"]
+                                )
+                            )
+                            await finish_response(
+                                "end_turn",
+                                input_tokens=prompt_tokens,
+                                output_tokens=output_tokens,
+                                usage_complete=True,
+                                error_code=None,
+                            )
+                            self._apply_validated_model_usage(
+                                record, prompt_tokens, output_tokens
+                            )
+                            if not assistant_content.strip():
+                                raise OllamaBrokerError(
+                                    "model_empty_response",
+                                    "The model returned no visible assistant content.",
+                                    retryable=True,
+                                )
                         record.broker_stop_iteration = expected_iteration
+                        record.broker_stop_reason = str(stop_reason)
                         record.final_assistant_content = assistant_content
                         saw_terminal_frame = True
                         await self._write_model_response(

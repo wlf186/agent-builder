@@ -12,6 +12,11 @@ from .context import ModelContext
 from .tools import ToolResult, ToolSpec, prototype_tool_specs, toolset_digest
 
 
+VALID_COMPLETED_STOP_REASONS = frozenset(
+    {"end_turn", "max_output", "repetition_truncated"}
+)
+
+
 @dataclass(frozen=True)
 class ModelBlock:
     kind: str
@@ -354,7 +359,7 @@ class BrokeredStreamingModel:
                     "request_id",
                     "type",
                     "reason",
-                } or frame.get("reason") not in {"end_turn", "max_output"}:
+                } or frame.get("reason") not in VALID_COMPLETED_STOP_REASONS:
                     raise RuntimeError("model broker stop frame is invalid")
                 if block_open:
                     yield ModelBlock("text.finish", {"block_id": block_id})
@@ -384,4 +389,5 @@ __all__ = [
     "ModelBlock",
     "ModelToolResult",
     "StreamingModel",
+    "VALID_COMPLETED_STOP_REASONS",
 ]

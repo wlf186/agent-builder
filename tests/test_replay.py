@@ -9,6 +9,7 @@ import pytest
 
 from agent_builder_v2.capsule import PROTOTYPE_AGENT_ID
 from agent_builder_v2.contracts import EventEnvelope
+from agent_builder_v2.ollama import REPETITION_TRUNCATION_MARKER
 from agent_builder_v2.replay import (
     PROJECTION_VERSION,
     ReplayCorruptionError,
@@ -77,6 +78,15 @@ def _multi_tool_started_payload() -> dict[str, object]:
     }
 
 
+def _tool_free_current_started_payload() -> dict[str, object]:
+    payload = _current_started_payload()
+    payload["visible_tools"] = []
+    context = payload["context_plan"]
+    assert isinstance(context, dict)
+    context["toolset_digest"] = toolset_digest(())
+    return payload
+
+
 def _model_request(
     iteration: int,
     *,
@@ -93,6 +103,39 @@ def _model_request(
         "message_count": 2 + (iteration - 1) * 2,
         "tool_count": 1 if iteration == 1 else 0,
         "tool_result_call_ids": result_call_ids or [],
+    }
+
+
+def _tool_free_model_request() -> dict[str, object]:
+    payload = _model_request(1)
+    payload["tool_count"] = 0
+    return payload
+
+
+def _repetition_response(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "request_id": "model-1",
+        "iteration": 1,
+        "outcome": "repetition_truncated",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "usage_complete": False,
+        "error_code": None,
+    }
+    payload.update(changes)
+    return payload
+
+
+def _repetition_completed(*, reason: str = "repetition_truncated") -> dict[str, object]:
+    return {
+        "reason": reason,
+        "model_iterations": 1,
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "last_input_tokens": 0,
+            "complete": False,
+        },
     }
 
 
@@ -439,6 +482,106 @@ def test_projector_strictly_pairs_current_model_call_boundaries() -> None:
         expected_through_seq=snapshot.through_seq,
     )
     assert decoded == snapshot
+
+
+def _repetition_events(
+    *,
+    response: dict[str, object] | None = None,
+    terminal: dict[str, object] | None = None,
+    include_content: bool = True,
+) -> tuple[EventEnvelope, ...]:
+    events = [
+        _event(1, "run.started", _tool_free_current_started_payload()),
+        _event(2, "model.request.started", _tool_free_model_request()),
+        _event(
+            3,
+            "model.response.finished",
+            response if response is not None else _repetition_response(),
+        ),
+    ]
+    if include_content:
+        events.extend(
+            (
+                _event(
+                    4,
+                    "assistant.block.started",
+                    {"block_id": "answer", "block_type": "content"},
+                ),
+                _event(
+                    5,
+                    "assistant.block.finished",
+                    {
+                        "block_id": "answer",
+                        "content": (
+                            "bounded answer" + REPETITION_TRUNCATION_MARKER
+                        ),
+                    },
+                ),
+            )
+        )
+    events.append(
+        _event(
+            len(events) + 1,
+            "run.completed",
+            terminal if terminal is not None else _repetition_completed(),
+        )
+    )
+    return tuple(events)
+
+
+def test_projector_accepts_repetition_completion_with_incomplete_usage() -> None:
+    snapshot, gaps = project_durable_run(_repetition_events())
+
+    assert gaps == ()
+    assert snapshot.complete is True
+    assert snapshot.document["model_calls"][-1] == {
+        **_tool_free_model_request(),
+        "state": "finished",
+        "request_seq": 2,
+        "response_seq": 3,
+        **_repetition_response(),
+    }
+    assert snapshot.document["terminal"] == {
+        "kind": "run.completed",
+        "payload": _repetition_completed(),
+    }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"input_tokens": 1},
+        {"output_tokens": 1},
+        {"usage_complete": True},
+        {"error_code": "model_protocol_error"},
+    ),
+)
+def test_projector_rejects_corrupt_repetition_usage(
+    changes: dict[str, object],
+) -> None:
+    with pytest.raises(ReplayCorruptionError):
+        project_durable_run(
+            _repetition_events(response=_repetition_response(**changes))
+        )
+
+
+@pytest.mark.parametrize(
+    ("terminal", "include_content"),
+    (
+        (_repetition_completed(reason="end_turn"), True),
+        (_repetition_completed(), False),
+    ),
+)
+def test_projector_rejects_repetition_completion_without_matching_terminal_content(
+    terminal: dict[str, object], include_content: bool
+) -> None:
+    with pytest.raises(ReplayCorruptionError):
+        project_durable_run(
+            _repetition_events(
+                terminal=terminal,
+                include_content=include_content,
+            )
+        )
 
 
 def test_feature_marked_completed_run_cannot_masquerade_as_legacy() -> None:

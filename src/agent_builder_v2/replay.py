@@ -1128,7 +1128,13 @@ def _validate_model_response_payload(
         raise ReplayCorruptionError("invalid model response context")
     if (
         request_id != expected_request_id
-        or outcome not in {"tool_use", "end_turn", "error", "cancelled"}
+        or outcome not in {
+            "tool_use",
+            "end_turn",
+            "repetition_truncated",
+            "error",
+            "cancelled",
+        }
         or not isinstance(complete, bool)
         or input_tokens > context.get("input_budget_tokens", 0)
         or output_tokens > context.get("output_reserve_tokens", 0)
@@ -1139,6 +1145,14 @@ def _validate_model_response_payload(
     if outcome in {"tool_use", "end_turn"}:
         if complete is not True or error_code is not None:
             raise ReplayCorruptionError("invalid successful model response")
+    elif outcome == "repetition_truncated":
+        if (
+            complete is not False
+            or input_tokens != 0
+            or output_tokens != 0
+            or error_code is not None
+        ):
+            raise ReplayCorruptionError("invalid repetition-truncated response")
     elif (
         complete is not False
         or input_tokens != 0
@@ -1300,7 +1314,8 @@ def _validate_terminal_payload(
         iterations = payload.get("model_iterations")
         usage = _validate_usage(payload.get("usage"))
         if (
-            payload.get("reason") not in {"end_turn", "max_output"}
+            payload.get("reason")
+            not in {"end_turn", "max_output", "repetition_truncated"}
             or not isinstance(iterations, int)
             or isinstance(iterations, bool)
             or not 1 <= iterations <= 4
@@ -1375,6 +1390,41 @@ def _validate_tool_outcome(
 def _snapshot_sequence(value: object, *, field: str, through_seq: int) -> int:
     return _bounded_integer(
         value, minimum=2, maximum=through_seq, field=field
+    )
+
+
+def _valid_completed_model_sequence(
+    model_calls: Sequence[object],
+    tools: Sequence[object],
+    blocks: Sequence[object],
+    terminal_payload: dict[str, object],
+) -> bool:
+    if not model_calls or not isinstance(model_calls[-1], dict):
+        return False
+    last = model_calls[-1]
+    reason = terminal_payload.get("reason")
+    repetition = reason == "repetition_truncated"
+    if repetition:
+        if (
+            last.get("outcome") != "repetition_truncated"
+            or last.get("tool_count") != 0
+            or not any(
+                isinstance(block, dict)
+                and block.get("state") == "finished"
+                and isinstance(block.get("content"), str)
+                and bool(str(block["content"]).strip())
+                for block in blocks
+            )
+        ):
+            return False
+    elif last.get("outcome") != "end_turn":
+        return False
+    return (
+        sum(
+            isinstance(item, dict) and item.get("outcome") == "tool_use"
+            for item in model_calls[:-1]
+        )
+        == len(tools)
     )
 
 
@@ -1532,6 +1582,13 @@ def _validate_snapshot_document(
                     }
                 )
             _validate_model_response_payload(response_payload, started)
+            if (
+                item.get("outcome") == "repetition_truncated"
+                and item.get("tool_count") != 0
+            ):
+                raise ReplayCorruptionError(
+                    "repetition truncation retained a Tool schema"
+                )
             response_seq = _snapshot_sequence(
                 item.get("response_seq"),
                 field="model response sequence",
@@ -1774,13 +1831,11 @@ def _validate_snapshot_document(
                 terminal_payload.get("model_iterations") != expected_iterations
                 or (
                     boundary_feature
-                    and (
-                        model_calls[-1].get("outcome") != "end_turn"  # type: ignore[union-attr]
-                        or sum(
-                            item.get("outcome") == "tool_use"  # type: ignore[union-attr]
-                            for item in model_calls[:-1]
-                        )
-                        != len(tools)
+                    and not _valid_completed_model_sequence(
+                        model_calls,
+                        tools,
+                        blocks,
+                        terminal_payload,
                     )
                 )
             ):
@@ -2006,6 +2061,10 @@ def project_durable_run(
                 or (
                     payload.get("outcome") == "tool_use"
                     and request.get("tool_count") == 0
+                )
+                or (
+                    payload.get("outcome") == "repetition_truncated"
+                    and request.get("tool_count") != 0
                 )
             ):
                 raise ReplayCorruptionError("model response does not match its request")
@@ -2269,14 +2328,11 @@ def project_durable_run(
                     terminal_payload.get("model_iterations") != expected_iterations
                     or (
                         model_boundaries_seen
-                        and (
-                            not model_calls
-                            or model_calls[-1].get("outcome") != "end_turn"
-                            or sum(
-                                item.get("outcome") == "tool_use"
-                                for item in model_calls[:-1]
-                            )
-                            != len(tools)
+                        and not _valid_completed_model_sequence(
+                            model_calls,
+                            tools,
+                            blocks,
+                            terminal_payload,
                         )
                     )
                 ):

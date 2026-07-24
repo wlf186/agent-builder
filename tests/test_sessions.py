@@ -49,6 +49,7 @@ from agent_builder_v2.sessions import (
     MAX_USER_CONTENT_BYTES,
     ConversationConflictError,
     ConversationNotFoundError,
+    ProviderUsageMutation,
     ConversationStore,
     ConversationStoreUnavailableError,
     ConversationTurnCapacityError,
@@ -188,6 +189,15 @@ def _boundary_started_payload() -> dict[str, object]:
     }
 
 
+def _tool_free_boundary_started_payload() -> dict[str, object]:
+    payload = _boundary_started_payload()
+    payload["visible_tools"] = []
+    context = payload["context_plan"]
+    assert isinstance(context, dict)
+    context["toolset_digest"] = toolset_digest(())
+    return payload
+
+
 def _model_request_payload(
     iteration: int = 1,
     *,
@@ -222,6 +232,20 @@ def _model_response_payload(
         "usage_complete": True,
         "error_code": None,
     }
+
+
+def _repetition_response_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "request_id": "model-1",
+        "iteration": 1,
+        "outcome": "repetition_truncated",
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "usage_complete": False,
+        "error_code": None,
+    }
+    payload.update(changes)
+    return payload
 
 
 def _usage(*, complete: bool = True) -> dict[str, object]:
@@ -1420,6 +1444,92 @@ def test_terminal_usage_must_match_provider_aggregate_and_rolls_back(
                 "usage": usage,
             },
         }
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("changes", "accepted"),
+    (
+        ({}, True),
+        ({"input_tokens": 1}, False),
+        ({"output_tokens": 1}, False),
+        ({"usage_complete": True}, False),
+        ({"error_code": "model_protocol_error"}, False),
+    ),
+)
+def test_repetition_response_boundary_requires_exact_incomplete_usage(
+    tmp_path: Path,
+    changes: dict[str, object],
+    accepted: bool,
+) -> None:
+    store = ConversationStore(_database(tmp_path), AGENT_ID)
+    conversation_id, turn_id, run_id = _id(850), _id(851), _id(852)
+    request_payload = _model_request_payload()
+    request_payload["tool_count"] = 0
+    response_payload = _repetition_response_payload(**changes)
+    try:
+        store.create_conversation(conversation_id=conversation_id)
+        store.begin_turn(
+            conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            user_content="write a joke",
+            expected_revision=0,
+            started_event=_event(
+                kind="run.started",
+                seq=1,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=_tool_free_boundary_started_payload(),
+            ),
+        )
+        store.start_provider_usage_with_event(
+            run_id,
+            1,
+            provider="ollama",
+            model="qwen3.5:2b",
+            profile_digest="d" * 64,
+            context_plan_id=f"context-{PLAN_DIGEST[:24]}",
+            toolset_digest=toolset_digest(()),
+            estimated_input_tokens=1_024,
+            hard_input_tokens=30_720,
+            boundary_event=_event(
+                kind="model.request.started",
+                seq=2,
+                conversation_id=conversation_id,
+                turn_id=turn_id,
+                run_id=run_id,
+                payload=request_payload,
+            ),
+        )
+        response_event = _event(
+            kind="model.response.finished",
+            seq=3,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            run_id=run_id,
+            payload=response_payload,
+        )
+        def complete_response() -> ProviderUsageMutation:
+            return store.complete_provider_usage_with_event(
+                run_id,
+                1,
+                input_tokens=int(response_payload["input_tokens"]),
+                output_tokens=int(response_payload["output_tokens"]),
+                boundary_event=response_event,
+            )
+
+        if accepted:
+            mutation = complete_response()
+            assert mutation.record.status == "incomplete"
+            assert mutation.record.input_tokens is None
+            assert mutation.record.output_tokens is None
+        else:
+            with pytest.raises(ValueError, match="response boundary disagrees"):
+                complete_response()
+            assert store.provider_usage_for_run(run_id)[0].status == "started"
     finally:
         store.close()
 

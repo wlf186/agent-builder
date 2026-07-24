@@ -158,6 +158,38 @@ class _UnknownToolModel:
         )
 
 
+class _RepetitionTruncatedModel:
+    def stream(self, *_args: Any, **_kwargs: Any) -> Iterator[ModelBlock]:
+        yield ModelBlock("text.start", {"block_id": "bounded-answer"})
+        yield ModelBlock(
+            "text.delta",
+            {
+                "block_id": "bounded-answer",
+                "text": "usable prefix\n\n[回答因重复死循环被截断；后续忽略重复尾部。]",
+            },
+        )
+        yield ModelBlock("text.finish", {"block_id": "bounded-answer"})
+        yield ModelBlock("stop", {"reason": "repetition_truncated"})
+
+
+def test_repetition_truncation_is_a_completed_kernel_outcome() -> None:
+    kernel = HarnessKernel(model=_RepetitionTruncatedModel())  # type: ignore[arg-type]
+
+    events = list(kernel.run("write a joke"))
+
+    assert [event.kind for event in events] == [
+        "assistant.block.started",
+        "assistant.block.delta",
+        "assistant.block.finished",
+        "run.completed",
+    ]
+    assert events[-1].payload == {
+        "reason": "repetition_truncated",
+        "model_iterations": 1,
+    }
+    _assert_single_terminal_last(events, "run.completed")
+
+
 def test_tool_failure_is_paired_before_failed_terminal() -> None:
     kernel = HarnessKernel(model=_UnknownToolModel())  # type: ignore[arg-type]
 

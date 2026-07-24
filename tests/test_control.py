@@ -1334,6 +1334,7 @@ def test_completed_terminal_requires_a_control_observed_model_stop(
     record.model_request_count = 1
     record.model_response_count = 1
     record.broker_stop_iteration = 1
+    record.broker_stop_reason = "end_turn"
     service._validate_worker_event(record, "run.completed", "durable", completed)
     with pytest.raises(ValueError, match="invalid completed terminal"):
         service._validate_worker_event(
@@ -1341,6 +1342,17 @@ def test_completed_terminal_requires_a_control_observed_model_stop(
             "run.completed",
             "durable",
             {"reason": "end_turn", "model_iterations": True},
+        )
+    record.broker_stop_reason = "repetition_truncated"
+    service._validate_worker_event(
+        record,
+        "run.completed",
+        "durable",
+        {"reason": "repetition_truncated", "model_iterations": 1},
+    )
+    with pytest.raises(ValueError, match="invalid completed terminal"):
+        service._validate_worker_event(
+            record, "run.completed", "durable", completed
         )
     record.broker_pending_tool_calls["call-1"] = (
         "builtin/echo",

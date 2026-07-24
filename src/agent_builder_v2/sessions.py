@@ -590,6 +590,33 @@ def _usage_count(value: object, field: str, *, positive: bool = False) -> int:
     return value
 
 
+def _valid_model_response_usage(
+    *,
+    outcome: object,
+    input_tokens: object,
+    output_tokens: object,
+    usage_complete: object,
+    error_code: object,
+) -> bool:
+    if outcome in {"tool_use", "end_turn"}:
+        return usage_complete is True and error_code is None
+    if outcome == "repetition_truncated":
+        return (
+            usage_complete is False
+            and input_tokens == 0
+            and output_tokens == 0
+            and error_code is None
+        )
+    if outcome in {"error", "cancelled"}:
+        return (
+            usage_complete is False
+            and input_tokens == 0
+            and output_tokens == 0
+            and isinstance(error_code, str)
+        )
+    return False
+
+
 def _run_journal_state_from_row(row: tuple[object, ...]) -> RunJournalState:
     values = list(row)
     values[-1] = bool(values[-1])
@@ -3118,21 +3145,12 @@ class ConversationStore:
             or payload.get("input_tokens") != input_tokens
             or payload.get("output_tokens") != output_tokens
             or usage_complete not in {True, False}
-            or (
-                usage_complete is True
-                and (
-                    payload.get("error_code") is not None
-                    or payload.get("outcome") not in {"tool_use", "end_turn"}
-                )
-            )
-            or (
-                usage_complete is False
-                and (
-                    input_tokens != 0
-                    or output_tokens != 0
-                    or payload.get("outcome") not in {"error", "cancelled"}
-                    or not isinstance(payload.get("error_code"), str)
-                )
+            or not _valid_model_response_usage(
+                outcome=payload.get("outcome"),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                usage_complete=usage_complete,
+                error_code=payload.get("error_code"),
             )
         ):
             raise ValueError("provider response boundary disagrees with its usage")
@@ -5016,6 +5034,7 @@ class ConversationStore:
         finished_call_ids: list[str] = []
         model_request_count = 0
         open_model_request: tuple[str, int, int, str | None, int | None] | None = None
+        open_model_tool_count: int | None = None
         open_transport_attempt: tuple[str, int, int, int, int] | None = None
         transport_max_attempts: int | None = None
         next_transport_attempt = 1
@@ -5293,6 +5312,7 @@ class ConversationStore:
                     recovery_id if isinstance(recovery_id, str) else None,
                     provider_call_index if isinstance(provider_call_index, int) else None,
                 )
+                open_model_tool_count = int(model_payload["tool_count"])
                 open_transport_attempt = None
                 transport_max_attempts = None
                 next_transport_attempt = 1
@@ -5465,7 +5485,6 @@ class ConversationStore:
                 output_tokens = model_payload.get("output_tokens")
                 usage_complete = model_payload.get("usage_complete")
                 error_code = model_payload.get("error_code")
-                successful = outcome in {"tool_use", "end_turn"}
                 response_identity = (
                     request_id,
                     iteration,
@@ -5484,7 +5503,13 @@ class ConversationStore:
                 if (
                     open_model_request != response_identity
                     or open_transport_attempt is not None
-                    or outcome not in {"tool_use", "end_turn", "error", "cancelled"}
+                    or outcome not in {
+                        "tool_use",
+                        "end_turn",
+                        "repetition_truncated",
+                        "error",
+                        "cancelled",
+                    }
                     or not isinstance(input_tokens, int)
                     or isinstance(input_tokens, bool)
                     or not 0 <= input_tokens <= MAX_USAGE_TOKENS
@@ -5492,25 +5517,30 @@ class ConversationStore:
                     or isinstance(output_tokens, bool)
                     or not 0 <= output_tokens <= MAX_USAGE_TOKENS
                     or not isinstance(usage_complete, bool)
-                    or (
-                        successful
-                        and (usage_complete is not True or error_code is not None)
+                    or not _valid_model_response_usage(
+                        outcome=outcome,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        usage_complete=usage_complete,
+                        error_code=error_code,
                     )
                     or (
-                        not successful
+                        outcome in {"error", "cancelled"}
                         and (
-                            usage_complete is not False
-                            or input_tokens != 0
-                            or output_tokens != 0
-                            or not isinstance(error_code, str)
+                            not isinstance(error_code, str)
                             or _RECOVERY_WORKER_ID.fullmatch(error_code) is None
                         )
+                    )
+                    or (
+                        outcome == "repetition_truncated"
+                        and open_model_tool_count != 0
                     )
                 ):
                     raise ConversationConflictError(
                         "running turn has an invalid model response"
                     )
                 open_model_request = None
+                open_model_tool_count = None
                 transport_max_attempts = None
                 next_transport_attempt = 1
                 transport_first_frame_received = False

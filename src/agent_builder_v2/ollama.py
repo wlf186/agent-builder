@@ -44,6 +44,7 @@ from .model_catalog import (
     ModelCatalogError,
     default_model_catalog,
 )
+from .repetition import REPETITION_CHECK_INTERVAL_BYTES, detect_repeating_suffix
 from .semantic_summary import (
     MAX_SUMMARY_OUTPUT_BYTES,
     MAX_SUMMARY_SOURCE_BYTES,
@@ -90,11 +91,21 @@ MAX_OUTPUT_BYTES = MAX_COMMITTED_ASSISTANT_BYTES
 OUTPUT_TRUNCATION_MARKER = (
     "\n\n[回答达到模型输出长度上限；已保留此前内容。]"
 )
+REPETITION_TRUNCATION_MARKER = (
+    "\n\n[回答因重复死循环被截断；后续忽略重复尾部。]"
+)
 _OUTPUT_TRUNCATION_MARKER_BYTES = len(
     OUTPUT_TRUNCATION_MARKER.encode("utf-8")
 )
+_REPETITION_TRUNCATION_MARKER_BYTES = len(
+    REPETITION_TRUNCATION_MARKER.encode("utf-8")
+)
 MAX_UNTRUNCATED_OUTPUT_BYTES = (
-    MAX_OUTPUT_BYTES - _OUTPUT_TRUNCATION_MARKER_BYTES
+    MAX_OUTPUT_BYTES
+    - max(
+        _OUTPUT_TRUNCATION_MARKER_BYTES,
+        _REPETITION_TRUNCATION_MARKER_BYTES,
+    )
 )
 MAX_MODEL_TURNS = 8
 MAX_CONCURRENT_MODEL_STREAMS = 2
@@ -1567,6 +1578,9 @@ class OllamaRunSession:
             content_frames = 0
             output_bytes = 0
             output_truncated = False
+            repetition_truncated = False
+            repeat_check_bytes = 0
+            emitted_content_characters = 0
             visible_content_seen = False
             provider_call: dict[str, Any] | None = None
             final_frame: dict[str, Any] | None = None
@@ -1632,12 +1646,55 @@ class OllamaRunSession:
                         if accepted:
                             accepted_bytes = len(accepted.encode("utf-8"))
                             output_bytes += accepted_bytes
+                            repeat_check_bytes += accepted_bytes
                             visible_content_seen = (
                                 visible_content_seen or bool(accepted.strip())
                             )
                             content_parts.append(accepted)
                             coalesced.append(accepted)
                             coalesced_bytes += accepted_bytes
+                            if (
+                                not available_tools
+                                and not raw_frame["done"]
+                                and repeat_check_bytes
+                                >= REPETITION_CHECK_INTERVAL_BYTES
+                            ):
+                                repeat_check_bytes = 0
+                                full_content = "".join(content_parts)
+                                repetition = detect_repeating_suffix(full_content)
+                                if repetition is not None:
+                                    if is_cancelled():
+                                        raise OllamaCancelledError()
+                                    keep_end = max(
+                                        emitted_content_characters,
+                                        repetition.keep_end,
+                                    )
+                                    guarded_content = (
+                                        full_content[:keep_end]
+                                        + REPETITION_TRUNCATION_MARKER
+                                    )
+                                    pending_content = guarded_content[
+                                        emitted_content_characters:
+                                    ]
+                                    content_parts = [guarded_content]
+                                    coalesced = (
+                                        [pending_content]
+                                        if pending_content
+                                        else []
+                                    )
+                                    coalesced_bytes = len(
+                                        pending_content.encode("utf-8")
+                                    )
+                                    output_bytes = len(
+                                        guarded_content.encode("utf-8")
+                                    )
+                                    output_truncated = False
+                                    repetition_truncated = True
+                                    await result.aclose()
+                                    result = None
+                                    break
+                        if repetition_truncated:
+                            break
                         if output_truncated:
                             output_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
                             content_parts.append(OUTPUT_TRUNCATION_MARKER)
@@ -1660,6 +1717,7 @@ class OllamaRunSession:
                                 for chunk in candidate_chunks:
                                     yield OllamaFrame("content", {"text": chunk})
                                     content_frames += 1
+                                    emitted_content_characters += len(chunk)
                                 coalesced.clear()
                                 coalesced_bytes = 0
                                 last_flush = now
@@ -1671,27 +1729,35 @@ class OllamaRunSession:
                         )
                     final_frame = raw_frame
 
-            if final_frame is None:
-                raise OllamaBrokerError(
-                    "model_protocol_error", "Ollama ended without a terminal frame."
-                )
-            done_reason = final_frame.get("done_reason")
-            if done_reason == "length":
+            usage: dict[str, int] | None = None
+            if repetition_truncated:
                 if provider_call is not None or not visible_content_seen:
                     raise OllamaBrokerError(
                         "model_output_limit",
-                        "Ollama exhausted the output token budget without a usable answer.",
+                        "Repetition was detected without a usable ordinary answer.",
                     )
-                if not output_truncated:
-                    output_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
-                    content_parts.append(OUTPUT_TRUNCATION_MARKER)
-                    coalesced.append(OUTPUT_TRUNCATION_MARKER)
-                    coalesced_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
-                    output_truncated = True
-            elif done_reason != "stop":
-                raise OllamaBrokerError(
-                    "model_protocol_error", "Ollama returned an invalid stop reason."
-                )
+            else:
+                if final_frame is None:
+                    raise OllamaBrokerError(
+                        "model_protocol_error", "Ollama ended without a terminal frame."
+                    )
+                done_reason = final_frame.get("done_reason")
+                if done_reason == "length":
+                    if provider_call is not None or not visible_content_seen:
+                        raise OllamaBrokerError(
+                            "model_output_limit",
+                            "Ollama exhausted the output token budget without a usable answer.",
+                        )
+                    if not output_truncated:
+                        output_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                        content_parts.append(OUTPUT_TRUNCATION_MARKER)
+                        coalesced.append(OUTPUT_TRUNCATION_MARKER)
+                        coalesced_bytes += _OUTPUT_TRUNCATION_MARKER_BYTES
+                        output_truncated = True
+                elif done_reason != "stop":
+                    raise OllamaBrokerError(
+                        "model_protocol_error", "Ollama returned an invalid stop reason."
+                    )
             if output_truncated and (
                 provider_call is not None or not visible_content_seen
             ):
@@ -1709,25 +1775,31 @@ class OllamaRunSession:
                 for chunk in _split_content_for_ipc("".join(coalesced)):
                     yield OllamaFrame("content", {"text": chunk})
                     content_frames += 1
+                    emitted_content_characters += len(chunk)
             if content_frames > MAX_NORMALIZED_CONTENT_FRAMES:
                 raise OllamaBrokerError(
                     "model_protocol_error", "Normalized model output exceeded its frame limit."
                 )
 
-            usage: dict[str, int] = {}
-            for field in ("prompt_eval_count", "eval_count"):
-                value = final_frame.get(field)
-                if (
-                    not isinstance(value, int)
-                    or isinstance(value, bool)
-                    or not 0 <= value <= 1_000_000_000
-                ):
-                    raise OllamaBrokerError(
-                        "model_protocol_error", "Ollama returned invalid usage data."
-                    )
-                usage[field] = value
+            if final_frame is not None:
+                usage = {}
+                for field in ("prompt_eval_count", "eval_count"):
+                    value = final_frame.get(field)
+                    if (
+                        not isinstance(value, int)
+                        or isinstance(value, bool)
+                        or not 0 <= value <= 1_000_000_000
+                    ):
+                        raise OllamaBrokerError(
+                            "model_protocol_error", "Ollama returned invalid usage data."
+                        )
+                    usage[field] = value
 
-            if self._turns == 1 and available_tools == self._context_plan.tools:
+            if (
+                usage is not None
+                and self._turns == 1
+                and available_tools == self._context_plan.tools
+            ):
                 self._broker.observe_context_usage(
                     self._context_plan,
                     admission_upper_bound_tokens=runtime_input_tokens,
@@ -1743,6 +1815,11 @@ class OllamaRunSession:
                 "content": "" if provider_call is not None else "".join(content_parts),
             }
             if provider_call is not None:
+                if usage is None:
+                    raise OllamaBrokerError(
+                        "model_protocol_error",
+                        "A Tool call ended without complete Provider usage.",
+                    )
                 assistant["tool_calls"] = [provider_call]
             candidate_messages.append(assistant)
             self._messages = candidate_messages
@@ -1770,7 +1847,11 @@ class OllamaRunSession:
                     "stop",
                     {
                         "reason": (
-                            "max_output" if output_truncated else "end_turn"
+                            "repetition_truncated"
+                            if repetition_truncated
+                            else "max_output"
+                            if output_truncated
+                            else "end_turn"
                         ),
                         "usage": usage,
                     },

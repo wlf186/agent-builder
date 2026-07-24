@@ -42,6 +42,7 @@ from agent_builder_v2.ollama import (
     OLLAMA_MODEL,
     OLLAMA_PORT,
     OUTPUT_TRUNCATION_MARKER,
+    REPETITION_TRUNCATION_MARKER,
     TOOL_FINALIZATION_INSTRUCTION,
     OllamaBroker,
     OllamaBrokerError,
@@ -204,6 +205,7 @@ async def _collect(stream: AsyncIterator[OllamaFrame]) -> list[OllamaFrame]:
 
 def test_raw_stream_budget_matches_the_4096_token_profile() -> None:
     assert MAX_STREAM_BYTES == 1024 * 1024
+    assert len(REPETITION_TRUNCATION_MARKER.encode("utf-8")) == 67
 
 
 def _plan(broker: OllamaBroker, message: str) -> object:
@@ -213,6 +215,18 @@ def _plan(broker: OllamaBroker, message: str) -> object:
         message,
         model_profile=qualification.model_profile,
         tools=prototype_tool_specs(),
+        agent_id=PROTOTYPE_AGENT_ID,
+        capsule_generation=1,
+    )
+
+
+def _plan_without_tools(broker: OllamaBroker, message: str) -> object:
+    qualification = broker.qualification
+    assert qualification is not None
+    return ContextCompiler().compile(
+        message,
+        model_profile=qualification.model_profile,
+        tools=(),
         agent_id=PROTOTYPE_AGENT_ID,
         capsule_generation=1,
     )
@@ -1832,6 +1846,235 @@ def _stream_factory(stream: httpx.AsyncByteStream) -> ChatFactory:
         )
 
     return response
+
+
+class _TrackedFramesStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.yielded = 0
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        try:
+            for chunk in self.chunks:
+                self.yielded += 1
+                yield chunk
+                await asyncio.sleep(0)
+        finally:
+            self.closed.set()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+@pytest.mark.asyncio
+async def test_repetition_guard_closes_stream_and_commits_only_emitted_prefix(
+) -> None:
+    prefix = "A bounded joke:\n"
+    unit = "Because the atoms had already made up everything in the room.\n"
+    chunks = [
+        _ndjson(_provider_frame(content=prefix)),
+        *(
+            _ndjson(_provider_frame(content=unit))
+            for _index in range(20)
+        ),
+        _ndjson(_provider_frame(content="provider tail must not be read")),
+        _ndjson(_provider_frame(done=True, done_reason="stop")),
+    ]
+    stream = _TrackedFramesStream(chunks)
+    broker, provider = await _started_broker(
+        [
+            _stream_factory(stream),
+            _chat_response(
+                _ndjson(
+                    _provider_frame(content="next answer"),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            ),
+        ]
+    )
+    try:
+        session = broker.new_run(_plan_without_tools(broker, "hello"))
+        frames = await _collect(session.stream_turn("hello"))
+
+        await asyncio.wait_for(stream.closed.wait(), timeout=1.0)
+        content = "".join(
+            frame.payload["text"] for frame in frames if frame.kind == "content"
+        )
+        assert content.startswith(prefix + unit)
+        assert content.endswith(REPETITION_TRUNCATION_MARKER)
+        assert content.count(REPETITION_TRUNCATION_MARKER) == 1
+        assert "provider tail must not be read" not in content
+        assert content.count(unit) < 20
+        assert len(content.encode("utf-8")) <= MAX_OUTPUT_BYTES
+        assert stream.yielded < len(chunks)
+        assert frames[-1] == OllamaFrame(
+            "stop",
+            {"reason": "repetition_truncated", "usage": None},
+        )
+        assert session.messages[-1] == {
+            "role": "assistant",
+            "content": content,
+        }
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+        assert sum(
+            request.url.path == "/api/chat" for request in provider.requests
+        ) == 1
+
+        next_frames = await _collect(
+            broker.new_run(_plan_without_tools(broker, "next")).stream_turn(
+                "next"
+            )
+        )
+        assert next_frames[-1].payload["reason"] == "end_turn"
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+        assert sum(
+            request.url.path == "/api/chat" for request in provider.requests
+        ) == 2
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_terminal_frame_wins_before_repetition_guard() -> None:
+    prefix = "A naturally completed answer:\n"
+    unit = "This exact sentence is intentionally repeated for the test only.\n"
+    complete = prefix + unit * 9
+    broker, _provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(
+                    _provider_frame(
+                        content=complete,
+                        done=True,
+                        done_reason="stop",
+                    )
+                )
+            )
+        ]
+    )
+    try:
+        frames = await _collect(
+            broker.new_run(_plan_without_tools(broker, "hello")).stream_turn(
+                "hello"
+            )
+        )
+
+        content = "".join(
+            frame.payload["text"] for frame in frames if frame.kind == "content"
+        )
+        assert content == complete
+        assert REPETITION_TRUNCATION_MARKER not in content
+        assert frames[-1] == OllamaFrame(
+            "stop",
+            {
+                "reason": "end_turn",
+                "usage": {"prompt_eval_count": 17, "eval_count": 5},
+            },
+        )
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_two_exact_copies_do_not_trigger_repetition_guard() -> None:
+    unit = "Two copies are legitimate and remain below the guard threshold.\n"
+    complete = unit * 2
+    broker, _provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(
+                    _provider_frame(content=complete),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            )
+        ]
+    )
+    try:
+        frames = await _collect(
+            broker.new_run(_plan_without_tools(broker, "hello")).stream_turn(
+                "hello"
+            )
+        )
+
+        assert "".join(
+            frame.payload["text"] for frame in frames if frame.kind == "content"
+        ) == complete
+        assert frames[-1].payload["reason"] == "end_turn"
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_cancellation_wins_at_repetition_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = "Cancellation must win when this exact repeated cycle is detected.\n"
+    chunks = [
+        *(
+            _ndjson(_provider_frame(content=unit))
+            for _index in range(20)
+        ),
+        _ndjson(_provider_frame(done=True, done_reason="stop")),
+    ]
+    stream = _TrackedFramesStream(chunks)
+    broker, _provider = await _started_broker([_stream_factory(stream)])
+    cancelled = False
+    detector = ollama_module.detect_repeating_suffix
+
+    def cancel_when_detected(text: str) -> object:
+        nonlocal cancelled
+        match = detector(text)
+        if match is not None:
+            cancelled = True
+        return match
+
+    monkeypatch.setattr(
+        ollama_module,
+        "detect_repeating_suffix",
+        cancel_when_detected,
+    )
+    try:
+        session = broker.new_run(_plan_without_tools(broker, "hello"))
+        with pytest.raises(OllamaCancelledError):
+            await _collect(
+                session.stream_turn("hello", is_cancelled=lambda: cancelled)
+            )
+
+        await asyncio.wait_for(stream.closed.wait(), timeout=1.0)
+        assert session.messages == ()
+        assert broker._model_slots._value == MAX_CONCURRENT_MODEL_STREAMS
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_repetition_guard_is_disabled_while_tool_schema_is_available() -> None:
+    unit = "Repeated visible text during a Tool selection phase is not success.\n"
+    complete = unit * 9
+    broker, _provider = await _started_broker(
+        [
+            _chat_response(
+                _ndjson(
+                    _provider_frame(content=complete),
+                    _provider_frame(done=True, done_reason="stop"),
+                )
+            )
+        ]
+    )
+    try:
+        frames = await _collect(
+            broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+        )
+
+        content = "".join(
+            frame.payload["text"] for frame in frames if frame.kind == "content"
+        )
+        assert content == complete
+        assert REPETITION_TRUNCATION_MARKER not in content
+        assert frames[-1].payload["reason"] == "end_turn"
+    finally:
+        await broker.close()
 
 
 def _set_session_timeouts(session: object, **changes: object) -> None:

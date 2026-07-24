@@ -6,8 +6,10 @@ import pytest
 
 from agent_builder_v2.generation import (
     GENERATION_POLICY_VERSION,
+    RESPONSE_PRESENCE_PENALTY,
     RESPONSE_SAMPLED_PHASE,
     RESPONSE_TEMPERATURE,
+    RESPONSE_TOP_K,
     RESPONSE_TOP_P,
     TOOL_DETERMINISTIC_PHASE,
     generation_options_for,
@@ -15,7 +17,7 @@ from agent_builder_v2.generation import (
 )
 
 
-def test_no_tool_phase_uses_bounded_response_sampling() -> None:
+def test_no_tool_phase_uses_qualified_response_sampling() -> None:
     options = generation_options_for(
         has_tools=False,
         deterministic_temperature=0,
@@ -23,12 +25,16 @@ def test_no_tool_phase_uses_bounded_response_sampling() -> None:
     )
 
     assert options == {
-        "temperature": 0.7,
-        "top_p": 0.8,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "presence_penalty": 1.5,
         "seed": 0,
     }
     assert options["temperature"] == RESPONSE_TEMPERATURE
     assert options["top_p"] == RESPONSE_TOP_P
+    assert options["top_k"] == RESPONSE_TOP_K
+    assert options["presence_penalty"] == RESPONSE_PRESENCE_PENALTY
 
     # Callers receive a fresh mapping and cannot mutate the sealed policy.
     options["temperature"] = 0
@@ -36,7 +42,7 @@ def test_no_tool_phase_uses_bounded_response_sampling() -> None:
         has_tools=False,
         deterministic_temperature=0,
         seed=0,
-    )["temperature"] == 0.7
+    )["temperature"] == 1.0
 
 
 def test_tool_phase_is_deterministic_and_has_no_sampling_tail() -> None:
@@ -61,8 +67,10 @@ def test_generation_manifest_binds_both_phases_and_selection_rule() -> None:
         "phases": {
             TOOL_DETERMINISTIC_PHASE: {"temperature": 0, "seed": 0},
             RESPONSE_SAMPLED_PHASE: {
-                "temperature": 0.7,
-                "top_p": 0.8,
+                "temperature": 1.0,
+                "top_p": 0.95,
+                "top_k": 20,
+                "presence_penalty": 1.5,
                 "seed": 0,
             },
         },

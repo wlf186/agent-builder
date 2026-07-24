@@ -34,6 +34,7 @@ from agent_builder_v2.ollama import (
     MAX_NDJSON_LINE_BYTES,
     MAX_NORMALIZED_CONTENT_FRAMES,
     MAX_OUTPUT_BYTES,
+    MAX_STREAM_BYTES,
     MAX_STREAM_FRAMES,
     MAX_UNTRUNCATED_OUTPUT_BYTES,
     MODEL_NUM_PREDICT,
@@ -199,6 +200,10 @@ async def _started_broker(
 
 async def _collect(stream: AsyncIterator[OllamaFrame]) -> list[OllamaFrame]:
     return [frame async for frame in stream]
+
+
+def test_raw_stream_budget_matches_the_4096_token_profile() -> None:
+    assert MAX_STREAM_BYTES == 1024 * 1024
 
 
 def _plan(broker: OllamaBroker, message: str) -> object:
@@ -1192,8 +1197,10 @@ async def test_tool_budget_transition_forces_a_visible_final_answer() -> None:
         ]
         assert len(requests) == 3
         assert requests[2]["tools"] == []
-        assert requests[2]["options"]["temperature"] == 0.7
-        assert requests[2]["options"]["top_p"] == 0.8
+        assert requests[2]["options"]["temperature"] == 1.0
+        assert requests[2]["options"]["top_p"] == 0.95
+        assert requests[2]["options"]["top_k"] == 20
+        assert requests[2]["options"]["presence_penalty"] == 1.5
         assert requests[2]["options"]["seed"] == 0
         assert requests[2]["messages"][-2] == {
             "role": "tool",
@@ -1354,8 +1361,10 @@ async def test_tool_is_not_exposed_without_minimum_result_headroom() -> None:
             if item.url.path == "/api/chat"
         )
         assert request["tools"] == []
-        assert request["options"]["temperature"] == 0.7
-        assert request["options"]["top_p"] == 0.8
+        assert request["options"]["temperature"] == 1.0
+        assert request["options"]["top_p"] == 0.95
+        assert request["options"]["top_k"] == 20
+        assert request["options"]["presence_penalty"] == 1.5
         assert request["options"]["seed"] == 0
     finally:
         await broker.close()
@@ -1461,6 +1470,40 @@ async def test_ordinary_output_limit_commits_bounded_truncated_answer(
                 "usage": {"prompt_eval_count": 17, "eval_count": 5},
             },
         )
+    finally:
+        await broker.close()
+
+
+@pytest.mark.asyncio
+async def test_raw_stream_between_512_kib_and_1_mib_reaches_terminal() -> None:
+    padded_frames: list[dict[str, Any]] = []
+    for _index in range(600):
+        frame = _provider_frame()
+        frame["bounded_padding"] = "p" * 900
+        padded_frames.append(frame)
+    body = _ndjson(
+        *padded_frames,
+        _provider_frame(content="bounded answer"),
+        _provider_frame(done=True, done_reason="stop"),
+    )
+    assert 512 * 1024 < len(body) <= 1024 * 1024
+    assert len(padded_frames) + 2 < MAX_STREAM_FRAMES
+    broker, _provider = await _started_broker([_chat_response(body)])
+    try:
+        frames = await _collect(
+            broker.new_run(_plan(broker, "hello")).stream_turn("hello")
+        )
+
+        assert frames == [
+            OllamaFrame("content", {"text": "bounded answer"}),
+            OllamaFrame(
+                "stop",
+                {
+                    "reason": "end_turn",
+                    "usage": {"prompt_eval_count": 17, "eval_count": 5},
+                },
+            ),
+        ]
     finally:
         await broker.close()
 

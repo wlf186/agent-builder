@@ -8,11 +8,13 @@ the exact provider call; request data cannot provide arbitrary model options.
 
 from __future__ import annotations
 
-GENERATION_POLICY_VERSION = "tool-phase-generation-v1"
+GENERATION_POLICY_VERSION = "tool-phase-generation-v2"
 TOOL_DETERMINISTIC_PHASE = "tool-deterministic-v1"
 RESPONSE_SAMPLED_PHASE = "response-sampled-v1"
-RESPONSE_TEMPERATURE = 0.7
-RESPONSE_TOP_P = 0.8
+RESPONSE_TEMPERATURE = 1.0
+RESPONSE_TOP_P = 0.95
+RESPONSE_TOP_K = 20
+RESPONSE_PRESENCE_PENALTY = 1.5
 
 
 def generation_options_for(
@@ -34,6 +36,8 @@ def generation_options_for(
         return {
             "temperature": RESPONSE_TEMPERATURE,
             "top_p": RESPONSE_TOP_P,
+            "top_k": RESPONSE_TOP_K,
+            "presence_penalty": RESPONSE_PRESENCE_PENALTY,
             "seed": seed,
         }
     return {"temperature": deterministic_temperature, "seed": seed}
@@ -62,8 +66,10 @@ def generation_policy_manifest(
 
 __all__ = [
     "GENERATION_POLICY_VERSION",
+    "RESPONSE_PRESENCE_PENALTY",
     "RESPONSE_SAMPLED_PHASE",
     "RESPONSE_TEMPERATURE",
+    "RESPONSE_TOP_K",
     "RESPONSE_TOP_P",
     "TOOL_DETERMINISTIC_PHASE",
     "generation_options_for",

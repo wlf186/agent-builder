@@ -1222,6 +1222,8 @@ _PROTOTYPE_AGENT_INSTRUCTIONS = (
     "Answer directly without a Tool by default. Call a Tool only when the answer "
     "requires external or workspace state, or when the user explicitly asks for an "
     "action; creative writing and self-contained questions never need a Tool. "
+    "For arithmetic expressions, use conventional arithmetic operator precedence "
+    "and verify the result before answering. "
     "Prior user and assistant messages included in this request are directly "
     "available conversation context: use their facts when relevant, never claim "
     "that you cannot inspect them, and never call a Tool merely to read them. "

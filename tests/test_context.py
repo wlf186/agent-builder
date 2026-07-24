@@ -151,6 +151,7 @@ def test_context_plan_is_ordered_reproducible_and_provider_renderable() -> None:
         "creative writing and self-contained questions never need a Tool"
         in messages[0]["content"]
     )
+    assert "conventional arithmetic operator precedence" in messages[0]["content"]
     assert "directly available conversation context" in messages[0]["content"]
     assert "never call a Tool merely to read them" in messages[0]["content"]
     assert messages[1] == {"role": "user", "content": "请回显这一条"}

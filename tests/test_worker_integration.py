@@ -613,6 +613,73 @@ class _RepetitionTruncatedModelBroker(_FakeModelBroker):
         return _RepetitionTruncatedModelSession(context_plan)
 
 
+class _RepetitionContinuationModelSession(_DirectModelSession):
+    async def stream_turn(
+        self,
+        user_message: str,
+        _tool_results: tuple[OllamaToolResult, ...] = (),
+        _is_cancelled: object = None,
+        on_request: object = None,
+        on_transport_attempt: object = None,
+    ) -> object:
+        del on_transport_attempt
+        if on_request is not None:
+            await on_request(  # type: ignore[operator]
+                OllamaRequestMetadata(
+                    iteration=1,
+                    message_count=len(self.context_plan.provider_messages()),
+                    tool_count=0,
+                    tool_ids=(),
+                    toolset_digest=toolset_digest(()),
+                    estimated_input_tokens=self.context_plan.estimated_input_tokens,
+                    request_bytes=512,
+                    request_digest=(
+                        "7" if user_message == "write a joke" else "6"
+                    )
+                    * 64,
+                )
+            )
+        if user_message == "write a joke":
+            yield OllamaFrame(
+                "content",
+                {"text": f"bounded prefix{REPETITION_TRUNCATION_MARKER}"},
+            )
+            yield OllamaFrame(
+                "stop",
+                {"reason": "repetition_truncated", "usage": None},
+            )
+            return
+        assert user_message == "ok"
+        marker_count = sum(
+            str(message.get("content", "")).count(
+                REPETITION_TRUNCATION_MARKER
+            )
+            for message in self.context_plan.provider_messages()
+        )
+        assert marker_count == 1
+        yield OllamaFrame("content", {"text": "continued after bounded history"})
+        yield OllamaFrame(
+            "stop",
+            {
+                "reason": "end_turn",
+                "usage": {"prompt_eval_count": 120, "eval_count": 8},
+            },
+        )
+
+
+class _RepetitionContinuationModelBroker(_RepetitionTruncatedModelBroker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.plans: list[ContextPlan] = []
+
+    def new_run(
+        self, context_plan: ContextPlan, *, max_tool_calls: int = 2
+    ) -> _RepetitionContinuationModelSession:
+        assert max_tool_calls == 2
+        self.plans.append(context_plan)
+        return _RepetitionContinuationModelSession(context_plan)
+
+
 class _CancellableModelSession:
     def __init__(self, context_plan: ContextPlan, entered: asyncio.Event) -> None:
         self.context_plan = context_plan
@@ -1996,6 +2063,144 @@ def test_repetition_truncation_commits_with_incomplete_provider_usage(
             assert replay.events[-1].payload["reason"] == "repetition_truncated"
         finally:
             await service.close()
+
+    asyncio.run(exercise())
+
+
+def test_repetition_completion_continues_from_exact_committed_history_after_restart(
+    tmp_path: Path,
+) -> None:
+    async def exercise() -> None:
+        first_broker = _RepetitionContinuationModelBroker()
+        first = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=first_broker,  # type: ignore[arg-type]
+        )
+        try:
+            await first.initialize()
+            repeated = await first.start(
+                StartRunCommand(PROTOTYPE_AGENT_ID, "write a joke")
+            )
+            repeated_events = [
+                event
+                async for event in first.stream(repeated.run_id)
+                if event is not None
+            ]
+            assert repeated_events[-1].kind == "run.completed"
+            assert repeated_events[-1].payload["reason"] == "repetition_truncated"
+            conversation_id = repeated.conversation_id
+            assert first.conversations is not None
+            conversation = first.conversations.get_conversation(conversation_id)
+            assert conversation.revision == 2
+            assert conversation.turns[-1].status == "completed"
+            assert conversation.turns[-1].assistant_content.count(
+                REPETITION_TRUNCATION_MARKER
+            ) == 1
+            usage = first.conversations.provider_usage_for_run(repeated.run_id)
+            assert len(usage) == 1
+            assert usage[0].status == "incomplete"
+            assert usage[0].input_tokens is None
+            assert usage[0].output_tokens is None
+            first_boundary = (
+                first.conversations.read_context_projection_boundary(
+                    repeated.run_id
+                )
+            )
+            assert first_boundary is not None
+            assert first.conversations.recent_provider_calibration_samples(
+                profile_digest=first_boundary.model_profile_digest,
+                renderer_version=first_boundary.renderer_version,
+                toolset_digest=toolset_digest(()),
+                policy_digest=first_boundary.compression_policy_digest,
+            ) == ()
+            preview = await first.next_turn_preview(conversation_id)
+            assert preview["availability"] == "unavailable"
+            assert preview["stale_reason"] == "incomplete_provider_usage"
+            assert preview["conversation_revision"] == 2
+            assert preview["fixed_context_tokens"] is None
+            assert preview["safe_user_tokens"] is None
+            assert preview["last_run_usage"] == {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "provider_calls": 1,
+                "complete": False,
+            }
+        finally:
+            await first.close()
+
+        second_broker = _RepetitionContinuationModelBroker()
+        second = RunService(
+            tmp_path,
+            SOURCE_ROOT,
+            model_broker=second_broker,  # type: ignore[arg-type]
+        )
+        try:
+            await second.initialize()
+            restored = await second.get_conversation(conversation_id)
+            assert restored.revision == 2
+            restarted_preview = await second.next_turn_preview(conversation_id)
+            assert restarted_preview["availability"] == "unavailable"
+            assert restarted_preview["stale_reason"] == (
+                "incomplete_provider_usage"
+            )
+            assert restarted_preview["conversation_revision"] == 2
+
+            continued = await second.start(
+                StartRunCommand(
+                    PROTOTYPE_AGENT_ID,
+                    "ok",
+                    conversation_id=conversation_id,
+                )
+            )
+            assert continued.conversation_revision == 2
+            assert continued.context_plan is not None
+            assert continued.context_plan.history_message_count == 2
+            marker_count = sum(
+                str(message.get("content", "")).count(
+                    REPETITION_TRUNCATION_MARKER
+                )
+                for message in continued.context_plan.provider_messages()
+            )
+            assert marker_count == 1
+            continued_events = [
+                event
+                async for event in second.stream(continued.run_id)
+                if event is not None
+            ]
+            assert continued_events[-1].kind == "run.completed"
+            assert continued_events[-1].payload["reason"] == "end_turn"
+            second_boundary = (
+                second.conversations.read_context_projection_boundary(
+                    continued.run_id
+                )
+                if second.conversations is not None
+                else None
+            )
+            assert second_boundary is not None
+            assert second_boundary.conversation_revision == 2
+            assert second_boundary.history_source_digest == (
+                continued.context_plan.history_source_digest
+            )
+            final = await second.get_conversation(conversation_id)
+            assert [turn.status for turn in final.turns] == [
+                "completed",
+                "completed",
+            ]
+            assert final.turns[-1].assistant_content == (
+                "continued after bounded history"
+            )
+            recovered_preview = await second.next_turn_preview(conversation_id)
+            assert recovered_preview["availability"] == "available"
+            assert recovered_preview["stale_reason"] is None
+            assert recovered_preview["conversation_revision"] == 4
+            assert continued.process is None
+            assert second.capsule is not None
+            assert not (
+                second.capsule.runtime_root / "runs" / continued.run_id
+            ).exists()
+        finally:
+            await second.close()
 
     asyncio.run(exercise())
 

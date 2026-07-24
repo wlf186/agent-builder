@@ -584,6 +584,75 @@ def test_projector_rejects_repetition_completion_without_matching_terminal_conte
         )
 
 
+def test_projector_rejects_repetition_that_only_has_earlier_tool_phase_content(
+) -> None:
+    events = (
+        _event(1, "run.started", _current_started_payload()),
+        _event(2, "model.request.started", _model_request(1)),
+        _event(
+            3,
+            "model.response.finished",
+            _model_response(1, "tool_use", input_tokens=40, output_tokens=3),
+        ),
+        _event(
+            4,
+            "assistant.block.started",
+            {"block_id": "earlier", "block_type": "content"},
+        ),
+        _event(
+            5,
+            "assistant.block.finished",
+            {"block_id": "earlier", "content": "text before the Tool call"},
+        ),
+        _event(
+            6,
+            "tool.call.requested",
+            {
+                "call_id": "echo-1",
+                "tool_id": "builtin/echo",
+                "arguments": {"text": "hello"},
+            },
+        ),
+        _event(
+            7,
+            "tool.call.started",
+            {"call_id": "echo-1", "tool_id": "builtin/echo"},
+        ),
+        _event(
+            8,
+            "tool.call.finished",
+            {"call_id": "echo-1", "outcome": "succeeded", "result": "hello"},
+        ),
+        _event(
+            9,
+            "model.request.started",
+            _model_request(2, result_call_ids=["echo-1"]),
+        ),
+        _event(
+            10,
+            "model.response.finished",
+            _repetition_response(request_id="model-2", iteration=2),
+        ),
+        _event(
+            11,
+            "run.completed",
+            {
+                "reason": "repetition_truncated",
+                "model_iterations": 2,
+                "usage": {
+                    "input_tokens": 40,
+                    "output_tokens": 3,
+                    "last_input_tokens": 40,
+                    "complete": False,
+                },
+            },
+        ),
+    )
+
+    with pytest.raises(ReplayCorruptionError):
+        project_durable_run(events)
+
+
 def test_feature_marked_completed_run_cannot_masquerade_as_legacy() -> None:
     with pytest.raises(ReplayCorruptionError, match="model iteration"):
         project_durable_run(

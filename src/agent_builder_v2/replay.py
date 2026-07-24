@@ -1405,12 +1405,16 @@ def _valid_completed_model_sequence(
     reason = terminal_payload.get("reason")
     repetition = reason == "repetition_truncated"
     if repetition:
+        final_response_seq = last.get("response_seq")
         if (
             last.get("outcome") != "repetition_truncated"
             or last.get("tool_count") != 0
+            or not isinstance(final_response_seq, int)
             or not any(
                 isinstance(block, dict)
                 and block.get("state") == "finished"
+                and isinstance(block.get("start_seq"), int)
+                and block["start_seq"] > final_response_seq
                 and isinstance(block.get("content"), str)
                 and bool(str(block["content"]).strip())
                 for block in blocks

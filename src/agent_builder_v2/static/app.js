@@ -1121,7 +1121,7 @@ function renderSessionTurnUsage() {
     : "本轮模型实际计算量";
   if (!usage || !usage.hasUsage) {
     elements.turnTokenUsageValue.textContent = usage?.terminalKind
-      ? "未取得模型用量"
+      ? (usage.complete ? "未取得模型用量" : "Provider 用量不完整（模型流已提前关闭）")
       : "等待模型响应";
     elements.turnTokenUsageValue.title = (
       "Ollama 在每次模型响应结束时返回实际 input/output token，用量不会按流式文本逐 token 估算。"
@@ -4734,10 +4734,21 @@ function eventSummary(envelope) {
     const outputTokens = payload.output_tokens;
     if (
       !Number.isSafeInteger(iteration) || iteration < 1 ||
-      !["tool_use", "end_turn", "error", "cancelled"].includes(outcome) ||
+      ![
+        "tool_use", "end_turn", "repetition_truncated", "error", "cancelled",
+      ].includes(outcome) ||
       !isNonNegativeInteger(inputTokens) || !isNonNegativeInteger(outputTokens)
     ) {
       return "模型响应元数据不可用";
+    }
+    if (outcome === "repetition_truncated") {
+      if (
+        inputTokens !== 0 || outputTokens !== 0 ||
+        payload.usage_complete !== false || payload.error_code !== null
+      ) {
+        return "模型响应元数据不可用";
+      }
+      return "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，Provider 用量不完整";
     }
     const attempt = Number.isSafeInteger(payload.attempt) ? payload.attempt : 0;
     const providerCall = Number.isSafeInteger(payload.provider_call_index)
@@ -4776,8 +4787,13 @@ function eventSummary(envelope) {
     );
   }
   if (envelope.kind === "run.completed") {
-    if (!["end_turn", "max_output"].includes(payload.reason)) {
+    if (![
+      "end_turn", "max_output", "repetition_truncated",
+    ].includes(payload.reason)) {
       return "运行完成原因不可用";
+    }
+    if (payload.reason === "repetition_truncated") {
+      return "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，Provider 用量不完整";
     }
     return payload.reason === "max_output"
       ? "回答达到模型输出长度上限；此前正文已保留，可继续对话"
@@ -4981,13 +4997,20 @@ function eventBusinessBody(entry) {
   } else if (kind === "model.transport.attempt") {
     eventBody = "这里只记录首帧等待的尝试次数和耗时；不保存 endpoint、prompt 或模型原始报文。";
   } else if (kind === "model.response.finished") {
-    eventBody = payload?.error_code && MODEL_ERROR_LABELS[payload.error_code]
+    eventBody = payload?.outcome === "repetition_truncated"
+      ? "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，Provider 用量不完整。"
+      : payload?.error_code && MODEL_ERROR_LABELS[payload.error_code]
       ? `模型失败阶段：${MODEL_ERROR_LABELS[payload.error_code]}`
       : "模型供应商原始响应正文按协议未持久化；智能体正文来自规范 assistant 事件。";
   } else if (kind === "run.completed" && payload?.reason === "max_output") {
     eventBody = (
       "模型达到本轮输出长度上限；Harness 已保留有界正文并追加可信截断标记，" +
       "Provider 终帧用量仍完整结算。"
+    );
+  } else if (kind === "run.completed" && payload?.reason === "repetition_truncated") {
+    eventBody = (
+      "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，" +
+      "Provider 用量不完整。"
     );
   } else if (["stream.gap", "stream.snapshot"].includes(kind)) {
     eventBody = "这是 Replay control，不是 Run 业务消息，也不是模型报文。";
@@ -5643,9 +5666,15 @@ function completeRunContext(runContext, refreshFailed) {
       runContext.terminalKind === "run.completed" &&
       runContext.terminalPayload?.reason === "max_output"
     );
+    const repetitionTruncated = (
+      runContext.terminalKind === "run.completed" &&
+      runContext.terminalPayload?.reason === "repetition_truncated"
+    );
     setStatus(
       `${outputLimited
         ? "回答达到模型输出长度上限；已保留此前内容，可继续追问"
+        : repetitionTruncated
+        ? "检测到回答进入重复循环；重复尾部已截断，本轮已完成，可继续追问"
         : terminalStatus[runContext.terminalKind] || "本轮运行已结束"}${failureDetail}${suffix}`,
       runContext.terminalKind === "run.failed" ? "failure" : "interaction",
     );

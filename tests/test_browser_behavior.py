@@ -770,6 +770,127 @@ window.setTimeout(async () => {
     completionMarkerRetained: state.backgroundCompletions.has(sessionA),
   };
 
+  const repetitionRun = "12121212121212121212121212121212";
+  const repetitionTurn = "34343434343434343434343434343434";
+  const repetitionMarker = "\n\n[回答因重复死循环被截断；后续忽略重复尾部。]";
+  const repetitionContent = `bounded answer${repetitionMarker}`;
+  const repetitionContext = {
+    agentId,
+    agentEpoch: state.agentEpoch,
+    runId: repetitionRun,
+    sessionId: sessionA,
+    lastSeq: 0,
+    terminalSeen: false,
+    terminalKind: null,
+    terminalPayload: null,
+    cancelPending: false,
+    controller: null,
+    driverPromise: null,
+    transportTimer: null,
+    transportAttempt: null,
+    assistantBlocks: new Map(),
+  };
+  const repetitionEnvelope = (seq, kind, payload) => ({
+    ...envelope(seq, kind, payload),
+    event_id: (100 + seq).toString(16).padStart(32, "0"),
+    turn_id: repetitionTurn,
+    run_id: repetitionRun,
+  });
+  state.activeRuns.set(sessionA, repetitionContext);
+  state.timelineRuns.push({
+    runId: repetitionRun,
+    turnId: repetitionTurn,
+    turnNumber: 2,
+    status: "running",
+    kind: "conversation",
+  });
+  state.selectedTimelineRunId = repetitionRun;
+  state.timelineEntries = [];
+  state.timelineEntriesByRun.set(repetitionRun, state.timelineEntries);
+  renderMessages([{
+    message_id: "repetition-user",
+    role: "user",
+    content: "write a joke",
+    created_at: "2026-07-22T00:03:00.000Z",
+    turn_id: repetitionTurn,
+    run_id: repetitionRun,
+    turn_position: 2,
+    turn_status: "running",
+  }]);
+  renderEnvelope(repetitionEnvelope(1, "assistant.block.started", {
+    block_id: "answer",
+    block_type: "content",
+  }), repetitionContext);
+  renderEnvelope(repetitionEnvelope(2, "assistant.block.delta", {
+    block_id: "answer",
+    text: repetitionContent,
+  }), repetitionContext);
+  const repetitionResponse = repetitionEnvelope(3, "model.response.finished", {
+    request_id: "model-1",
+    iteration: 1,
+    attempt: 0,
+    recovery_id: null,
+    provider_call_index: 1,
+    outcome: "repetition_truncated",
+    input_tokens: 0,
+    output_tokens: 0,
+    usage_complete: false,
+    error_code: null,
+  });
+  renderEnvelope(repetitionResponse, repetitionContext);
+  renderEnvelope(repetitionEnvelope(4, "assistant.block.finished", {
+    block_id: "answer",
+    content: repetitionContent,
+  }), repetitionContext);
+  renderEnvelope(repetitionEnvelope(5, "run.completed", {
+    reason: "repetition_truncated",
+    model_iterations: 1,
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      last_input_tokens: 0,
+      complete: false,
+    },
+  }), repetitionContext);
+  renderMessages([
+    {
+      message_id: "repetition-user",
+      role: "user",
+      content: "write a joke",
+      created_at: "2026-07-22T00:03:00.000Z",
+      turn_id: repetitionTurn,
+      run_id: repetitionRun,
+      turn_position: 2,
+      turn_status: "completed",
+    },
+    {
+      message_id: "repetition-assistant",
+      role: "assistant",
+      content: repetitionContent,
+      created_at: "2026-07-22T00:03:01.000Z",
+      turn_id: repetitionTurn,
+      run_id: repetitionRun,
+      turn_position: 2,
+      turn_status: "completed",
+    },
+  ]);
+  completeRunContext(repetitionContext, false);
+  const repetitionText = elements.conversationMessages.textContent;
+  outcomes.repetitionCompletion = {
+    turnCards: elements.conversationMessages.querySelectorAll(".turn-card").length,
+    assistantMessages: elements.conversationMessages.querySelectorAll(
+      ".message-assistant",
+    ).length,
+    markerCount: repetitionText.split("回答因重复死循环被截断").length - 1,
+    completedLabel: elements.conversationMessages.querySelector(".turn-status")?.textContent,
+    usageComplete: state.sessionTurnUsage?.complete,
+    usageText: elements.turnTokenUsageValue.textContent,
+    eventSummary: eventSummary(repetitionResponse),
+    terminalKind: repetitionContext.terminalKind,
+    terminalReason: repetitionContext.terminalPayload?.reason,
+    status: elements.composerStatus.textContent,
+  };
+
   const currentMessages = [
     ...turnMessages(3, "current", "completed", 260),
     ...turnMessages(4, "current", "completed", 260),
@@ -2415,6 +2536,20 @@ def test_multisession_pagination_menu_and_pagehide_in_a_real_browser() -> None:
     assert background["markerAfterReturn"] == "空闲"
     assert background["activeAfterCompletion"] is False
     assert background["completionMarkerRetained"] is False
+
+    repetition = outcome["repetitionCompletion"]
+    assert repetition["turnCards"] == 1
+    assert repetition["assistantMessages"] == 1
+    assert repetition["markerCount"] == 1
+    assert repetition["completedLabel"] == "已完成"
+    assert repetition["usageComplete"] is False
+    assert "Provider 用量不完整" in repetition["usageText"]
+    assert repetition["eventSummary"] == (
+        "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，Provider 用量不完整"
+    )
+    assert repetition["terminalKind"] == "run.completed"
+    assert repetition["terminalReason"] == "repetition_truncated"
+    assert "重复尾部已截断" in repetition["status"]
 
     pagination = outcome["pagination"]
     assert pagination["turnPositions"] == [1, 2, 3, 4]

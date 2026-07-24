@@ -720,7 +720,12 @@ def test_event_cards_summarize_model_iterations_without_body_or_full_digest() ->
     assert 'envelope.kind === "run.started"' in summary
     assert 'envelope.kind === "run.completed"' in summary
     assert '"max_output"' in summary
+    assert '"repetition_truncated"' in summary
     assert "已保留" in summary
+    assert (
+        "检测到回答进入重复循环；重复尾部已截断，本轮正文已提交，Provider 用量不完整"
+        in summary
+    )
     assert "context.included_history_message_count" in summary
     assert "context.history_message_count" in summary
     assert 'envelope.kind.startsWith("tool.call.")' in summary
@@ -764,7 +769,25 @@ def test_terminal_event_keeps_the_owning_run_locked_until_reconciliation() -> No
     assert "state.backgroundCompletions.set(runContext.sessionId" in completer
     assert "const foreground = state.sessionId === runContext.sessionId" in completer
     assert 'runContext.terminalPayload?.reason === "max_output"' in completer
+    assert 'runContext.terminalPayload?.reason === "repetition_truncated"' in completer
     assert "已保留此前内容" in completer
+    assert "重复尾部已截断" in completer
+
+
+def test_repetition_completion_is_presented_as_success_with_incomplete_usage() -> None:
+    summary = _function_body("eventSummary")
+    usage = _function_body("renderSessionTurnUsage")
+    business = _function_body("eventBusinessBody")
+    category = _function_body("timelineCategory")
+
+    assert '"repetition_truncated"' in summary
+    assert "payload.usage_complete" in summary
+    assert "payload.error_code" in summary
+    assert "Provider 用量不完整" in summary
+    assert "Provider 用量不完整" in usage
+    assert 'payload?.reason === "repetition_truncated"' in business
+    assert "重复尾部已截断" in business
+    assert '"repetition_truncated"' not in category.split('return "error"')[0]
 
 
 def test_sse_reconnect_is_bounded_and_resumes_from_the_last_sequence() -> None:
